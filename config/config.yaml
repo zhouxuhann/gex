@@ -1,0 +1,35 @@
+# GEX Monitor 配置文件
+
+ib:
+  host: "127.0.0.1"           # Docker 内用 "host.docker.internal"
+  port: 7496                   # IB Gateway Live 端口 (Paper: 7497)
+  client_id_base: 10           # 每个标的递增 client_id
+
+symbols:
+  - name: QQQ
+    trading_class: QQQ
+    strike_range: 0.04         # ATM 上下 4%
+    enabled: true
+
+  - name: SPY
+    trading_class: SPY
+    strike_range: 0.04
+    enabled: false
+
+  - name: SPX
+    trading_class: SPXW        # SPX 周权
+    strike_range: 0.03
+    sec_type: IND              # 指数
+    enabled: false             # 默认关闭
+
+storage:
+  data_dir: "./data"           # Docker 内用 "/data"
+  max_history: 8000            # 内存中保留的历史条数
+
+server:
+  host: "0.0.0.0"
+  port: 8050
+
+monitoring:
+  stale_seconds: 15            # 数据陈旧警告阈值
+  spot_sanity_pct: 0.01        # spot 单 tick 最大漂移 (1%)

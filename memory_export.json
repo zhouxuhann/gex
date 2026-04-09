@@ -1,0 +1,63 @@
+{
+  "entities": [
+    {
+      "name": "GEX_Monitor_v2",
+      "entityType": "project",
+      "observations": [
+        "QQQ/SPY 0DTE Gamma Exposure 实时监控系统",
+        "位置: /Users/lh/Downloads/gex/",
+        "Python 3.11+, 使用 ib_insync + Dash + Pandas",
+        "支持多标的并行监控 (QQQ, SPY, SPX)",
+        "IB Gateway Live 端口: 7496",
+        "Web UI 端口: 8050",
+        "数据存储: Parquet 文件",
+        "支持 Docker Compose 部署",
+        "完成模块化重构 v1.0 -> v2.0"
+      ]
+    },
+    {
+      "name": "GEX_Monitor_架构",
+      "entityType": "architecture",
+      "observations": [
+        "模块结构: src/gex_monitor/ 下 8 个核心模块",
+        "time_utils.py - 时区和交易日历",
+        "config.py - Pydantic 配置模型",
+        "storage.py - Parquet 存储 + SegmentStorage",
+        "state.py - StateManager + StateRegistry 多标的状态",
+        "gex_calc.py - 纯函数 GEX 计算",
+        "ib_client.py - IBWorker 数据采集",
+        "ui/ - Dash 布局和回调",
+        "main.py - 入口和信号处理"
+      ]
+    },
+    {
+      "name": "GEX_Monitor_功能",
+      "entityType": "features",
+      "observations": [
+        "实时 GEX 柱状图显示",
+        "Intraday Evolution 历史演化图",
+        "Segment Labeling 分段标注 (ML 训练数据)",
+        "历史回放: 拖动时间轴查看任意时刻 GEX 分布",
+        "Strike-level 数据每分钟采样存储",
+        "/health API 端点健康检查",
+        "GEX 公式: sign × gamma × OI × multiplier × spot² × 0.01"
+      ]
+    },
+    {
+      "name": "GEX_Monitor_运行",
+      "entityType": "commands",
+      "observations": [
+        "安装: pip install -e .",
+        "验证: python test_setup.py",
+        "启动: python -m gex_monitor.main",
+        "Docker: docker compose up -d",
+        "访问: http://localhost:8050"
+      ]
+    }
+  ],
+  "relations": [
+    {"from": "GEX_Monitor_架构", "to": "GEX_Monitor_v2", "relationType": "belongs_to"},
+    {"from": "GEX_Monitor_功能", "to": "GEX_Monitor_v2", "relationType": "belongs_to"},
+    {"from": "GEX_Monitor_运行", "to": "GEX_Monitor_v2", "relationType": "belongs_to"}
+  ]
+}

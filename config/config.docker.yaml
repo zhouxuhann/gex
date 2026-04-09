@@ -1,0 +1,29 @@
+# GEX Monitor Docker 配置
+
+ib:
+  host: "host.docker.internal"  # 访问宿主机上的 IB Gateway
+  port: 7497                     # IB Gateway Live 端口 (Paper: 7497)
+  client_id_base: 10
+
+symbols:
+  - name: QQQ
+    trading_class: QQQ
+    strike_range: 0.04
+    enabled: true
+
+  - name: SPY
+    trading_class: SPY
+    strike_range: 0.04
+    enabled: true
+
+storage:
+  data_dir: "/data"             # 容器内路径，挂载到宿主机
+  max_history: 8000
+
+server:
+  host: "0.0.0.0"               # 容器内监听所有接口
+  port: 8050
+
+monitoring:
+  stale_seconds: 15
+  spot_sanity_pct: 0.01

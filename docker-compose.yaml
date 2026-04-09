@@ -1,0 +1,32 @@
+services:
+  gex-monitor:
+    build: .
+    container_name: gex-monitor
+    ports:
+      - "8050:8050"
+    volumes:
+      # 数据持久化
+      - ./data:/data
+      # 配置文件（可选，也可以用内置的）
+      - ./config:/app/config:ro
+    extra_hosts:
+      # Mac/Windows Docker Desktop 访问宿主机
+      - "host.docker.internal:host-gateway"
+    environment:
+      # 可选：覆盖配置
+      - TZ=America/New_York
+    command: ["python", "-m", "gex_monitor.main", "--config", "/app/config/config.docker.yaml"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8050/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+# 如果需要在 Linux 上运行，取消下面的注释
+# networks:
+#   default:
+#     driver: bridge
+#     driver_opts:
+#       com.docker.network.driver.mtu: 1500
