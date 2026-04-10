@@ -405,6 +405,7 @@ class IBWorker:
             call_wall=result.call_wall,
             put_wall=result.put_wall,
             positive_gamma=result.positive_gamma,
+            max_pain=result.max_pain,
             regime_code=regime_code,
             regime_tags=regime_tags,
         )

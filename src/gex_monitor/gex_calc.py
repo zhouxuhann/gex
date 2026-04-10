@@ -38,6 +38,8 @@ class GEXResult:
     call_wall: float | None    # Call Wall（spot 上方正 GEX 最大的 strike）
     put_wall: float | None     # Put Wall（spot 下方负 GEX 绝对值最大的 strike）
     positive_gamma: bool       # 是否正 Gamma 环境
+    # Max Pain
+    max_pain: float | None = None  # Max Pain 价格（期权卖方痛苦最小的价位）
     # ΔOI 相关
     delta_oi_df: pd.DataFrame | None = None  # ΔOI 数据 (strike, call_delta_oi, put_delta_oi)
     max_call_delta_oi_strike: float | None = None  # Call ΔOI 最大的 strike
@@ -189,6 +191,9 @@ def calculate_gex(
                 max_call_delta_oi_strike = delta_oi_df.loc[max_call_idx, 'strike']
                 max_put_delta_oi_strike = delta_oi_df.loc[max_put_idx, 'strike']
 
+    # Max Pain 计算（使用 OI）
+    max_pain = _calculate_max_pain(df)
+
     return GEXResult(
         df=df,
         total_gex=total_gex,
@@ -202,6 +207,7 @@ def calculate_gex(
         call_wall=call_wall,
         put_wall=put_wall,
         positive_gamma=positive_gamma,
+        max_pain=max_pain,
         delta_oi_df=delta_oi_df,
         max_call_delta_oi_strike=max_call_delta_oi_strike,
         max_put_delta_oi_strike=max_put_delta_oi_strike,
@@ -321,6 +327,63 @@ def _calculate_atm_iv(df: pd.DataFrame, spot: float) -> float | None:
 
     atm_iv = np.mean(ivs)
     return float(atm_iv * 100)
+
+
+def _calculate_max_pain(df: pd.DataFrame) -> float | None:
+    """
+    计算 Max Pain（最大痛点）
+
+    Max Pain 是使期权买方总内在价值最小的价格，
+    即期权卖方（通常是做市商）痛苦最小、获利最大的价位。
+
+    计算方法：
+    - 遍历每个候选价格 P（使用所有 strike）
+    - 对每个 P，计算所有期权到期时的总内在价值
+    - 找出使总内在价值最小的 P
+
+    Args:
+        df: 期权数据 DataFrame，需包含 strike, right, oi 列
+
+    Returns:
+        Max Pain 价格，或 None（无有效数据时）
+    """
+    if df.empty or 'oi' not in df.columns:
+        return None
+
+    # 按 strike 和 right 聚合 OI
+    call_oi = df[df['right'] == 'C'].groupby('strike')['oi'].sum()
+    put_oi = df[df['right'] == 'P'].groupby('strike')['oi'].sum()
+
+    if call_oi.empty and put_oi.empty:
+        return None
+
+    # 获取所有 strikes 作为候选价格
+    all_strikes = sorted(set(call_oi.index) | set(put_oi.index))
+    if not all_strikes:
+        return None
+
+    # 计算每个候选价格的总内在价值（买方总获利 = 卖方总亏损）
+    min_pain = float('inf')
+    max_pain_strike = None
+
+    for P in all_strikes:
+        total_intrinsic = 0.0
+
+        # Call 内在价值: max(P - K, 0) * OI * 100
+        for K, oi in call_oi.items():
+            if P > K:
+                total_intrinsic += (P - K) * oi * 100
+
+        # Put 内在价值: max(K - P, 0) * OI * 100
+        for K, oi in put_oi.items():
+            if K > P:
+                total_intrinsic += (K - P) * oi * 100
+
+        if total_intrinsic < min_pain:
+            min_pain = total_intrinsic
+            max_pain_strike = P
+
+    return max_pain_strike
 
 
 def pick_expiry(chain, today_str: str) -> tuple[str | None, bool]:

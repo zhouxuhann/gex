@@ -75,11 +75,13 @@ def register_callbacks(
         gamma_env_txt = "正Gamma" if positive_gamma else "负Gamma"
         gamma_env_color = '#00ff88' if positive_gamma else '#ff4444'
 
-        # Call Wall / Put Wall
+        # Call Wall / Put Wall / Max Pain
         call_wall = s.get('call_wall')
         put_wall = s.get('put_wall')
+        max_pain = s.get('max_pain')
         call_wall_txt = f"{call_wall:.0f}" if call_wall else "—"
         put_wall_txt = f"{put_wall:.0f}" if put_wall else "—"
+        max_pain_txt = f"{max_pain:.0f}" if max_pain else "—"
 
         stats_children = [
             html.Span(f"{symbol}  |  ", style={'color': '#ffaa00', 'fontWeight': 'bold'}),
@@ -91,6 +93,7 @@ def register_callbacks(
             html.Span(f"Flip: {s['gamma_flip']:.0f}  |  ", style={'color': '#ffaa00'}),
             html.Span(f"Call Wall: {call_wall_txt}  |  ", style={'color': '#00d4ff'}),
             html.Span(f"Put Wall: {put_wall_txt}  |  ", style={'color': '#ff66cc'}),
+            html.Span(f"Max Pain: {max_pain_txt}  |  ", style={'color': '#aaaaaa'}),
             html.Span(f"ATM IV: {iv_txt}%  |  ", style={'color': '#ff66cc'}),
             html.Span(f"Exp: {exp_txt}  |  ",
                       style={'color': '#ff4444' if not s.get('is_true_0dte') else '#aaaaaa'}),
@@ -160,6 +163,9 @@ def register_callbacks(
             # Put Wall (支撑) - 粉色
             if put_wall:
                 fig1.add_vline(x=put_wall, line=dict(color='#ff66cc', width=2), row=r, col=1)
+            # Max Pain - 灰色虚线
+            if max_pain:
+                fig1.add_vline(x=max_pain, line=dict(color='#888888', width=2, dash='dot'), row=r, col=1)
         # x 轴自动缩放，确保所有数据可见（不强制 range，避免丢数据）
         fig1.update_layout(template='plotly_dark', height=700, barmode='relative',
                            paper_bgcolor='#0e1117', plot_bgcolor='#0e1117',
@@ -206,6 +212,11 @@ def register_callbacks(
                 fig2.add_trace(go.Scatter(x=r1.index, y=r1['put_wall'], mode='lines',
                                           name='Put Wall',
                                           line=dict(color='#ff66cc', width=1.5, dash='dash')),
+                               row=2, col=1)
+            if 'max_pain' in r1.columns:
+                fig2.add_trace(go.Scatter(x=r1.index, y=r1['max_pain'], mode='lines',
+                                          name='Max Pain',
+                                          line=dict(color='#888888', width=1.5, dash='dot')),
                                row=2, col=1)
             if 'atm_iv_pct' in r1.columns:
                 fig2.add_trace(go.Scatter(x=r1.index, y=r1['atm_iv_pct'], mode='lines',

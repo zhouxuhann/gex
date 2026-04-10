@@ -26,6 +26,7 @@ class GEXSnapshot:
     call_wall: float | None = None
     put_wall: float | None = None
     positive_gamma: bool = False
+    max_pain: float | None = None
     # Regime 分类
     regime_code: str | None = None
     regime_tags: dict | None = None
@@ -71,6 +72,7 @@ class StateManager:
         self._call_wall: float | None = None
         self._put_wall: float | None = None
         self._positive_gamma: bool = False
+        self._max_pain: float | None = None
         # Regime 分类
         self._regime_code: str | None = None
         self._regime_tags: dict | None = None
@@ -98,7 +100,7 @@ class StateManager:
                call_gex: float, put_gex: float, atm_iv_pct: float | None,
                expiry: str, is_true_0dte: bool, df: pd.DataFrame,
                call_wall: float | None = None, put_wall: float | None = None,
-               positive_gamma: bool = False,
+               positive_gamma: bool = False, max_pain: float | None = None,
                regime_code: str | None = None, regime_tags: dict | None = None) -> None:
         """更新实时状态"""
         now = et_now()
@@ -120,6 +122,7 @@ class StateManager:
             self._call_wall = call_wall
             self._put_wall = put_wall
             self._positive_gamma = positive_gamma
+            self._max_pain = max_pain
             # Regime 分类
             self._regime_code = regime_code
             self._regime_tags = regime_tags
@@ -136,6 +139,7 @@ class StateManager:
                 'call_wall': call_wall,
                 'put_wall': put_wall,
                 'positive_gamma': positive_gamma,
+                'max_pain': max_pain,
             })
 
             # OHLC
@@ -205,6 +209,7 @@ class StateManager:
                 'call_wall': self._call_wall,
                 'put_wall': self._put_wall,
                 'positive_gamma': self._positive_gamma,
+                'max_pain': self._max_pain,
                 # Regime 分类
                 'regime_code': self._regime_code,
                 'regime_tags': self._regime_tags,

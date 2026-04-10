@@ -6,7 +6,8 @@ from unittest.mock import MagicMock
 
 from gex_monitor.gex_calc import (
     calculate_gex, pick_expiry, GEXResult,
-    _calculate_gamma_flip, _calculate_atm_iv, ATM_MAX_DEVIATION_PCT
+    _calculate_gamma_flip, _calculate_atm_iv, _calculate_max_pain,
+    ATM_MAX_DEVIATION_PCT
 )
 
 
@@ -356,3 +357,95 @@ class TestCalculateAtmIv:
         assert result is not None
         # Should use 500 strike: average of 25% and 26%
         assert abs(result - 25.5) < 0.1
+
+
+class TestCalculateMaxPain:
+    """Tests for _calculate_max_pain function."""
+
+    def test_empty_df(self):
+        """Test with empty DataFrame."""
+        df = pd.DataFrame()
+        result = _calculate_max_pain(df)
+        assert result is None
+
+    def test_no_oi_column(self):
+        """Test when OI column is missing."""
+        df = pd.DataFrame([
+            {'strike': 500, 'right': 'C', 'gamma': 0.1},
+        ])
+        result = _calculate_max_pain(df)
+        assert result is None
+
+    def test_simple_max_pain(self):
+        """Test basic Max Pain calculation."""
+        # Scenario: Most OI at 500 strike
+        # Call at 490: OI=100, Put at 510: OI=100
+        # Max Pain should be around where both have minimal intrinsic value
+        df = pd.DataFrame([
+            {'strike': 490, 'right': 'C', 'oi': 100},
+            {'strike': 500, 'right': 'C', 'oi': 1000},
+            {'strike': 500, 'right': 'P', 'oi': 1000},
+            {'strike': 510, 'right': 'P', 'oi': 100},
+        ])
+        result = _calculate_max_pain(df)
+        assert result is not None
+        # Max Pain should be 500 where the OI is concentrated
+        assert result == 500
+
+    def test_max_pain_puts_only(self):
+        """Test Max Pain with only puts."""
+        df = pd.DataFrame([
+            {'strike': 495, 'right': 'P', 'oi': 100},
+            {'strike': 500, 'right': 'P', 'oi': 500},
+            {'strike': 505, 'right': 'P', 'oi': 200},
+        ])
+        result = _calculate_max_pain(df)
+        assert result is not None
+        # With only puts, Max Pain should be highest strike (505)
+        # because at 505, all puts expire worthless
+        assert result == 505
+
+    def test_max_pain_calls_only(self):
+        """Test Max Pain with only calls."""
+        df = pd.DataFrame([
+            {'strike': 495, 'right': 'C', 'oi': 100},
+            {'strike': 500, 'right': 'C', 'oi': 500},
+            {'strike': 505, 'right': 'C', 'oi': 200},
+        ])
+        result = _calculate_max_pain(df)
+        assert result is not None
+        # With only calls, Max Pain should be lowest strike (495)
+        # because at 495, all calls expire worthless
+        assert result == 495
+
+    def test_max_pain_symmetric(self):
+        """Test Max Pain with symmetric OI distribution."""
+        df = pd.DataFrame([
+            {'strike': 490, 'right': 'C', 'oi': 500},
+            {'strike': 490, 'right': 'P', 'oi': 500},
+            {'strike': 500, 'right': 'C', 'oi': 500},
+            {'strike': 500, 'right': 'P', 'oi': 500},
+            {'strike': 510, 'right': 'C', 'oi': 500},
+            {'strike': 510, 'right': 'P', 'oi': 500},
+        ])
+        result = _calculate_max_pain(df)
+        assert result is not None
+        # With symmetric distribution, Max Pain should be middle strike
+        assert result == 500
+
+    def test_max_pain_in_gex_result(self, mock_ib_ticker):
+        """Test that max_pain is included in GEXResult."""
+        tickers = [
+            mock_ib_ticker(495, 'C', gamma=0.10, oi=500),
+            mock_ib_ticker(495, 'P', gamma=0.10, oi=500),
+            mock_ib_ticker(500, 'C', gamma=0.10, oi=1000),
+            mock_ib_ticker(500, 'P', gamma=0.10, oi=1000),
+            mock_ib_ticker(505, 'C', gamma=0.10, oi=500),
+            mock_ib_ticker(505, 'P', gamma=0.10, oi=500),
+        ]
+        result = calculate_gex(tickers, spot=500.0)
+
+        assert result is not None
+        assert result.max_pain is not None
+        # Max Pain should be 500 where OI is highest
+        assert result.max_pain == 500
