@@ -44,6 +44,15 @@ class ServerConfig(BaseModel):
     port: int = 8050
 
 
+class TimingConfig(BaseModel):
+    """时间间隔配置"""
+    tick_interval_sec: int = 3           # 主循环间隔
+    persist_interval_sec: int = 60       # 持久化间隔
+    reconnect_delay_sec: int = 10        # 重连等待
+    market_closed_check_sec: int = 300   # 非交易时段检查间隔
+    max_sleep_sec: int = 1800            # 最长休眠时间
+
+
 class MonitoringConfig(BaseModel):
     """监控配置"""
     stale_seconds: int = 15
@@ -57,6 +66,7 @@ class AppConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+    timing: TimingConfig = Field(default_factory=TimingConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "AppConfig":

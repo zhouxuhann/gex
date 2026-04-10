@@ -99,7 +99,7 @@ class StateManager:
                expiry: str, is_true_0dte: bool, df: pd.DataFrame,
                call_wall: float | None = None, put_wall: float | None = None,
                positive_gamma: bool = False,
-               regime_code: str | None = None, regime_tags: dict | None = None):
+               regime_code: str | None = None, regime_tags: dict | None = None) -> None:
         """更新实时状态"""
         now = et_now()
         minute = now.replace(second=0, microsecond=0)
@@ -170,8 +170,8 @@ class StateManager:
 
             self._history_version += 1
 
-    def set_status(self, market_open: bool = None, connected: bool = None,
-                   updated: str = None):
+    def set_status(self, market_open: bool | None = None, connected: bool | None = None,
+                   updated: str | None = None) -> None:
         """设置连接状态"""
         with self._lock:
             if market_open is not None:
@@ -181,7 +181,7 @@ class StateManager:
             if updated is not None:
                 self._updated = updated
 
-    def log(self, level: str, msg: str):
+    def log(self, level: str, msg: str) -> None:
         """记录日志"""
         with self._lock:
             self._logs.append((level, et_now(), str(msg)))

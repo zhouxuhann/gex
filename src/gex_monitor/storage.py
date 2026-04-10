@@ -29,7 +29,7 @@ PARQUET_ROW_GROUP_SIZE = 10000  # Parquet row group 大小
 PARQUET_COMPRESSION = 'snappy'  # 压缩算法（snappy: 速度快，gzip: 压缩率高）
 
 
-def _normalize_ts_to_utc(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_ts_to_utc(df: "pd.DataFrame") -> "pd.DataFrame":
     """将 df['ts'] 转换为 UTC 时区（用于存储前）"""
     if 'ts' not in df.columns:
         return df
@@ -43,7 +43,7 @@ def _normalize_ts_to_utc(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _normalize_ts_to_et(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_ts_to_et(df: "pd.DataFrame") -> "pd.DataFrame":
     """将 df['ts'] 转换为 ET 时区（用于读取后）"""
     if 'ts' not in df.columns:
         return df
@@ -57,7 +57,7 @@ def _normalize_ts_to_et(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _atomic_write_parquet(df: pd.DataFrame, path: Path):
+def _atomic_write_parquet(df: "pd.DataFrame", path: Path) -> None:
     """原子写入 parquet 文件（先写临时文件再 rename）
 
     使用 PyArrow 优化:
@@ -77,8 +77,8 @@ def _atomic_write_parquet(df: pd.DataFrame, path: Path):
     tmp.replace(path)
 
 
-def _merge_and_write(path: Path, new_df: pd.DataFrame, key_cols: list[str],
-                     io_lock: threading.Lock):
+def _merge_and_write(path: Path, new_df: "pd.DataFrame", key_cols: list[str],
+                     io_lock: threading.Lock) -> None:
     """合并新旧数据并写入文件"""
     if new_df.empty:
         return
@@ -99,13 +99,13 @@ def _merge_and_write(path: Path, new_df: pd.DataFrame, key_cols: list[str],
         _atomic_write_parquet(combined, path)
 
 
-def _read_parquet_with_lock(path: Path, io_lock: threading.Lock) -> pd.DataFrame:
+def _read_parquet_with_lock(path: Path, io_lock: threading.Lock) -> "pd.DataFrame":
     """读取 parquet 文件（带锁）"""
     with io_lock:
         return pd.read_parquet(path)
 
 
-def read_parquet_et(path: Path, io_lock: Optional[threading.Lock] = None) -> pd.DataFrame:
+def read_parquet_et(path: Path, io_lock: Optional[threading.Lock] = None) -> "pd.DataFrame":
     """读取 parquet 文件并转换时区为 ET"""
     if io_lock is not None:
         df = _read_parquet_with_lock(path, io_lock)
@@ -133,7 +133,7 @@ class WriteBuffer:
     _disk_loaded: bool = False
     _disk_data: Optional[pd.DataFrame] = None
 
-    def append(self, records: list[dict]):
+    def append(self, records: list[dict]) -> None:
         """添加记录到缓冲区"""
         if not records:
             return
@@ -250,7 +250,7 @@ class StorageManager:
             return self._buffers[key]
 
     def persist_sync(self, symbol: str, hist: list[dict], ohlc: list[dict],
-                     strikes: list[dict] = None):
+                     strikes: list[dict] | None = None) -> None:
         """同步落盘（使用缓冲区，达到阈值才写磁盘）"""
         date_str = et_now().strftime('%Y%m%d')
         try:
@@ -280,7 +280,7 @@ class StorageManager:
             log.error(f"persist failed for {symbol}: {e}")
 
     def persist_async(self, symbol: str, hist: list[dict], ohlc: list[dict],
-                      strikes: list[dict] = None):
+                      strikes: list[dict] | None = None) -> None:
         """异步落盘，不阻塞调用方。每个 symbol 独立跟踪。"""
         with self._persist_lock:
             # 检查该 symbol 上一次是否还在写
@@ -331,7 +331,7 @@ class StorageManager:
         }).dropna().reset_index()
         return agg
 
-    def persist_strikes_sync(self, symbol: str, strikes_data: list[dict]):
+    def persist_strikes_sync(self, symbol: str, strikes_data: list[dict]) -> None:
         """
         存储 strike-level GEX 数据（用于回放，使用缓冲区）
 
@@ -386,7 +386,7 @@ class StorageManager:
             return []
         return sorted(strikes_df['ts'].unique())
 
-    def flush_all_buffers(self):
+    def flush_all_buffers(self) -> int:
         """强制 flush 所有缓冲区"""
         with self._buffer_lock:
             buffers = list(self._buffers.values())
@@ -416,7 +416,7 @@ class StorageManager:
                 }
             return stats
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """关闭存储管理器，flush 缓冲区并等待落盘完成"""
         # 先 flush 所有缓冲区
         log.info("Flushing all buffers before shutdown...")
@@ -482,7 +482,7 @@ class SegmentStorage:
             _atomic_write_parquet(df, self.segments_file)
         return df
 
-    def delete_segments_by_ids(self, ids: list[str]):
+    def delete_segments_by_ids(self, ids: list[str]) -> None:
         """删除指定 ID 的分段"""
         if not ids:
             return

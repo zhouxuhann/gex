@@ -6,6 +6,7 @@ import time
 import numpy as np
 from ib_insync import IB, Stock, Index, Option
 
+from .config import TimingConfig
 from .gex_calc import calculate_gex, pick_expiry
 from .features import compute_realtime_features
 from .state import StateManager
@@ -18,13 +19,6 @@ log = logging.getLogger(__name__)
 
 # IB market data generic ticks
 GENERIC_TICKS = '100,101,104,106'
-
-# 时间常量
-TICK_INTERVAL_SEC = 3        # 主循环间隔
-PERSIST_INTERVAL_SEC = 60    # 持久化间隔
-RECONNECT_DELAY_SEC = 10     # 重连等待
-MARKET_CLOSED_CHECK_SEC = 300  # 非交易时段检查间隔
-MAX_SLEEP_SEC = 1800         # 最长休眠时间
 
 
 class IBWorker:
@@ -48,6 +42,7 @@ class IBWorker:
         sec_type: str = 'STK',
         connect_timeout: int = 20,
         max_retries: int = 3,
+        timing: TimingConfig | None = None,
     ):
         self.symbol = symbol
         self.trading_class = trading_class
@@ -61,6 +56,7 @@ class IBWorker:
         self.sec_type = sec_type
         self.connect_timeout = connect_timeout
         self.max_retries = max_retries
+        self.timing = timing or TimingConfig()
 
         self.ib: IB | None = None
         self.underlying = None
@@ -72,18 +68,18 @@ class IBWorker:
         self.last_good_spot: float | None = None
         self._running: bool = True
 
-    def _log(self, level: str, msg: str):
+    def _log(self, level: str, msg: str) -> None:
         """记录日志到 state 和 logger"""
         self.state.log(level, msg)
 
-    def _sleep(self, sec: float):
+    def _sleep(self, sec: float) -> None:
         """睡眠，同时推进 IB event loop"""
         if self.ib is not None and self.ib.isConnected():
             self.ib.sleep(sec)
         else:
             time.sleep(sec)
 
-    def _connect(self):
+    def _connect(self) -> None:
         """建立 IB 连接（带重试和超时）"""
         if self.ib is not None:
             try:
@@ -143,7 +139,7 @@ class IBWorker:
         self._log('info', f"IB connected (host={self.ib_host}, port={self.ib_port})")
         self.ib.sleep(1)
 
-    def _subscribe_options(self, expiry: str, strikes: list[float]):
+    def _subscribe_options(self, expiry: str, strikes: list[float]) -> None:
         """订阅期权行情"""
         key = (expiry, tuple(strikes))
         if key == self.current_key:
@@ -174,7 +170,7 @@ class IBWorker:
                           f"expiry={expiry} strikes={len(strikes)}")
         self.ib.sleep(2)
 
-    def _process_tick(self):
+    def _process_tick(self) -> bool:
         """处理一次 tick"""
         # 获取 spot
         u_ticker = self.ib.ticker(self.underlying)
@@ -265,14 +261,14 @@ class IBWorker:
         )
 
         # 定期持久化
-        if time.time() - self.last_persist > PERSIST_INTERVAL_SEC:
+        if time.time() - self.last_persist > self.timing.persist_interval_sec:
             hist, ohlc, strikes = self.state.get_persist_data()
             self.storage.persist_async(self.symbol, hist, ohlc, strikes)
             self.last_persist = time.time()
 
         return True
 
-    def run(self):
+    def run(self) -> None:
         """主循环（在独立线程调用）"""
         asyncio.set_event_loop(asyncio.new_event_loop())
 
@@ -311,10 +307,10 @@ class IBWorker:
                 try:
                     sleep_sec = max(seconds_until_next_open() - 60, 30)
                     self._log('info', f"Market closed, next check in {sleep_sec:.0f}s")
-                    time.sleep(min(sleep_sec, MAX_SLEEP_SEC))
+                    time.sleep(min(sleep_sec, self.timing.max_sleep_sec))
                 except RuntimeError as e:
-                    self._log('error', f"{e}; retrying in {MARKET_CLOSED_CHECK_SEC}s")
-                    time.sleep(MARKET_CLOSED_CHECK_SEC)
+                    self._log('error', f"{e}; retrying in {self.timing.market_closed_check_sec}s")
+                    time.sleep(self.timing.market_closed_check_sec)
                 continue
 
             # 确保连接
@@ -324,7 +320,7 @@ class IBWorker:
                 except Exception as e:
                     self.state.set_status(connected=False)
                     self._log('error', f"IB connect failed: {e}")
-                    time.sleep(RECONNECT_DELAY_SEC)
+                    time.sleep(self.timing.reconnect_delay_sec)
                     continue
 
             # 主循环
@@ -335,9 +331,9 @@ class IBWorker:
                 if self.ib is not None and not self.ib.isConnected():
                     self.state.set_status(connected=False)
 
-            self._sleep(TICK_INTERVAL_SEC)
+            self._sleep(self.timing.tick_interval_sec)
 
-    def stop(self):
+    def stop(self) -> None:
         """停止 worker"""
         self._running = False
         if self.ib is not None and self.ib.isConnected():

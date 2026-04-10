@@ -33,3 +33,10 @@ server:
 monitoring:
   stale_seconds: 15            # 数据陈旧警告阈值
   spot_sanity_pct: 0.01        # spot 单 tick 最大漂移 (1%)
+
+timing:
+  tick_interval_sec: 3         # 主循环间隔（秒）
+  persist_interval_sec: 60     # 持久化间隔（秒）
+  reconnect_delay_sec: 10      # IB 重连等待（秒）
+  market_closed_check_sec: 300 # 非交易时段检查间隔（秒）
+  max_sleep_sec: 1800          # 非交易时段最长休眠（秒）

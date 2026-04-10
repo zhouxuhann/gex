@@ -10,6 +10,8 @@ import logging
 import signal
 import sys
 import threading
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .config import AppConfig
@@ -18,8 +20,6 @@ from .state import registry
 from .storage import StorageManager, SegmentStorage
 from .ui import create_app
 
-from datetime import datetime
-
 # 日志目录
 LOG_DIR = Path(__file__).parent.parent.parent / 'logs'
 LOG_DIR.mkdir(exist_ok=True)
@@ -27,13 +27,25 @@ LOG_DIR.mkdir(exist_ok=True)
 # 日志文件名：logs/gex_20260409.log
 log_file = LOG_DIR / f"gex_{datetime.now().strftime('%Y%m%d')}.log"
 
+# 配置日志（带 rotation）
+_file_handler = RotatingFileHandler(
+    log_file,
+    maxBytes=10 * 1024 * 1024,  # 10 MB
+    backupCount=5,
+    encoding='utf-8',
+)
+_file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%H:%M:%S',
+))
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     datefmt='%H:%M:%S',
     handlers=[
         logging.StreamHandler(),  # 终端输出
-        logging.FileHandler(log_file, encoding='utf-8'),  # 文件输出
+        _file_handler,            # 文件输出（带 rotation）
     ]
 )
 log = logging.getLogger(__name__)
@@ -97,6 +109,7 @@ def main():
             sec_type=sym_config.sec_type,
             connect_timeout=config.ib.connect_timeout,
             max_retries=config.ib.max_retries,
+            timing=config.timing,
         )
         workers.append(worker)
 
