@@ -7,6 +7,7 @@ import numpy as np
 from ib_insync import IB, Stock, Index, Option
 
 from .gex_calc import calculate_gex, pick_expiry
+from .features import compute_realtime_features
 from .state import StateManager
 from .storage import StorageManager
 from .time_utils import (
@@ -235,6 +236,16 @@ class IBWorker:
                           f'数据缺失较多: missing_greeks={result.missing_greeks} '
                           f'missing_oi={result.missing_oi}')
 
+        # 计算 regime 特征
+        try:
+            history, _ = self.state.get_history_for_resample()
+            _, regime_code, regime_tags = compute_realtime_features(
+                result.df, spot, history
+            )
+        except Exception as e:
+            log.debug(f"Regime 计算失败: {e}")
+            regime_code, regime_tags = None, None
+
         # 更新状态
         self.state.update(
             spot=spot,
@@ -249,6 +260,8 @@ class IBWorker:
             call_wall=result.call_wall,
             put_wall=result.put_wall,
             positive_gamma=result.positive_gamma,
+            regime_code=regime_code,
+            regime_tags=regime_tags,
         )
 
         # 定期持久化

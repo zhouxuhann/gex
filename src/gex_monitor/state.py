@@ -26,6 +26,9 @@ class GEXSnapshot:
     call_wall: float | None = None
     put_wall: float | None = None
     positive_gamma: bool = False
+    # Regime 分类
+    regime_code: str | None = None
+    regime_tags: dict | None = None
 
 
 @dataclass
@@ -68,6 +71,9 @@ class StateManager:
         self._call_wall: float | None = None
         self._put_wall: float | None = None
         self._positive_gamma: bool = False
+        # Regime 分类
+        self._regime_code: str | None = None
+        self._regime_tags: dict | None = None
 
         # 历史数据
         self._history: deque = deque(maxlen=max_history)
@@ -92,7 +98,8 @@ class StateManager:
                call_gex: float, put_gex: float, atm_iv_pct: float | None,
                expiry: str, is_true_0dte: bool, df: pd.DataFrame,
                call_wall: float | None = None, put_wall: float | None = None,
-               positive_gamma: bool = False):
+               positive_gamma: bool = False,
+               regime_code: str | None = None, regime_tags: dict | None = None):
         """更新实时状态"""
         now = et_now()
         minute = now.replace(second=0, microsecond=0)
@@ -113,6 +120,9 @@ class StateManager:
             self._call_wall = call_wall
             self._put_wall = put_wall
             self._positive_gamma = positive_gamma
+            # Regime 分类
+            self._regime_code = regime_code
+            self._regime_tags = regime_tags
 
             # 追加历史
             self._history.append({
@@ -195,6 +205,9 @@ class StateManager:
                 'call_wall': self._call_wall,
                 'put_wall': self._put_wall,
                 'positive_gamma': self._positive_gamma,
+                # Regime 分类
+                'regime_code': self._regime_code,
+                'regime_tags': self._regime_tags,
             }
 
     def get_df(self) -> pd.DataFrame:

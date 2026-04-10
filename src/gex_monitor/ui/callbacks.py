@@ -101,7 +101,36 @@ def register_callbacks(
                 html.Span(f"  {stale_warning}",
                           style={'color': '#ff4444', 'fontWeight': 'bold'})
             )
-        stats = html.Div(stats_children)
+
+        # Regime 分类显示
+        regime_code = s.get('regime_code')
+        regime_tags = s.get('regime_tags') or {}
+        if regime_code:
+            # 根据 tags 选择颜色和图标
+            gamma_sign = regime_tags.get('gamma_sign', 'neutral')
+            position = regime_tags.get('position', 'mid_range')
+            concentration = regime_tags.get('concentration', 'diffuse')
+
+            # 图标
+            gamma_icon = {'long_gamma': '🟢', 'short_gamma': '🔴', 'neutral': '⚪'}.get(gamma_sign, '⚪')
+            pos_icon = {'above_flip': '📈', 'below_flip': '📉', 'at_flip': '⚡'}.get(position, '•')
+            conc_icon = '🧲' if concentration == 'concentrated' else '🌫️'
+
+            regime_children = [
+                html.Span("Regime: ", style={'color': '#888'}),
+                html.Span(f"{gamma_icon} ", style={'fontSize': '14px'}),
+                html.Span(f"{gamma_sign.replace('_', ' ')}  ",
+                          style={'color': '#00ff88' if gamma_sign == 'long_gamma' else '#ff4444' if gamma_sign == 'short_gamma' else '#aaa'}),
+                html.Span(f"{pos_icon} ", style={'fontSize': '14px'}),
+                html.Span(f"{position.replace('_', ' ')}  ", style={'color': '#ffaa00'}),
+                html.Span(f"{conc_icon} ", style={'fontSize': '14px'}),
+                html.Span(f"{concentration}", style={'color': '#00d4ff'}),
+            ]
+            regime_div = html.Div(regime_children, style={'marginTop': '4px', 'fontSize': '13px'})
+        else:
+            regime_div = html.Div()
+
+        stats = html.Div([html.Div(stats_children), regime_div])
 
         # GEX 柱状图
         by_strike = df.groupby('strike')['gex'].sum().sort_index() / 1e6
