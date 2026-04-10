@@ -77,6 +77,28 @@ def is_market_open(now: datetime = None) -> bool:
     return o <= now <= c
 
 
+def should_connect(now: datetime = None, warmup_minutes: int = 5) -> bool:
+    """
+    判断是否应该建立 IB 连接
+
+    在开盘前 warmup_minutes 分钟就连接，以获取盘前价格用于预热
+
+    Args:
+        now: 指定时间，默认当前美东时间
+        warmup_minutes: 开盘前多少分钟连接
+
+    Returns:
+        True 如果应该连接（盘前预热期或交易时段）
+    """
+    now = now or et_now()
+    sess = market_session_today(now)
+    if sess is None:
+        return False
+    o, c = sess
+    warmup_start = o - timedelta(minutes=warmup_minutes)
+    return warmup_start <= now <= c
+
+
 def seconds_until_next_open(now: datetime = None) -> float:
     """
     计算距离下一个交易日开盘的秒数

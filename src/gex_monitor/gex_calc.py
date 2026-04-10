@@ -38,23 +38,35 @@ class GEXResult:
     call_wall: float | None    # Call Wall（spot 上方正 GEX 最大的 strike）
     put_wall: float | None     # Put Wall（spot 下方负 GEX 绝对值最大的 strike）
     positive_gamma: bool       # 是否正 Gamma 环境
+    # ΔOI 相关
+    delta_oi_df: pd.DataFrame | None = None  # ΔOI 数据 (strike, call_delta_oi, put_delta_oi)
+    max_call_delta_oi_strike: float | None = None  # Call ΔOI 最大的 strike
+    max_put_delta_oi_strike: float | None = None   # Put ΔOI 最大的 strike
 
 
-def calculate_gex(tickers, spot: float) -> GEXResult | None:
+def calculate_gex(
+    tickers,
+    spot: float,
+    oi_ready_threshold: float = 0.8,
+    prev_oi: dict[float, dict] | None = None,
+) -> GEXResult | None:
     """
     从 IB tickers 计算 GEX
 
     Args:
         tickers: IB ticker 列表
         spot: 当前现货价格
+        oi_ready_threshold: OI 就绪比例阈值，低于此值返回 None
+        prev_oi: 前一交易日 OI 快照 {strike: {'call_oi': int, 'put_oi': int}}
 
     Returns:
-        GEXResult 或 None（无有效数据时）
+        GEXResult 或 None（无有效数据或 OI 未就绪时）
     """
     rows = []
     missing_oi = 0
     missing_greeks = 0
     invalid_contracts = 0
+    total_with_greeks = 0  # 有 Greeks 的合约数
 
     for t in tickers:
         if t is None:
@@ -76,42 +88,56 @@ def calculate_gex(tickers, spot: float) -> GEXResult | None:
             invalid_contracts += 1
             continue
 
-        # 优先使用 volume（盘中实时），OI 仅作 fallback
-        vol = getattr(t, 'volume', None)
-        if vol is None or (isinstance(vol, float) and np.isnan(vol)) or vol <= 0:
-            # fallback 到 OI
-            if oi is None or (isinstance(oi, float) and np.isnan(oi)) or oi <= 0:
-                # 无 volume 也无 OI，仍保留 strike（GEX=0），保持图表稳定
-                quantity = 0
-            else:
-                quantity = oi
+        total_with_greeks += 1
+
+        # OI: 用于计算 Flip（稳定的 dealer 仓位）
+        if oi is None or (isinstance(oi, float) and np.isnan(oi)) or oi <= 0:
+            missing_oi += 1
+            oi_qty = 0
         else:
-            quantity = vol
+            oi_qty = oi
+
+        # Volume: 用于计算 GEX（盘中实时活动）
+        vol = getattr(t, 'volume', None)
+        if vol is None or not isinstance(vol, (int, float)) or (isinstance(vol, float) and np.isnan(vol)) or vol <= 0:
+            vol_qty = oi_qty  # fallback 到 OI
+        else:
+            vol_qty = vol
 
         # dealer 约定: +1 for calls, -1 for puts
         multiplier = int(c.multiplier) if c.multiplier else 100
-        gex = sign * g.gamma * quantity * multiplier * spot ** 2 * 0.01
+        gex_oi = sign * g.gamma * oi_qty * multiplier * spot ** 2 * 0.01    # 用于 Flip
+        gex_vol = sign * g.gamma * vol_qty * multiplier * spot ** 2 * 0.01  # 用于 GEX 总量
 
         rows.append({
             'strike': c.strike,
             'right': c.right,
             'gamma': g.gamma,
-            'oi': quantity,  # 实际用的是 volume 或 OI
-            'gex': gex,
+            'oi': oi_qty,
+            'volume': vol_qty,
+            'gex_oi': gex_oi,    # OI-based GEX (for flip)
+            'gex': gex_vol,      # Volume-based GEX (for total)
             'iv': g.impliedVol,
         })
 
     if not rows:
         return None
 
+    # 检查 OI 就绪比例
+    if total_with_greeks > 0:
+        oi_ready_ratio = (total_with_greeks - missing_oi) / total_with_greeks
+        if oi_ready_ratio < oi_ready_threshold:
+            return None  # OI 数据未就绪，等待
+
     df = pd.DataFrame(rows)
 
-    # 按行权价汇总
-    by_strike = df.groupby('strike')['gex'].sum().sort_index()
+    # 按行权价汇总（OI-based 用于 Flip）
+    by_strike_oi = df.groupby('strike')['gex_oi'].sum().sort_index()
 
-    # Gamma Flip: 累积 GEX 穿越零点的位置
-    gamma_flip = _calculate_gamma_flip(by_strike, spot)
+    # Gamma Flip: 用 OI-based GEX 计算（稳定）
+    gamma_flip = _calculate_gamma_flip(by_strike_oi, spot)
 
+    # GEX 总量: 用 Volume-based GEX 计算（实时）
     total_gex = df['gex'].sum()
     call_gex = df[df.right == 'C']['gex'].sum()
     put_gex = df[df.right == 'P']['gex'].sum()
@@ -119,11 +145,49 @@ def calculate_gex(tickers, spot: float) -> GEXResult | None:
     # ATM IV
     atm_iv_pct = _calculate_atm_iv(df, spot)
 
-    # Call Wall / Put Wall 计算
-    call_wall, put_wall = _calculate_walls(by_strike, spot)
+    # Call Wall / Put Wall 计算（用 OI-based GEX，与 Flip 一致）
+    call_wall, put_wall = _calculate_walls(by_strike_oi, spot)
 
     # 是否正 Gamma 环境
     positive_gamma = total_gex > 0
+
+    # 计算 ΔOI（与前一交易日对比）
+    delta_oi_df = None
+    max_call_delta_oi_strike = None
+    max_put_delta_oi_strike = None
+
+    if prev_oi:
+        delta_oi_rows = []
+        # 按 strike 聚合当前 OI
+        call_oi_today = df[df.right == 'C'].groupby('strike')['oi'].sum()
+        put_oi_today = df[df.right == 'P'].groupby('strike')['oi'].sum()
+
+        all_strikes = set(call_oi_today.index) | set(put_oi_today.index) | set(prev_oi.keys())
+        for strike in sorted(all_strikes):
+            call_today = call_oi_today.get(strike, 0)
+            put_today = put_oi_today.get(strike, 0)
+            prev = prev_oi.get(strike, {'call_oi': 0, 'put_oi': 0})
+            call_prev = prev.get('call_oi', 0)
+            put_prev = prev.get('put_oi', 0)
+
+            delta_oi_rows.append({
+                'strike': strike,
+                'call_oi_today': call_today,
+                'put_oi_today': put_today,
+                'call_oi_prev': call_prev,
+                'put_oi_prev': put_prev,
+                'call_delta_oi': call_today - call_prev,
+                'put_delta_oi': put_today - put_prev,
+            })
+
+        if delta_oi_rows:
+            delta_oi_df = pd.DataFrame(delta_oi_rows)
+            # 找 ΔOI 最大的 strike
+            if not delta_oi_df.empty:
+                max_call_idx = delta_oi_df['call_delta_oi'].idxmax()
+                max_put_idx = delta_oi_df['put_delta_oi'].idxmax()
+                max_call_delta_oi_strike = delta_oi_df.loc[max_call_idx, 'strike']
+                max_put_delta_oi_strike = delta_oi_df.loc[max_put_idx, 'strike']
 
     return GEXResult(
         df=df,
@@ -138,6 +202,9 @@ def calculate_gex(tickers, spot: float) -> GEXResult | None:
         call_wall=call_wall,
         put_wall=put_wall,
         positive_gamma=positive_gamma,
+        delta_oi_df=delta_oi_df,
+        max_call_delta_oi_strike=max_call_delta_oi_strike,
+        max_put_delta_oi_strike=max_put_delta_oi_strike,
     )
 
 

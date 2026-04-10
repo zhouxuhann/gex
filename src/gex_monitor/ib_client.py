@@ -12,7 +12,7 @@ from .features import compute_realtime_features
 from .state import StateManager
 from .storage import StorageManager
 from .time_utils import (
-    et_now, trading_date_str, is_market_open, seconds_until_next_open
+    et_now, trading_date_str, is_market_open, should_connect, seconds_until_next_open
 )
 
 log = logging.getLogger(__name__)
@@ -67,6 +67,24 @@ class IBWorker:
         self.last_expiry_seen: str | None = None
         self.last_good_spot: float | None = None
         self._running: bool = True
+
+        # ΔOI 相关
+        self.prev_oi: dict[float, dict] | None = None  # 前一交易日 OI
+        self.today_oi: dict[float, dict] = {}  # 今日 OI（用于收盘保存）
+        self._load_prev_oi()
+
+    def _load_prev_oi(self) -> None:
+        """加载前一交易日的 OI 快照"""
+        today = trading_date_str()
+        prev_date = self.storage.get_previous_trading_day(today)
+        if prev_date:
+            self.prev_oi = self.storage.load_oi_snapshot(self.symbol, prev_date)
+            if self.prev_oi:
+                log.info(f"[{self.symbol}] Loaded prev OI from {prev_date}: {len(self.prev_oi)} strikes")
+            else:
+                log.info(f"[{self.symbol}] No prev OI found for {prev_date}")
+        else:
+            log.info(f"[{self.symbol}] No previous trading day OI snapshot found")
 
     def _log(self, level: str, msg: str) -> None:
         """记录日志到 state 和 logger"""
@@ -139,8 +157,117 @@ class IBWorker:
         self._log('info', f"IB connected (host={self.ib_host}, port={self.ib_port})")
         self.ib.sleep(1)
 
-    def _subscribe_options(self, expiry: str, strikes: list[float]) -> None:
-        """订阅期权行情"""
+        # 连接后执行预热，确保数据就绪
+        self._warmup()
+
+    def _warmup(self) -> None:
+        """
+        连接后预热：等待 spot 就绪并完成初始期权订阅
+
+        确保在开始正式数据采集前，所有合约都已正确订阅
+        """
+        self._log('info', "开始预热...")
+
+        # 1. 等待 spot 就绪
+        spot = None
+        for attempt in range(10):
+            self.ib.sleep(1)
+            u_ticker = self.ib.ticker(self.underlying)
+            spot = u_ticker.marketPrice() if u_ticker else None
+            if spot and not np.isnan(spot) and spot > 0:
+                self._log('info', f"Spot 就绪: {spot:.2f}")
+                self.last_good_spot = spot
+                break
+            self._log('info', f"等待 spot... (attempt {attempt + 1}/10)")
+        else:
+            self._log('warning', "预热: spot 未就绪，将在主循环中重试")
+            return
+
+        # 2. 获取 expiry
+        today_str = trading_date_str()
+        expiry, _ = pick_expiry(self.chain, today_str)
+        if expiry is None:
+            self._log('warning', "预热: 无可用 expiry")
+            return
+
+        # 3. 选择 strikes
+        all_strikes = sorted(s for s in self.chain.strikes if s == int(s))
+        below = [s for s in all_strikes if s <= spot][-10:]
+        above = [s for s in all_strikes if s > spot][:10]
+        strikes = sorted(set(below + above))
+        expected_contracts = len(strikes) * 2  # C + P
+
+        # 4. 订阅期权（带重试）
+        for attempt in range(3):
+            self._subscribe_options(expiry, strikes, validate=True)
+            actual = len(self.current_contracts)
+
+            if actual >= expected_contracts * 0.9:  # 允许 10% 容差
+                self._log('info',
+                          f"预热完成: {actual}/{expected_contracts} 合约就绪, "
+                          f"strikes={len(strikes)}, expiry={expiry}")
+                return
+
+            self._log('warning',
+                      f"预热: 合约不足 {actual}/{expected_contracts}, 重试 ({attempt + 1}/3)")
+            self.current_key = None  # 强制重新订阅
+            self.ib.sleep(2)
+
+        self._log('warning',
+                  f"预热: 合约订阅未达预期 ({len(self.current_contracts)}/{expected_contracts}), "
+                  "继续运行")
+
+    def _update_warmup(self) -> None:
+        """
+        预热期更新：检查 spot 变化，必要时重新订阅 strikes
+
+        在开盘前持续调用，确保 strikes 跟随盘前价格变化
+        """
+        # 获取当前 spot
+        u_ticker = self.ib.ticker(self.underlying)
+        spot = u_ticker.marketPrice() if u_ticker else None
+        if not spot or np.isnan(spot) or spot <= 0:
+            return
+
+        # 检查 spot 是否变化超过 $1
+        if self.last_good_spot is not None:
+            change = abs(spot - self.last_good_spot)
+            if change < 1.0:  # 变化 < $1，不需要更新
+                return
+            self._log('info', f"预热: spot 变化 {self.last_good_spot:.2f} → {spot:.2f} (${change:.2f})")
+
+        self.last_good_spot = spot
+
+        # 获取 expiry
+        today_str = trading_date_str()
+        expiry, _ = pick_expiry(self.chain, today_str)
+        if expiry is None:
+            return
+
+        # 重新计算 strikes
+        all_strikes = sorted(s for s in self.chain.strikes if s == int(s))
+        below = [s for s in all_strikes if s <= spot][-10:]
+        above = [s for s in all_strikes if s > spot][:10]
+        new_strikes = sorted(set(below + above))
+
+        # 检查 strikes 是否变化
+        new_key = (expiry, tuple(new_strikes))
+        if new_key == self.current_key:
+            return  # strikes 没变
+
+        self._log('info', f"预热: 重新订阅 strikes (spot={spot:.2f})")
+        self.current_key = None  # 强制重新订阅
+        self._subscribe_options(expiry, new_strikes, validate=True)
+
+    def _subscribe_options(self, expiry: str, strikes: list[float],
+                           validate: bool = False) -> None:
+        """订阅期权行情
+
+        Args:
+            expiry: 到期日
+            strikes: 行权价列表
+            validate: 是否验证合约数量（预热时使用）
+        """
         key = (expiry, tuple(strikes))
         if key == self.current_key:
             return
@@ -159,14 +286,26 @@ class IBWorker:
                    tradingClass=self.trading_class)
             for s in strikes for r in ['C', 'P']
         ]
+        expected = len(raw)
         self.current_contracts = self.ib.qualifyContracts(*raw)
+        actual = len(self.current_contracts)
+
+        # 验证合约数量
+        if validate and actual < expected:
+            # 记录哪些合约验证失败
+            qualified_keys = {(c.strike, c.right) for c in self.current_contracts}
+            missing = [(s, r) for s in strikes for r in ['C', 'P']
+                       if (s, r) not in qualified_keys]
+            if missing:
+                self._log('warning',
+                          f"合约验证失败: {len(missing)} 个 - {missing[:5]}...")
 
         # 订阅行情
         for c in self.current_contracts:
             self.ib.reqMktData(c, genericTickList=GENERIC_TICKS, snapshot=False)
 
         self.current_key = key
-        self._log('info', f"订阅 {len(self.current_contracts)} 个合约 "
+        self._log('info', f"订阅 {actual}/{expected} 个合约 "
                           f"expiry={expiry} strikes={len(strikes)}")
         self.ib.sleep(2)
 
@@ -213,9 +352,9 @@ class IBWorker:
                 self._log('warning',
                           f"⚠️ 今日无 0DTE 合约，回退到 {expiry} — GEX 语义与 0DTE 不同")
 
-        # 计算 GEX
+        # 计算 GEX（传入前一日 OI 用于计算 ΔOI）
         tickers = [self.ib.ticker(c) for c in self.current_contracts]
-        result = calculate_gex(tickers, spot)
+        result = calculate_gex(tickers, spot, prev_oi=self.prev_oi)
 
         if result is None:
             self._log('warning',
@@ -231,6 +370,16 @@ class IBWorker:
                 self._log('warning',
                           f'数据缺失较多: missing_greeks={result.missing_greeks} '
                           f'missing_oi={result.missing_oi}')
+
+        # 收集今日 OI（用于收盘保存）
+        for _, row in result.df.iterrows():
+            strike = row['strike']
+            if strike not in self.today_oi:
+                self.today_oi[strike] = {'call_oi': 0, 'put_oi': 0}
+            if row['right'] == 'C':
+                self.today_oi[strike]['call_oi'] = int(row['oi'])
+            else:
+                self.today_oi[strike]['put_oi'] = int(row['oi'])
 
         # 计算 regime 特征
         try:
@@ -273,11 +422,15 @@ class IBWorker:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
         while self._running:
-            # 非交易时段
-            if not is_market_open():
+            now = et_now()
+            market_open = is_market_open(now)
+            should_conn = should_connect(now, warmup_minutes=5)
+
+            # 非连接时段（收盘后且不在预热期）
+            if not should_conn:
                 self.state.set_status(
                     market_open=False,
-                    updated=f"非交易时段 ({et_now().strftime('%H:%M ET')})"
+                    updated=f"非交易时段 ({now.strftime('%H:%M ET')})"
                 )
 
                 if self.ib is not None and self.ib.isConnected():
@@ -287,6 +440,15 @@ class IBWorker:
                         self.storage.persist_async(self.symbol, hist, ohlc, strikes)
                     except Exception as e:
                         self._log('error', f"盘后 persist 失败: {e}")
+
+                    # 保存今日 OI 快照（用于明天计算 ΔOI）
+                    try:
+                        if self.today_oi:
+                            today = trading_date_str()
+                            self.storage.save_oi_snapshot(self.symbol, today, self.today_oi)
+                            self._log('info', f"Saved OI snapshot: {len(self.today_oi)} strikes")
+                    except Exception as e:
+                        self._log('error', f"保存 OI 快照失败: {e}")
 
                     # 断开连接
                     try:
@@ -313,7 +475,7 @@ class IBWorker:
                     time.sleep(self.timing.market_closed_check_sec)
                 continue
 
-            # 确保连接
+            # 确保连接（在预热期或交易时段）
             if self.ib is None or not self.ib.isConnected():
                 try:
                     self._connect()
@@ -323,7 +485,20 @@ class IBWorker:
                     time.sleep(self.timing.reconnect_delay_sec)
                     continue
 
-            # 主循环
+            # 预热期：已连接但市场未开，持续更新 strikes
+            if not market_open:
+                self.state.set_status(
+                    market_open=False,
+                    updated=f"预热中，等待开盘 ({now.strftime('%H:%M:%S ET')})"
+                )
+                try:
+                    self._update_warmup()
+                except Exception as e:
+                    self._log('warning', f"预热更新失败: {e}")
+                self._sleep(1)
+                continue
+
+            # 主循环：市场已开
             try:
                 self._process_tick()
             except Exception as e:

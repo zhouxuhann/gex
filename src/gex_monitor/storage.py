@@ -386,6 +386,63 @@ class StorageManager:
             return []
         return sorted(strikes_df['ts'].unique())
 
+    # ==================== OI 快照存储 ====================
+
+    def save_oi_snapshot(self, symbol: str, date_str: str, oi_data: dict[float, dict]) -> None:
+        """
+        保存当日收盘 OI 快照
+
+        Args:
+            symbol: 标的代码
+            date_str: 日期 YYYYMMDD
+            oi_data: {strike: {'call_oi': int, 'put_oi': int}, ...}
+        """
+        if not oi_data:
+            return
+        rows = []
+        for strike, data in oi_data.items():
+            rows.append({
+                'strike': strike,
+                'call_oi': data.get('call_oi', 0),
+                'put_oi': data.get('put_oi', 0),
+            })
+        df = pd.DataFrame(rows)
+        path = self.data_dir / f'oi_snapshot_{symbol}_{date_str}.parquet'
+        with self._io_lock:
+            _atomic_write_parquet(df, path)
+        log.info(f"[{symbol}] Saved OI snapshot: {len(rows)} strikes")
+
+    def load_oi_snapshot(self, symbol: str, date_str: str) -> dict[float, dict] | None:
+        """
+        加载指定日期的 OI 快照
+
+        Returns:
+            {strike: {'call_oi': int, 'put_oi': int}, ...} 或 None
+        """
+        path = self.data_dir / f'oi_snapshot_{symbol}_{date_str}.parquet'
+        if not path.exists():
+            return None
+        with self._io_lock:
+            df = pd.read_parquet(path)
+        result = {}
+        for _, row in df.iterrows():
+            result[row['strike']] = {
+                'call_oi': int(row['call_oi']),
+                'put_oi': int(row['put_oi']),
+            }
+        return result
+
+    def get_previous_trading_day(self, date_str: str) -> str | None:
+        """获取上一个有 OI 快照的交易日"""
+        files = sorted(self.data_dir.glob('oi_snapshot_*_*.parquet'), reverse=True)
+        for f in files:
+            parts = f.stem.split('_')
+            if len(parts) >= 3:
+                file_date = parts[-1]
+                if file_date < date_str:
+                    return file_date
+        return None
+
     def flush_all_buffers(self) -> int:
         """强制 flush 所有缓冲区"""
         with self._buffer_lock:

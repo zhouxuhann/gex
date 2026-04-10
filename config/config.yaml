@@ -2,7 +2,7 @@
 
 ib:
   host: "127.0.0.1"           # Docker 内用 "host.docker.internal"
-  port: 7496                   # IB Gateway Live 端口 (Paper: 7497)
+  port: 7497                   # IB Gateway Live 端口 (Paper: 7497)
   client_id_base: 10           # 每个标的递增 client_id
 
 symbols:
