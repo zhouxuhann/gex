@@ -22,6 +22,22 @@ symbols:
     sec_type: IND              # 指数
     enabled: false             # 默认关闭
 
+  # 个股周期权
+  - name: NVDA
+    trading_class: NVDA        # NVDA 周权
+    strike_range: 0.05         # ATM 上下 5%
+    enabled: true
+
+  - name: AMD
+    trading_class: AMD         # AMD 周权
+    strike_range: 0.05
+    enabled: true
+
+  - name: MRVL
+    trading_class: MRVL        # MRVL 周权
+    strike_range: 0.06         # 价格较低，范围稍大
+    enabled: true
+
 storage:
   data_dir: "./data"           # Docker 内用 "/data"
   max_history: 8000            # 内存中保留的历史条数
