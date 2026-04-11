@@ -24,6 +24,12 @@ ENV/
 *.swp
 *.swo
 
+# Next.js / frontend
+web/node_modules/
+web/.next/
+web/out/
+web/.turbo/
+
 # macOS
 .DS_Store
 .AppleDouble
