@@ -391,9 +391,9 @@ class IBWorker:
         result = calculate_gex(tickers, spot, prev_oi=self.prev_oi)
 
         if result is None:
-            # 尾盘降级：15:30 ET 之后，缩窄到 ATM ±3 strike 重试
+            # 尾盘降级：15:00 ET 之后（最后一小时），缩窄到 ATM ±3 strike 重试
             now_et = et_now()
-            if (now_et.hour == 15 and now_et.minute >= 30) or now_et.hour > 15:
+            if now_et.hour >= 15:
                 narrow_below = [s for s in all_strikes if s <= spot][-3:]
                 narrow_above = [s for s in all_strikes if s > spot][:3]
                 narrow_strikes = sorted(set(narrow_below + narrow_above))
