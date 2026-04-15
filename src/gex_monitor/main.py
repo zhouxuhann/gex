@@ -60,8 +60,8 @@ def main():
                         help='覆盖服务器 host')
     parser.add_argument('--port', type=int, default=None,
                         help='覆盖服务器 port')
-    parser.add_argument('--hedge', action='store_true',
-                        help='启用 15:30 ET 自动对冲下单 (Paper 账户)')
+    parser.add_argument('--no-hedge', action='store_true',
+                        help='禁用自动对冲（默认开启）')
     parser.add_argument('--hedge-dry-run', action='store_true',
                         help='对冲信号预览模式（不实际下单）')
     parser.add_argument('--hedge-qty', type=int, default=1,
@@ -104,8 +104,8 @@ def main():
 
     log.info(f"启用标的: {[s.name for s in enabled_symbols]}")
 
-    if args.hedge:
-        mode = "DRY RUN" if args.hedge_dry_run else f"LIVE (qty={args.hedge_qty})"
+    if not args.no_hedge:
+        mode = "DRY RUN" if not args.no_hedge_dry_run else f"LIVE (qty={not args.no_hedge_qty})"
         log.info(f"对冲自动执行已启用 [{mode}] — 15:30 ET 自动采集+下单")
 
     # 创建 workers
@@ -132,9 +132,9 @@ def main():
             max_retries=config.ib.max_retries,
             timing=config.timing,
             db_storage=db_storage,
-            hedge_enabled=args.hedge,
-            hedge_dry_run=args.hedge_dry_run,
-            hedge_qty=args.hedge_qty,
+            hedge_enabled=not args.no_hedge,
+            hedge_dry_run=not args.no_hedge_dry_run,
+            hedge_qty=not args.no_hedge_qty,
         )
         workers.append(worker)
 

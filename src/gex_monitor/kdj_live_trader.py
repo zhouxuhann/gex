@@ -609,9 +609,9 @@ class KDJLiveTrader:
     # ── 信号生成 ──
 
     def _exhaust_allows(self, direction, score, prev):
-        if direction == 1:
-            return (score > prev) or (score > -3)
-        return (score < prev) or (score < 3)
+        if direction == 1:   # 做多: 动量不能强看空
+            return score > -2
+        return score < 2     # 做空: 动量不能强看多
 
     def _gen_signals(self, j, prev_j, prev_prev_j, close, in_trend, trend_dir,
                      bull_div, bear_div, in_session, in_bc, in_pure_c, in_14):

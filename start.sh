@@ -1,5 +1,5 @@
 #!/bin/bash
-# GEX Monitor + KDJ Trader 一键启动
+# GEX Monitor + KDJ Trader + Macro Dashboard 一键启动
 # 用法：
 #   ./start.sh              # 默认 dry-run
 #   ./start.sh live         # 实盘下单
@@ -10,6 +10,7 @@ cd "$(dirname "$0")"
 CONDA_ENV="gex"
 GEX_LOG="logs/gex_$(date +%Y%m%d).log"
 KDJ_LOG="logs/kdj_trader_$(date +%Y%m%d).log"
+MACRO_LOG="logs/macro_$(date +%Y%m%d).log"
 PID_FILE="logs/.pids"
 
 mkdir -p logs
@@ -65,14 +66,23 @@ KDJ_PID=$!
 cd ..
 echo "   PID=$KDJ_PID  Log=$KDJ_LOG"
 
+# 启动 Macro Dashboard
+echo "🔧 Starting Macro Dashboard..."
+cd src
+python -m gex_monitor.macro_app > "../$MACRO_LOG" 2>&1 &
+MACRO_PID=$!
+cd ..
+echo "   PID=$MACRO_PID  Log=$MACRO_LOG"
+
 # 保存 PID
 echo "$GEX_PID" > "$PID_FILE"
 echo "$KDJ_PID" >> "$PID_FILE"
+echo "$MACRO_PID" >> "$PID_FILE"
 
 echo ""
-echo "✅ Both running!"
-echo "   GEX UI: http://localhost:8050"
-echo "   KDJ Log: tail -f $KDJ_LOG"
+echo "✅ All running!"
+echo "   GEX UI:    http://localhost:8050"
+echo "   Macro UI:  http://localhost:8051"
+echo "   KDJ Log:   tail -f $KDJ_LOG"
 echo ""
 echo "停止: ./start.sh stop"
-echo "查看: tail -f $KDJ_LOG"
