@@ -2,6 +2,8 @@
 import asyncio
 import logging
 import time
+from collections import deque
+from statistics import median
 
 import numpy as np
 from ib_insync import IB, Stock, Index, Option
@@ -9,8 +11,14 @@ from ib_insync import IB, Stock, Index, Option
 from .config import TimingConfig
 from .gex_calc import calculate_gex, pick_expiry
 from .features import compute_realtime_features
+from .skew import compute_skew, SkewTracker
+from .skew_surface import collect_skew_surface
+from .hedge_signal import generate_hedge_signal, format_recommendation
+from .hedge_executor import HedgeExecutor, format_trade_result
+from .macro import fetch_macro_snapshot
+from .db_storage import GEXDBStorage
 from .state import StateManager
-from .storage import StorageManager
+from .storage import StorageManager, SkewSurfaceStorage
 from .time_utils import (
     et_now, trading_date_str, is_market_open, should_connect, seconds_until_next_open
 )
@@ -43,11 +51,16 @@ class IBWorker:
         connect_timeout: int = 20,
         max_retries: int = 3,
         timing: TimingConfig | None = None,
+        db_storage: GEXDBStorage | None = None,
+        hedge_enabled: bool = False,
+        hedge_dry_run: bool = False,
+        hedge_qty: int = 1,
     ):
         self.symbol = symbol
         self.trading_class = trading_class
         self.state = state
         self.storage = storage
+        self.db_storage = db_storage
         self.ib_host = ib_host
         self.ib_port = ib_port
         self.client_id = client_id
@@ -72,6 +85,22 @@ class IBWorker:
         self.prev_oi: dict[float, dict] | None = None  # 前一交易日 OI
         self.today_oi: dict[float, dict] = {}  # 今日 OI（用于收盘保存）
         self._load_prev_oi()
+
+        # Strike 选择 hysteresis：spot 偏移超过此值才重选 strike
+        self._last_strike_spot: float | None = None
+
+        # Flip 平滑（滑动中位数，防止单 tick 跳变）
+        self._flip_buffer: deque[float] = deque(maxlen=20)
+
+        # Skew tracker
+        self.skew_tracker = SkewTracker(window=30)
+
+        # Daily skew surface + hedge signal (auto at 15:30 ET)
+        self._skew_surface_captured_today: bool = False
+        self._skew_surface_storage = SkewSurfaceStorage(storage.data_dir)
+        self._hedge_enabled = hedge_enabled
+        self._hedge_dry_run = hedge_dry_run
+        self._hedge_qty = hedge_qty
 
     def _load_prev_oi(self) -> None:
         """加载前一交易日的 OI 快照"""
@@ -335,13 +364,18 @@ class IBWorker:
             return False
 
         # 选择 strikes：ATM 前后各 10 个整数 strike
+        # Hysteresis: spot 偏移超过 $1 才重选，避免边界抖动触发重新订阅
         all_strikes = sorted(s for s in self.chain.strikes if s == int(s))
-        below = [s for s in all_strikes if s <= spot][-10:]  # ATM 及以下 10 个
-        above = [s for s in all_strikes if s > spot][:10]    # ATM 以上 10 个
-        strikes = sorted(set(below + above))
-
-        # 订阅期权
-        self._subscribe_options(expiry, strikes)
+        need_reselect = (
+            self._last_strike_spot is None
+            or abs(spot - self._last_strike_spot) >= 1.0
+        )
+        if need_reselect:
+            below = [s for s in all_strikes if s <= spot][-10:]
+            above = [s for s in all_strikes if s > spot][:10]
+            strikes = sorted(set(below + above))
+            self._subscribe_options(expiry, strikes)
+            self._last_strike_spot = spot
 
         # 记录 expiry 变化
         if expiry != self.last_expiry_seen:
@@ -357,10 +391,26 @@ class IBWorker:
         result = calculate_gex(tickers, spot, prev_oi=self.prev_oi)
 
         if result is None:
-            self._log('warning',
-                      f'No valid data from {len(self.current_contracts)} contracts — '
-                      'check market data subscription')
-            return False
+            # 尾盘降级：15:30 ET 之后，缩窄到 ATM ±3 strike 重试
+            now_et = et_now()
+            if (now_et.hour == 15 and now_et.minute >= 30) or now_et.hour > 15:
+                narrow_below = [s for s in all_strikes if s <= spot][-3:]
+                narrow_above = [s for s in all_strikes if s > spot][:3]
+                narrow_strikes = sorted(set(narrow_below + narrow_above))
+                self._subscribe_options(expiry, narrow_strikes)
+                tickers = [self.ib.ticker(c) for c in self.current_contracts]
+                result = calculate_gex(tickers, spot, oi_ready_threshold=0.0,
+                                       prev_oi=self.prev_oi)
+                if result is not None:
+                    result.partial = True
+                    self._log('info',
+                              f'尾盘降级模式: {len(narrow_strikes)} strikes, '
+                              f'partial GEX={result.total_gex:.0f}')
+            if result is None:
+                self._log('warning',
+                          f'No valid data from {len(self.current_contracts)} contracts — '
+                          'check market data subscription')
+                return False
 
         if result.missing_greeks > 0 or result.missing_oi > 0:
             # 仅在数据较多缺失时警告
@@ -381,6 +431,17 @@ class IBWorker:
             else:
                 self.today_oi[strike]['put_oi'] = int(row['oi'])
 
+        # Flip 平滑：滑动中位数 + 低 GEX 锁定
+        raw_flip = result.gamma_flip
+        if abs(result.total_gex) < 5e8:
+            # GEX < 0.5B: flip 不可靠，沿用上次值
+            if self._flip_buffer:
+                result.gamma_flip = median(self._flip_buffer)
+            # 不把不可靠的值放进 buffer
+        else:
+            self._flip_buffer.append(raw_flip)
+            result.gamma_flip = median(self._flip_buffer)
+
         # 计算 regime 特征
         try:
             history, _ = self.state.get_history_for_resample()
@@ -390,6 +451,19 @@ class IBWorker:
         except Exception as e:
             log.debug(f"Regime 计算失败: {e}")
             regime_code, regime_tags = None, None
+
+        # 计算 skew 指标
+        rr_25 = skew_slope = rr_25_zscore = skew_signal = None
+        try:
+            skew_snap = compute_skew(tickers, spot)
+            skew_snap = self.skew_tracker.update(skew_snap, result.positive_gamma)
+            if skew_snap is not None:
+                rr_25 = skew_snap.rr_25
+                skew_slope = skew_snap.skew_slope
+                rr_25_zscore = skew_snap.rr_25_zscore
+                skew_signal = skew_snap.signal
+        except Exception as e:
+            log.debug(f"Skew 计算失败: {e}")
 
         # 更新状态
         self.state.update(
@@ -408,12 +482,45 @@ class IBWorker:
             max_pain=result.max_pain,
             regime_code=regime_code,
             regime_tags=regime_tags,
+            rr_25=rr_25,
+            skew_slope=skew_slope,
+            rr_25_zscore=rr_25_zscore,
+            skew_signal=skew_signal,
         )
+
+        # 缓冲到 DB
+        if self.db_storage is not None:
+            self.db_storage.buffer_snapshot({
+                'symbol': self.symbol,
+                'ts': et_now(),
+                'spot': spot,
+                'total_gex': result.total_gex,
+                'call_gex': result.call_gex,
+                'put_gex': result.put_gex,
+                'flip': result.gamma_flip,
+                'call_wall': result.call_wall,
+                'put_wall': result.put_wall,
+                'max_pain': result.max_pain,
+                'atm_iv_pct': result.atm_iv_pct,
+                'positive_gamma': result.positive_gamma,
+                'regime_code': regime_code,
+                'rr_25': rr_25,
+                'skew_slope': skew_slope,
+                'rr_25_zscore': rr_25_zscore,
+                'skew_signal': skew_signal,
+                'partial': getattr(result, 'partial', False),
+            })
 
         # 定期持久化
         if time.time() - self.last_persist > self.timing.persist_interval_sec:
             hist, ohlc, strikes = self.state.get_persist_data()
             self.storage.persist_async(self.symbol, hist, ohlc, strikes)
+            # DB flush
+            if self.db_storage is not None:
+                try:
+                    self.db_storage.flush()
+                except Exception as e:
+                    log.warning(f"DB flush error: {e}")
             self.last_persist = time.time()
 
         return True
@@ -450,6 +557,9 @@ class IBWorker:
                             self._log('info', f"Saved OI snapshot: {len(self.today_oi)} strikes")
                     except Exception as e:
                         self._log('error', f"保存 OI 快照失败: {e}")
+
+                    # 重置每日 skew surface 标志
+                    self._skew_surface_captured_today = False
 
                     # 断开连接
                     try:
@@ -507,7 +617,135 @@ class IBWorker:
                 if self.ib is not None and not self.ib.isConnected():
                     self.state.set_status(connected=False)
 
+            # 15:30 ET 自动采集 multi-tenor skew surface
+            self._maybe_capture_skew_surface(now)
+
             self._sleep(self.timing.tick_interval_sec)
+
+    def _maybe_capture_skew_surface(self, now) -> None:
+        """
+        15:30 ET 自动执行（每日一次）:
+          1. 采集 multi-tenor skew surface
+          2. 生成 hedge signal
+          3. 如果 hedge_enabled: 自动下单
+        """
+        if self._skew_surface_captured_today:
+            return
+        if now.hour != 15 or now.minute < 30:
+            return
+        if self.ib is None or not self.ib.isConnected():
+            return
+
+        self._skew_surface_captured_today = True
+        self._log('info', '=== 15:30 Daily Hedge Routine ===')
+
+        # Step 1: 采集 skew surface
+        surface = None
+        try:
+            surface = collect_skew_surface(
+                self.ib, self.symbol, self.trading_class, self.sec_type
+            )
+            if surface is not None:
+                self._skew_surface_storage.save_surface(surface.to_records())
+                self._log('info',
+                          f'Skew surface saved: {len(surface.tenors)} tenors, '
+                          f'term_spread_rr25={surface.term_spread_rr25}')
+            else:
+                self._log('warning', 'Skew surface collection returned None')
+                return
+        except Exception as e:
+            self._log('error', f'Skew surface capture failed: {e}')
+            self._skew_surface_captured_today = False
+            return
+
+        # Step 2: 生成 hedge signal
+        try:
+            history_df = self._skew_surface_storage.load_surface_history(
+                self.symbol, n_days=20
+            )
+
+            # GEX regime from current state
+            snapshot = self.state.get_snapshot()
+            total_gex = snapshot.get('total_gex', 0)
+            if total_gex > 0:
+                gex_regime = 'positive'
+            elif total_gex < 0:
+                gex_regime = 'negative'
+            else:
+                gex_regime = 'neutral'
+
+            last_signal = self._skew_surface_storage.get_last_signal(self.symbol)
+
+            # 采集宏观快照（VIX/MOVE/SOFR-OIS）
+            try:
+                macro = fetch_macro_snapshot(self.ib)
+            except Exception as e:
+                self._log('warning', f'Macro snapshot failed: {e}')
+                macro = None
+
+            signal = generate_hedge_signal(
+                surface=surface,
+                history_df=history_df,
+                gex_regime=gex_regime,
+                last_signal=last_signal,
+                macro=macro,
+            )
+
+            # 存储信号
+            self._skew_surface_storage.save_hedge_signal(signal.to_dict())
+
+            # 日志输出
+            self._log('info',
+                      f'Hedge signal: {signal.action} '
+                      f'(urgency={signal.urgency:.0%}, '
+                      f'skew={signal.skew_cheapness:.0f}pct, '
+                      f'gex={gex_regime}, '
+                      f'struct={signal.recommended_structure}, '
+                      f'tenor={signal.recommended_tenor})')
+
+            # 输出到 stdout（log 文件也能看到）
+            log.info(f'\n{format_recommendation(signal)}')
+
+        except Exception as e:
+            self._log('error', f'Hedge signal generation failed: {e}')
+            return
+
+        # Step 3: 自动执行（如果启用）
+        if not self._hedge_enabled:
+            self._log('info', 'Hedge execution disabled (use --hedge to enable)')
+            return
+
+        if signal.action not in ('HEDGE_NOW', 'HEDGE_SPREAD', 'REDUCE'):
+            self._log('info', f'Signal is {signal.action}, no trade needed')
+            return
+
+        try:
+            from .config import DatabaseConfig
+            db_config = DatabaseConfig()
+
+            executor = HedgeExecutor(
+                ib=self.ib,
+                db_config=db_config,
+                qty=self._hedge_qty,
+                dry_run=self._hedge_dry_run,
+            )
+
+            if signal.action == 'REDUCE':
+                results = executor.execute_reduce(self.symbol)
+                for r in results:
+                    self._log('info', f"Closed trade #{r['trade_id']}")
+            else:
+                record = executor.execute(signal, surface.spot)
+                if record:
+                    self._log('info', f'Trade executed: {record.status}')
+                    log.info(f'\n{format_trade_result(record)}')
+                else:
+                    self._log('warning', 'Trade execution returned None')
+
+            executor.shutdown()
+
+        except Exception as e:
+            self._log('error', f'Hedge execution failed: {e}')
 
     def stop(self) -> None:
         """停止 worker"""

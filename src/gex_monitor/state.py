@@ -30,6 +30,11 @@ class GEXSnapshot:
     # Regime 分类
     regime_code: str | None = None
     regime_tags: dict | None = None
+    # Skew 指标
+    rr_25: float | None = None
+    skew_slope: float | None = None
+    rr_25_zscore: float | None = None
+    skew_signal: str | None = None
 
 
 @dataclass
@@ -76,6 +81,11 @@ class StateManager:
         # Regime 分类
         self._regime_code: str | None = None
         self._regime_tags: dict | None = None
+        # Skew 指标
+        self._rr_25: float | None = None
+        self._skew_slope: float | None = None
+        self._rr_25_zscore: float | None = None
+        self._skew_signal: str | None = None
 
         # 历史数据
         self._history: deque = deque(maxlen=max_history)
@@ -101,7 +111,9 @@ class StateManager:
                expiry: str, is_true_0dte: bool, df: pd.DataFrame,
                call_wall: float | None = None, put_wall: float | None = None,
                positive_gamma: bool = False, max_pain: float | None = None,
-               regime_code: str | None = None, regime_tags: dict | None = None) -> None:
+               regime_code: str | None = None, regime_tags: dict | None = None,
+               rr_25: float | None = None, skew_slope: float | None = None,
+               rr_25_zscore: float | None = None, skew_signal: str | None = None) -> None:
         """更新实时状态"""
         now = et_now()
         minute = now.replace(second=0, microsecond=0)
@@ -126,6 +138,11 @@ class StateManager:
             # Regime 分类
             self._regime_code = regime_code
             self._regime_tags = regime_tags
+            # Skew 指标
+            self._rr_25 = rr_25
+            self._skew_slope = skew_slope
+            self._rr_25_zscore = rr_25_zscore
+            self._skew_signal = skew_signal
 
             # 追加历史
             self._history.append({
@@ -140,6 +157,9 @@ class StateManager:
                 'put_wall': put_wall,
                 'positive_gamma': positive_gamma,
                 'max_pain': max_pain,
+                'rr_25': rr_25,
+                'skew_slope': skew_slope,
+                'rr_25_zscore': rr_25_zscore,
             })
 
             # OHLC
@@ -213,6 +233,11 @@ class StateManager:
                 # Regime 分类
                 'regime_code': self._regime_code,
                 'regime_tags': self._regime_tags,
+                # Skew 指标
+                'rr_25': self._rr_25,
+                'skew_slope': self._skew_slope,
+                'rr_25_zscore': self._rr_25_zscore,
+                'skew_signal': self._skew_signal,
             }
 
     def get_df(self) -> pd.DataFrame:

@@ -15,6 +15,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .config import AppConfig
+from .db_storage import GEXDBStorage
 from .ib_client import IBWorker
 from .state import registry
 from .storage import StorageManager, SegmentStorage
@@ -59,6 +60,12 @@ def main():
                         help='覆盖服务器 host')
     parser.add_argument('--port', type=int, default=None,
                         help='覆盖服务器 port')
+    parser.add_argument('--hedge', action='store_true',
+                        help='启用 15:30 ET 自动对冲下单 (Paper 账户)')
+    parser.add_argument('--hedge-dry-run', action='store_true',
+                        help='对冲信号预览模式（不实际下单）')
+    parser.add_argument('--hedge-qty', type=int, default=1,
+                        help='每次对冲合约数 (默认 1)')
     args = parser.parse_args()
 
     # 加载配置
@@ -79,6 +86,16 @@ def main():
     storage = StorageManager(config.storage.data_dir)
     segments = SegmentStorage(config.storage.data_dir)
 
+    # 初始化 DB 存储
+    db_storage = None
+    if config.database.enabled:
+        db_storage = GEXDBStorage(config.database)
+        if db_storage.is_available:
+            log.info("DB storage enabled (PostgreSQL)")
+        else:
+            log.warning("DB storage configured but unavailable — parquet only")
+            db_storage = None
+
     # 获取启用的标的
     enabled_symbols = config.get_enabled_symbols()
     if not enabled_symbols:
@@ -86,6 +103,10 @@ def main():
         sys.exit(1)
 
     log.info(f"启用标的: {[s.name for s in enabled_symbols]}")
+
+    if args.hedge:
+        mode = "DRY RUN" if args.hedge_dry_run else f"LIVE (qty={args.hedge_qty})"
+        log.info(f"对冲自动执行已启用 [{mode}] — 15:30 ET 自动采集+下单")
 
     # 创建 workers
     workers: list[IBWorker] = []
@@ -110,6 +131,10 @@ def main():
             connect_timeout=config.ib.connect_timeout,
             max_retries=config.ib.max_retries,
             timing=config.timing,
+            db_storage=db_storage,
+            hedge_enabled=args.hedge,
+            hedge_dry_run=args.hedge_dry_run,
+            hedge_qty=args.hedge_qty,
         )
         workers.append(worker)
 
@@ -125,6 +150,7 @@ def main():
         storage=storage,
         segments=segments,
         symbols=[s.name for s in enabled_symbols],
+        db_storage=db_storage,
     )
 
     # 优雅关闭
@@ -142,6 +168,10 @@ def main():
 
         # 等待持久化完成
         storage.shutdown()
+
+        # 关闭 DB
+        if db_storage is not None:
+            db_storage.shutdown()
 
         log.info("Shutdown complete")
 

@@ -1,4 +1,5 @@
 """配置模块"""
+import os
 from pathlib import Path
 from typing import Literal, Self
 
@@ -53,6 +54,26 @@ class TimingConfig(BaseModel):
     max_sleep_sec: int = 1800            # 最长休眠时间
 
 
+class DatabaseConfig(BaseModel):
+    """PostgreSQL 数据库配置（复用 ibkr-data-store）"""
+    enabled: bool = True
+    host: str = "127.0.0.1"
+    port: int = 5433
+    dbname: str = "ibkr_market_data"
+    user: str = "ibkr_user"
+    password: str = ""
+
+    @model_validator(mode='after')
+    def load_password_from_env(self) -> Self:
+        """密码优先从环境变量读取"""
+        if not self.password:
+            object.__setattr__(
+                self, 'password',
+                os.environ.get('POSTGRES_PASSWORD', 'ibkr_secure_password_2026')
+            )
+        return self
+
+
 class MonitoringConfig(BaseModel):
     """监控配置"""
     stale_seconds: int = 15
@@ -67,6 +88,7 @@ class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     timing: TimingConfig = Field(default_factory=TimingConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "AppConfig":
