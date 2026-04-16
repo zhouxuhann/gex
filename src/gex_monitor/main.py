@@ -105,7 +105,7 @@ def main():
     log.info(f"启用标的: {[s.name for s in enabled_symbols]}")
 
     if not args.no_hedge:
-        mode = "DRY RUN" if not args.no_hedge_dry_run else f"LIVE (qty={not args.no_hedge_qty})"
+        mode = "DRY RUN" if args.hedge_dry_run else f"LIVE (qty={args.hedge_qty})"
         log.info(f"对冲自动执行已启用 [{mode}] — 15:30 ET 自动采集+下单")
 
     # 创建 workers
@@ -133,8 +133,8 @@ def main():
             timing=config.timing,
             db_storage=db_storage,
             hedge_enabled=not args.no_hedge,
-            hedge_dry_run=not args.no_hedge_dry_run,
-            hedge_qty=not args.no_hedge_qty,
+            hedge_dry_run=args.hedge_dry_run,
+            hedge_qty=args.hedge_qty,
         )
         workers.append(worker)
 
