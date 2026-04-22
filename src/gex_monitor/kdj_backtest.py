@@ -32,6 +32,8 @@ from engine_v48_live import (
     KDJCalculator, ADXCalculator, ATRCalculator, DEMACalculator,
     SpeedDivergence, PureCState,
 )
+from gex_regime_reader import GEXRegimeReader
+from vix_regime_reader import VIXRegimeReader
 
 ET = pytz.timezone('America/New_York')
 
@@ -56,6 +58,14 @@ PARAMS = {
     'a_skip_14': True, 'bc_all_day': True, 'bc_end_min': 900,  # 纯 C 从 15:00 起
     't_confirm_2bar': True,   # T 信号 2-bar 确认
     'b_reverse_c': True,      # B 止损后立即反手 C（v4.8 原版行为）
+    # GEX regime gate: +γ 只开 A/B, -γ 只开 T, 纯C 不 gate
+    'gex_gate_enabled': False,  # backtest 默认关，--gex-gate 打开
+    'gex_gate_symbol': 'QQQ',
+    'gex_stale_sec_max': 180,
+    # VIX regime gate: 用前一日 VIX close 分三档，低→反转, 高→趋势, 中→全开
+    'vix_gate_enabled': False,
+    'vix_low_thresh': 15.0,
+    'vix_high_thresh': 25.0,
     # 回测专用
     'tqqq_leverage': 3.0,     # TQQQ ≈ 3× QQQ intraday 收益
     'qty': 500,               # 每次交易数量
@@ -178,11 +188,14 @@ def load_30s_bars(start_date: str, end_date: str, symbol='QQQ') -> pd.DataFrame:
 # ═══════════════════════════════════════════════
 class KDJBacktester:
 
-    def __init__(self, params=None):
+    def __init__(self, params=None, gex_reader=None, vix_reader=None):
         self.p = params or PARAMS
+        self.gex_reader = gex_reader   # 可选：GEXRegimeReader（historical loaded）
+        self.vix_reader = vix_reader   # 可选：VIXRegimeReader（historical loaded）
         self._reset_for_new_day()
         self.all_trades: list[TradeRecord] = []
         self.daily_stats: list[dict] = []
+        self.gate_log = []  # 记录每次 gate 决策 (合并 gex + vix)
 
     def _reset_for_new_day(self):
         p = self.p
@@ -350,7 +363,7 @@ class KDJBacktester:
         # 生成下根 bar 开始时的信号
         self._gen_signals(j, prev_j, prev_prev_j, c, in_trend, trend_dir,
                           bull_div, bear_div, pure_c_long, pure_c_short,
-                          in_session, in_bc, in_pure_c, in_14)
+                          in_session, in_bc, in_pure_c, in_14, bar_ts=dt)
 
         # 5-min 级的入场可以在这里立即执行（close price 近似 next-tick 价格）
         if self._prev_signals and self.pos.direction == 0:
@@ -370,7 +383,7 @@ class KDJBacktester:
 
     def _gen_signals(self, j, prev_j, prev_prev_j, close, in_trend, trend_dir,
                      bull_div, bear_div, pure_c_long, pure_c_short,
-                     in_session, in_bc, in_pure_c, in_14):
+                     in_session, in_bc, in_pure_c, in_14, bar_ts=None):
         p = self.p
         ms = self.momentum.score
         signals = {}
@@ -411,6 +424,33 @@ class KDJBacktester:
                     signals['T_LONG'] = close
                 if trend_dir == -1 and ptd != -1 and md <= 0:
                     signals['T_SHORT'] = close
+
+        # GEX regime gate
+        if signals and p.get('gex_gate_enabled', False) and self.gex_reader is not None:
+            filtered = {}
+            for k, v in signals.items():
+                ok, reason = self.gex_reader.allows(k, ts=bar_ts)
+                self.gate_log.append({
+                    'ts': bar_ts, 'gate': 'gex', 'signal': k,
+                    'allowed': ok, 'reason': reason,
+                })
+                if ok:
+                    filtered[k] = v
+            signals = filtered
+
+        # VIX regime gate (可与 GEX gate 叠加)
+        if signals and p.get('vix_gate_enabled', False) and self.vix_reader is not None:
+            filtered = {}
+            td = bar_ts.date() if bar_ts is not None else None
+            for k, v in signals.items():
+                ok, reason = self.vix_reader.allows(k, trade_date=td)
+                self.gate_log.append({
+                    'ts': bar_ts, 'gate': 'vix', 'signal': k,
+                    'allowed': ok, 'reason': reason,
+                })
+                if ok:
+                    filtered[k] = v
+            signals = filtered
 
         self._prev_signals = signals
 
@@ -637,6 +677,16 @@ def main():
                     help='Use old single-bar DEMA cross for T signal')
     ap.add_argument('--no-reverse-c', action='store_true',
                     help='Disable B 止损→反手 C 机制，B 止损就止损')
+    ap.add_argument('--gex-gate', action='store_true',
+                    help='启用 GEX regime gate (+γ→A/B, -γ→T)')
+    ap.add_argument('--gex-symbol', default='QQQ',
+                    help='GEX 数据来源的 symbol (默认 QQQ)')
+    ap.add_argument('--vix-gate', action='store_true',
+                    help='启用 VIX regime gate (低→A/B, 高→T, 中→全开)')
+    ap.add_argument('--vix-low', type=float, default=15.0,
+                    help='VIX 低波阈值 (默认 15)')
+    ap.add_argument('--vix-high', type=float, default=25.0,
+                    help='VIX 高波阈值 (默认 25)')
     args = ap.parse_args()
 
     p = dict(PARAMS)
@@ -650,8 +700,39 @@ def main():
         p['t_confirm_2bar'] = False
     if args.no_reverse_c:
         p['b_reverse_c'] = False
+    if args.gex_gate:
+        p['gex_gate_enabled'] = True
+        p['gex_gate_symbol'] = args.gex_symbol
+    if args.vix_gate:
+        p['vix_gate_enabled'] = True
+        p['vix_low_thresh'] = args.vix_low
+        p['vix_high_thresh'] = args.vix_high
 
-    bt = KDJBacktester(p)
+    # 初始化 GEX reader（如启用 gate）
+    gex_reader = None
+    if p.get('gex_gate_enabled'):
+        gex_reader = GEXRegimeReader(symbol=p['gex_gate_symbol'])
+        n_gex = gex_reader.load_historical(args.start, args.end)
+        print(f"GEX gate: loaded {n_gex} historical snapshots for {p['gex_gate_symbol']}")
+        if n_gex == 0:
+            print("⚠ 没有 GEX 历史数据，gate 将 fail-open (等同未启用)")
+
+    # 初始化 VIX reader
+    vix_reader = None
+    if p.get('vix_gate_enabled'):
+        vix_reader = VIXRegimeReader(
+            low_thresh=p['vix_low_thresh'],
+            high_thresh=p['vix_high_thresh'],
+        )
+        n_vix = vix_reader.load_historical(args.start, args.end)
+        print(f"VIX gate: loaded {n_vix} daily bars, thresholds low={args.vix_low} high={args.vix_high}")
+        if n_vix == 0:
+            print("⚠ 没有 VIX 日线数据，gate 将 fail-open")
+        else:
+            dist = vix_reader._daily_df['regime'].value_counts().to_dict()
+            print(f"  regime 分布: {dist}")
+
+    bt = KDJBacktester(p, gex_reader=gex_reader, vix_reader=vix_reader)
 
     print(f"加载 QQQ 30s bars: {args.start} ~ {args.end}")
     df = load_30s_bars(args.start, args.end)
@@ -723,6 +804,21 @@ def main():
         print(f"  {phase:6} {s['n']:>4} {s['wins']/s['n']*100:>5.0f}% "
               f"{avg_bps:>+8.2f} {s['pnl_bps']:>+8.1f} {s['pnl_usd']:>+10.2f} "
               f"{avg_hold:>8.1f}")
+
+    # Gate 汇总 (按 gate 分组)
+    if bt.gate_log:
+        from collections import Counter, defaultdict
+        by_gate = defaultdict(list)
+        for g in bt.gate_log:
+            by_gate[g.get('gate', 'unknown')].append(g)
+        for gate_name, logs in by_gate.items():
+            n_total = len(logs)
+            n_allowed = sum(1 for g in logs if g['allowed'])
+            n_blocked = n_total - n_allowed
+            print(f"\n{gate_name.upper()} gate: {n_total} 次判定，通过 {n_allowed} ({n_allowed/n_total*100:.0f}%)，阻挡 {n_blocked}")
+            blocked = Counter((g['signal'], g['reason']) for g in logs if not g['allowed'])
+            for (sig, reason), n in blocked.most_common(8):
+                print(f"  阻挡 {sig:12} × {n:4}  ({reason})")
 
     if args.out:
         df_out = pd.DataFrame([t.__dict__ for t in bt.all_trades])

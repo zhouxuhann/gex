@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.expanduser('~/Developer/mnq-trading-system'))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from engine_v48_live import KDJCalculator, ADXCalculator, ATRCalculator, SpeedDivergence, DEMACalculator, PureCState
+from gex_regime_reader import GEXRegimeReader
 
 ET = pytz.timezone('America/New_York')
 
@@ -94,6 +95,11 @@ PARAMS = {
     'dema_fast': 8, 'dema_slow': 34, 'kdj_period': 9,
     'session_start_min': 575, 'session_end_min': 950,
     'a_skip_14': True, 'bc_all_day': True, 'bc_end_min': 900,
+    # GEX regime gate: +γ → 只开 A/B(反转), -γ → 只开 T(顺势), 纯C 不 gate
+    # 数据缺失/过期时 fail-open (仍按原策略跑)
+    'gex_gate_enabled': True,
+    'gex_gate_symbol': 'QQQ',
+    'gex_stale_sec_max': 180,   # 3 分钟内的数据算新鲜
 }
 
 
@@ -261,6 +267,19 @@ class KDJLiveTrader:
         self.pure_c = PureCState(confirm_bars=self.p['div_confirm_bars'])
         self.trend_dema_f = DEMACalculator(self.p['trend_dema_fast'])
         self.trend_dema_s = DEMACalculator(self.p['trend_dema_slow'])
+
+        # GEX regime gate (live 读 DB 或 parquet 最新快照)
+        self.gex_reader = None
+        if self.p.get('gex_gate_enabled', False):
+            try:
+                self.gex_reader = GEXRegimeReader(
+                    symbol=self.p.get('gex_gate_symbol', 'QQQ'),
+                    stale_sec_max=self.p.get('gex_stale_sec_max', 180),
+                )
+                log.info(f"✓ GEX regime gate enabled (symbol={self.gex_reader.symbol})")
+            except Exception as e:
+                log.warning(f"GEX gate init failed, gate disabled: {e}")
+                self.gex_reader = None
 
         from momentum_scorer import MomentumScorer
         self.momentum = MomentumScorer(
@@ -794,6 +813,22 @@ class KDJLiveTrader:
                 signals['T_LONG'] = close
             if trend_dir == -1 and ptd == -1 and pptd != -1 and md <= 0:
                 signals['T_SHORT'] = close
+
+        # GEX regime gate：过滤 A/B/T，纯C 透传
+        # 失败 fail-open（GEX 挂掉不挡信号）
+        if signals and self.gex_reader is not None:
+            raw_keys = list(signals.keys())
+            filtered = {}
+            for k, v in signals.items():
+                ok, reason = self.gex_reader.allows(k)
+                if ok:
+                    filtered[k] = v
+                else:
+                    log.info(f"  🚫 GEX gate 过滤: {k} ({reason})")
+            if filtered != signals:
+                log.info(f"  ⚡ 原始信号: {raw_keys}")
+                log.info(f"  ✓ GEX 通过: {list(filtered.keys())}")
+            signals = filtered
 
         if signals:
             log.info(f"  ⚡ 信号: {list(signals.keys())}")
