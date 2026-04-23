@@ -49,16 +49,19 @@ _log_file = os.path.join(_data_dir, f"kdj_trader_{_today}.log")
 _csv_file = os.path.join(_data_dir, f"kdj_trades_{_today}.csv")
 _state_file = os.path.join(_data_dir, "kdj_position_state.json")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [KDJ] %(message)s',
-    datefmt='%H:%M:%S',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(_log_file, encoding='utf-8'),
-    ],
-)
-log = logging.getLogger(__name__)
+# 专用命名 logger，关闭 propagation 防止根 logger 的 handler (ib_insync 等) 造成重复输出
+# 幂等: 已挂 handler 则跳过，避免模块二次导入重复挂载
+log = logging.getLogger('kdj_live_trader')
+log.setLevel(logging.INFO)
+log.propagate = False
+if not log.handlers:
+    _fmt = logging.Formatter('%(asctime)s [KDJ] %(message)s', datefmt='%H:%M:%S')
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_fmt)
+    _fh = logging.FileHandler(_log_file, encoding='utf-8')
+    _fh.setFormatter(_fmt)
+    log.addHandler(_sh)
+    log.addHandler(_fh)
 log.info(f"日志: {_log_file}")
 log.info(f"交易记录: {_csv_file}")
 
