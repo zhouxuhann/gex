@@ -7,6 +7,7 @@ Usage:
 import argparse
 import atexit
 import logging
+import os
 import signal
 import sys
 import threading
@@ -112,9 +113,68 @@ def main():
     workers: list[IBWorker] = []
     threads: list[threading.Thread] = []
 
+    # 为 ddput 信号构造共享 EmailNotifier（所有 worker 共享节流字典）
+    from .ddput_signal import DdputConfig
+    from .email_notifier import EmailConfig, EmailNotifier
+    from .ib_error_watcher import IBErrorWatcher
+    shared_ddput_email_notifier = None
+    ddput_yaml = config.signals.ddput
+    if ddput_yaml.enabled and ddput_yaml.email.enabled:
+        shared_ddput_email_notifier = EmailNotifier(EmailConfig(
+            enabled=ddput_yaml.email.enabled,
+            sender=ddput_yaml.email.sender,
+            password_env=ddput_yaml.email.password_env,
+            recipients=ddput_yaml.email.recipients,
+            smtp_host=ddput_yaml.email.smtp_host,
+            smtp_port=ddput_yaml.email.smtp_port,
+            only_strong=ddput_yaml.email.only_strong,
+            cooldown_sec=ddput_yaml.email.cooldown_sec,
+            subject_prefix=ddput_yaml.email.subject_prefix,
+        ))
+        pwd_present = bool(os.environ.get(ddput_yaml.email.password_env, ''))
+        log.info(f'ddput email notifier 构造完成, recipients={ddput_yaml.email.recipients}, '
+                 f'only_strong={ddput_yaml.email.only_strong}, '
+                 f'password 环境变量 {ddput_yaml.email.password_env} '
+                 f'{"已设" if pwd_present else "⚠ 未设"}')
+
+    # IB 关键 error 报警器 (10197 手机登录冲突等)
+    # 即使 ddput email 关闭, 也用同样的 SMTP 配置发系统告警 (force=True)
+    sys_email_notifier = shared_ddput_email_notifier
+    if sys_email_notifier is None and ddput_yaml.email.recipients:
+        sys_email_notifier = EmailNotifier(EmailConfig(
+            enabled=False,  # 默认关, 但 send_alert(force=True) 仍会发
+            sender=ddput_yaml.email.sender,
+            password_env=ddput_yaml.email.password_env,
+            recipients=ddput_yaml.email.recipients,
+            smtp_host=ddput_yaml.email.smtp_host,
+            smtp_port=ddput_yaml.email.smtp_port,
+            subject_prefix=ddput_yaml.email.subject_prefix,
+        ))
+    shared_ib_error_watcher = IBErrorWatcher(
+        email_notifier=sys_email_notifier,
+        cooldown_sec=600,  # 同 error code 10 分钟最多 1 封邮件
+    )
+    log.info('IB error watcher 启用 (监听 10197/10089/10168/1100/1101/1102)')
+
     for i, sym_config in enumerate(enabled_symbols):
         # 注册状态管理器
         state = registry.register(sym_config.name, config.storage.max_history)
+
+        # 为此标的配置 ddput 实时信号
+        ddput_cfg = None
+        if ddput_yaml.enabled and sym_config.name in ddput_yaml.symbols:
+            ddput_cfg = DdputConfig(
+                enabled=True,
+                z_mild=ddput_yaml.z_mild,
+                z_strong=ddput_yaml.z_strong,
+                min_time_et=ddput_yaml.min_time_et,
+                max_time_et=ddput_yaml.max_time_et,
+                cooldown_sec=ddput_yaml.cooldown_sec,
+                smooth_window=ddput_yaml.smooth_window,
+                buffer_minutes=ddput_yaml.buffer_minutes,
+                min_history_min=ddput_yaml.min_history_min,
+                std_window_min=ddput_yaml.std_window_min,
+            )
 
         # 创建 worker
         worker = IBWorker(
@@ -135,6 +195,9 @@ def main():
             hedge_enabled=not args.no_hedge,
             hedge_dry_run=args.hedge_dry_run,
             hedge_qty=args.hedge_qty,
+            ddput_signal_config=ddput_cfg,
+            ddput_email_notifier=shared_ddput_email_notifier,
+            ib_error_watcher=shared_ib_error_watcher,
         )
         workers.append(worker)
 

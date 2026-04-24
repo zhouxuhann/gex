@@ -9,7 +9,10 @@ import numpy as np
 from ib_insync import IB, Stock, Index, Option
 
 from .config import TimingConfig
+from .ddput_signal import DdputConfig, DdputSignalDetector
+from .email_notifier import EmailNotifier
 from .gex_calc import calculate_gex, pick_expiry
+from .strike_selector import select_strikes
 from .features import compute_realtime_features
 from .skew import compute_skew, SkewTracker
 from .skew_surface import collect_skew_surface
@@ -20,7 +23,8 @@ from .db_storage import GEXDBStorage
 from .state import StateManager
 from .storage import StorageManager, SkewSurfaceStorage
 from .time_utils import (
-    et_now, trading_date_str, is_market_open, should_connect, seconds_until_next_open
+    et_now, trading_date_str, is_market_open, should_connect,
+    seconds_until_next_open, format_countdown_to_open,
 )
 
 log = logging.getLogger(__name__)
@@ -55,6 +59,9 @@ class IBWorker:
         hedge_enabled: bool = False,
         hedge_dry_run: bool = False,
         hedge_qty: int = 1,
+        ddput_signal_config: DdputConfig | None = None,
+        ddput_email_notifier: EmailNotifier | None = None,
+        ib_error_watcher=None,
     ):
         self.symbol = symbol
         self.trading_class = trading_class
@@ -89,6 +96,13 @@ class IBWorker:
         # Strike 选择 hysteresis：spot 偏移超过此值才重选 strike
         self._last_strike_spot: float | None = None
 
+        # Stale spot 检测：连续 N 个 tick spot 不变时跳过写入
+        self._stale_spot_count: int = 0
+        self._stale_spot_threshold: int = 10  # 连续 10 tick (~30s) 不变即 stale
+
+        # IB error watcher (10197 手机登录冲突等关键错误监听)
+        self._ib_error_watcher = ib_error_watcher
+
         # Flip 平滑（滑动中位数，防止单 tick 跳变）
         self._flip_buffer: deque[float] = deque(maxlen=20)
 
@@ -101,6 +115,24 @@ class IBWorker:
         self._hedge_enabled = hedge_enabled
         self._hedge_dry_run = hedge_dry_run
         self._hedge_qty = hedge_qty
+
+        # ddput 实时信号检测器（L2 观察提醒 + 自动记录）
+        self._ddput_detector: DdputSignalDetector | None = None
+        if ddput_signal_config is not None and ddput_signal_config.enabled:
+            self._ddput_detector = DdputSignalDetector(
+                symbol=self.symbol,
+                config=ddput_signal_config,
+                data_dir=self.storage.data_dir,
+                email_notifier=ddput_email_notifier,
+            )
+            email_status = ('email on' if ddput_email_notifier and
+                            ddput_email_notifier.config.enabled else 'email off')
+            log.info(f'[{self.symbol}] ddput signal detector enabled '
+                     f'(z_mild={ddput_signal_config.z_mild}, '
+                     f'z_strong={ddput_signal_config.z_strong}, '
+                     f'window {ddput_signal_config.min_time_et:.1f}-'
+                     f'{ddput_signal_config.max_time_et:.1f} ET, '
+                     f'{email_status})')
 
     def _load_prev_oi(self) -> None:
         """加载前一交易日的 OI 快照"""
@@ -156,6 +188,10 @@ class IBWorker:
                         f"IB connect failed after {self.max_retries} attempts: {last_error}"
                     )
 
+        # 挂 IB 关键 error 监听 (10197 等)
+        if self._ib_error_watcher is not None:
+            self._ib_error_watcher.attach(self.ib)
+
         # 创建 underlying
         if self.sec_type == 'IND':
             self.underlying = Index(self.symbol, 'CBOE', 'USD')
@@ -168,11 +204,20 @@ class IBWorker:
         chains = self.ib.reqSecDefOptParams(
             self.underlying.symbol, '', self.underlying.secType, self.underlying.conId
         )
-        self.chain = next((c for c in chains if c.exchange == 'SMART'), None)
+        # 同时按 exchange=SMART 和 trading_class 过滤
+        # SPX 会返回多个 chain：SMART+SPX(月度)、SMART+SPXW(周度/0DTE)、CBOE+... 等
+        # 只按 exchange 过滤会命中第一个（SMART+SPX 月度），导致拿不到 0DTE 和 $5 间距 strike
+        self.chain = next(
+            (c for c in chains
+             if c.exchange == 'SMART' and c.tradingClass == self.trading_class),
+            None,
+        )
         if self.chain is None:
+            available = [(c.exchange, c.tradingClass) for c in chains]
             raise RuntimeError(
-                f"No SMART option chain for {self.symbol}, "
-                f"available exchanges: {[c.exchange for c in chains]}"
+                f"No SMART option chain for {self.symbol} "
+                f"with trading_class={self.trading_class}. "
+                f"Available: {available}"
             )
 
         # 订阅 underlying 行情
@@ -219,11 +264,11 @@ class IBWorker:
             self._log('warning', "预热: 无可用 expiry")
             return
 
-        # 3. 选择 strikes
-        all_strikes = sorted(s for s in self.chain.strikes if s == int(s))
-        below = [s for s in all_strikes if s <= spot][-10:]
-        above = [s for s in all_strikes if s > spot][:10]
-        strikes = sorted(set(below + above))
+        # 3. 选择 strikes（按 config.strike_range 覆盖 ±N%）
+        strikes = select_strikes(
+            self.chain.strikes, spot, self.strike_range,
+            include_half_dollar=False,
+        )
         expected_contracts = len(strikes) * 2  # C + P
 
         # 4. 订阅期权（带重试）
@@ -274,10 +319,10 @@ class IBWorker:
             return
 
         # 重新计算 strikes
-        all_strikes = sorted(s for s in self.chain.strikes if s == int(s))
-        below = [s for s in all_strikes if s <= spot][-10:]
-        above = [s for s in all_strikes if s > spot][:10]
-        new_strikes = sorted(set(below + above))
+        new_strikes = select_strikes(
+            self.chain.strikes, spot, self.strike_range,
+            include_half_dollar=False,
+        )
 
         # 检查 strikes 是否变化
         new_key = (expiry, tuple(new_strikes))
@@ -354,6 +399,22 @@ class IBWorker:
                           f"丢弃异常 spot={spot:.2f} "
                           f"(上次={self.last_good_spot:.2f}, 漂移 {drift:.1%})")
                 return False
+        # Stale spot 检测：IB 行情断开时 spot 会冻结，避免写入无效快照
+        if self.last_good_spot is not None and spot == self.last_good_spot:
+            self._stale_spot_count += 1
+            if self._stale_spot_count >= self._stale_spot_threshold:
+                if self._stale_spot_count == self._stale_spot_threshold:
+                    self._log('warning',
+                              f'Spot 冻结 {self._stale_spot_count} tick '
+                              f'({spot:.2f}) — 疑似行情中断，暂停写入')
+                return False
+        else:
+            if self._stale_spot_count >= self._stale_spot_threshold:
+                self._log('info',
+                          f'Spot 恢复更新 ({self.last_good_spot:.2f} → {spot:.2f})，'
+                          f'跳过了 {self._stale_spot_count} tick')
+            self._stale_spot_count = 0
+
         self.last_good_spot = spot
 
         # 选择 expiry
@@ -363,17 +424,19 @@ class IBWorker:
             self._log('error', '无可用 expiry')
             return False
 
-        # 选择 strikes：ATM 前后各 10 个整数 strike
-        # Hysteresis: spot 偏移超过 $1 才重选，避免边界抖动触发重新订阅
-        all_strikes = sorted(s for s in self.chain.strikes if s == int(s))
+        # 选择 strikes：按 config.strike_range 覆盖 ±N%
+        # Hysteresis: spot 漂移超过 max($1, spot*0.002) 才重选（保证阈值
+        # 随 spot 缩放，避免高价标的的最外层 strike 未跟上 spot 漂移）
+        hysteresis = max(1.0, spot * 0.002)
         need_reselect = (
             self._last_strike_spot is None
-            or abs(spot - self._last_strike_spot) >= 1.0
+            or abs(spot - self._last_strike_spot) >= hysteresis
         )
         if need_reselect:
-            below = [s for s in all_strikes if s <= spot][-10:]
-            above = [s for s in all_strikes if s > spot][:10]
-            strikes = sorted(set(below + above))
+            strikes = select_strikes(
+                self.chain.strikes, spot, self.strike_range,
+                include_half_dollar=False,
+            )
             self._subscribe_options(expiry, strikes)
             self._last_strike_spot = spot
 
@@ -392,11 +455,15 @@ class IBWorker:
 
         if result is None:
             # 尾盘降级：15:00 ET 之后（最后一小时），缩窄到 ATM ±3 strike 重试
+            # （沿用 select_strikes 的 min_strikes_each_side floor 机制：
+            #  传极小 strike_range 强制走 floor 路径，拿到 ATM 上下最近各 3 个）
             now_et = et_now()
             if now_et.hour >= 15:
-                narrow_below = [s for s in all_strikes if s <= spot][-3:]
-                narrow_above = [s for s in all_strikes if s > spot][:3]
-                narrow_strikes = sorted(set(narrow_below + narrow_above))
+                narrow_strikes = select_strikes(
+                    self.chain.strikes, spot, strike_range=1e-6,
+                    include_half_dollar=False,
+                    min_strikes_each_side=3,
+                )
                 self._subscribe_options(expiry, narrow_strikes)
                 tickers = [self.ib.ticker(c) for c in self.current_contracts]
                 result = calculate_gex(tickers, spot, oi_ready_threshold=0.0,
@@ -432,15 +499,22 @@ class IBWorker:
                 self.today_oi[strike]['put_oi'] = int(row['oi'])
 
         # Flip 平滑：滑动中位数 + 低 GEX 锁定
+        # 新版 _calculate_gamma_flip 可能返回 None（无 cumsum 穿越时）
         raw_flip = result.gamma_flip
-        if abs(result.total_gex) < 5e8:
+        valid_buffer = [f for f in self._flip_buffer if f is not None]
+        if raw_flip is None:
+            # 算法诚实地说无 flip（dealer 在采样窗口内全程同号），
+            # 沿用 buffer 里最近的有效值；若 buffer 也空，保持 None
+            result.gamma_flip = median(valid_buffer) if valid_buffer else None
+        elif abs(result.total_gex) < 5e8:
             # GEX < 0.5B: flip 不可靠，沿用上次值
-            if self._flip_buffer:
-                result.gamma_flip = median(self._flip_buffer)
+            if valid_buffer:
+                result.gamma_flip = median(valid_buffer)
             # 不把不可靠的值放进 buffer
         else:
             self._flip_buffer.append(raw_flip)
-            result.gamma_flip = median(self._flip_buffer)
+            valid_buffer = [f for f in self._flip_buffer if f is not None]
+            result.gamma_flip = median(valid_buffer) if valid_buffer else raw_flip
 
         # 计算 regime 特征
         try:
@@ -464,6 +538,18 @@ class IBWorker:
                 skew_signal = skew_snap.signal
         except Exception as e:
             log.debug(f"Skew 计算失败: {e}")
+
+        # ddput 实时信号（L2 观察级，失败不影响主采集但要能看到错误）
+        if self._ddput_detector is not None:
+            try:
+                self._ddput_detector.update(
+                    ts=et_now(),
+                    put_gex=result.put_gex,
+                    spot=spot,
+                )
+            except Exception as e:
+                # 用 warning 而不是 debug，避免重蹈"17 小时 silent fail"覆辙
+                log.warning(f'[{self.symbol}] ddput signal update failed: {e}')
 
         # 更新状态
         self.state.update(
@@ -535,10 +621,12 @@ class IBWorker:
             should_conn = should_connect(now, warmup_minutes=5)
 
             # 非连接时段（收盘后且不在预热期）
+            # UI 端会每 4s 自己重算 countdown（见 callbacks.py），
+            # 这里只维护 market_open 标志位即可，倒计时不在这里算
             if not should_conn:
                 self.state.set_status(
                     market_open=False,
-                    updated=f"非交易时段 ({now.strftime('%H:%M ET')})"
+                    updated=format_countdown_to_open(now)
                 )
 
                 if self.ib is not None and self.ib.isConnected():
