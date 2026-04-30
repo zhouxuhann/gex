@@ -44,6 +44,8 @@ class GEXResult:
     delta_oi_df: pd.DataFrame | None = None  # ΔOI 数据 (strike, call_delta_oi, put_delta_oi)
     max_call_delta_oi_strike: float | None = None  # Call ΔOI 最大的 strike
     max_put_delta_oi_strike: float | None = None   # Put ΔOI 最大的 strike
+    # 降级模式标记
+    partial: bool = False  # True = 尾盘降级模式，仅 ATM 附近少量 strike
 
 
 def calculate_gex(
@@ -101,14 +103,25 @@ def calculate_gex(
 
         # Volume: 用于计算 GEX（盘中实时活动）
         vol = getattr(t, 'volume', None)
-        if vol is None or not isinstance(vol, (int, float)) or (isinstance(vol, float) and np.isnan(vol)) or vol <= 0:
-            vol_qty = oi_qty  # fallback 到 OI
-        else:
+        has_volume = (vol is not None
+                      and isinstance(vol, (int, float))
+                      and not (isinstance(vol, float) and np.isnan(vol))
+                      and vol > 0)
+        if has_volume:
             vol_qty = vol
+        else:
+            vol_qty = oi_qty  # fallback 到 OI
 
         # dealer 约定: +1 for calls, -1 for puts
         multiplier = int(c.multiplier) if c.multiplier else 100
         gex_oi = sign * g.gamma * oi_qty * multiplier * spot ** 2 * 0.01    # 用于 Flip
+
+        # Flip 用量: 有成交量的 strike 用 volume，无成交量的用 OI * 衰减因子
+        # 尾盘 OTM 期权 volume 归零，stale OI 会锚定 flip，降权以减少干扰
+        OI_DECAY_FACTOR = 0.3
+        flip_qty = vol if has_volume else oi_qty * OI_DECAY_FACTOR
+        gex_flip = sign * g.gamma * flip_qty * multiplier * spot ** 2 * 0.01
+
         gex_vol = sign * g.gamma * vol_qty * multiplier * spot ** 2 * 0.01  # 用于 GEX 总量
 
         rows.append({
@@ -117,7 +130,9 @@ def calculate_gex(
             'gamma': g.gamma,
             'oi': oi_qty,
             'volume': vol_qty,
-            'gex_oi': gex_oi,    # OI-based GEX (for flip)
+            'has_volume': has_volume,
+            'gex_oi': gex_oi,    # OI-based GEX
+            'gex_flip': gex_flip, # Flip 专用 (volume 优先，OI 降权)
             'gex': gex_vol,      # Volume-based GEX (for total)
             'iv': g.impliedVol,
         })
@@ -133,11 +148,12 @@ def calculate_gex(
 
     df = pd.DataFrame(rows)
 
-    # 按行权价汇总（OI-based 用于 Flip）
+    # 按行权价汇总（OI-based）
     by_strike_oi = df.groupby('strike')['gex_oi'].sum().sort_index()
 
-    # Gamma Flip: 用 OI-based GEX 计算（稳定）
-    gamma_flip = _calculate_gamma_flip(by_strike_oi, spot)
+    # Gamma Flip: 用 flip 专用 GEX（有量用 volume，无量 OI 降权 0.3）
+    by_strike_flip = df.groupby('strike')['gex_flip'].sum().sort_index()
+    gamma_flip = _calculate_gamma_flip(by_strike_flip, spot)
 
     # GEX 总量: 用 Volume-based GEX 计算（实时）
     total_gex = df['gex'].sum()
@@ -147,8 +163,9 @@ def calculate_gex(
     # ATM IV
     atm_iv_pct = _calculate_atm_iv(df, spot)
 
-    # Call Wall / Put Wall 计算（用 OI-based GEX，与 Flip 一致）
-    call_wall, put_wall = _calculate_walls(by_strike_oi, spot)
+    # Call Wall / Put Wall 计算（用 Volume-based GEX，反映实时交易压力）
+    by_strike_vol = df.groupby('strike')['gex'].sum().sort_index()
+    call_wall, put_wall = _calculate_walls(by_strike_vol, spot)
 
     # 是否正 Gamma 环境
     positive_gamma = total_gex > 0

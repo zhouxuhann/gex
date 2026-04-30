@@ -495,6 +495,101 @@ class StorageManager:
             self._buffers.clear()
 
 
+# ==================== Skew Surface 存储 ====================
+
+SKEW_SURFACE_COLUMNS = [
+    'ts', 'symbol', 'spot', 'expiry', 'dte',
+    'atm_iv', 'rr_25', 'rr_10', 'skew_slope', 'n_contracts',
+    'term_spread_rr25', 'term_spread_iv',
+]
+
+HEDGE_SIGNAL_COLUMNS = [
+    'ts', 'symbol', 'action', 'urgency',
+    'skew_cheapness', 'gex_regime', 'term_structure',
+    'recommended_structure', 'recommended_tenor', 'reasoning',
+]
+
+
+class SkewSurfaceStorage:
+    """Skew surface + hedge signal 存储"""
+
+    def __init__(self, data_dir: Path | str):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._io_lock = threading.Lock()
+
+    def save_surface(self, records: list[dict]) -> None:
+        """保存 skew surface 快照"""
+        if not records:
+            return
+        df = pd.DataFrame(records)
+        date_str = pd.Timestamp(records[0]['ts']).strftime('%Y%m%d')
+        symbol = records[0]['symbol']
+        path = self.data_dir / f'skew_surface_{symbol}_{date_str}.parquet'
+        _merge_and_write(path, df, ['ts', 'symbol', 'expiry'], self._io_lock)
+        log.info(f"[{symbol}] Saved skew surface: {len(records)} tenor records")
+
+    def load_surface(self, symbol: str, date_str: str) -> pd.DataFrame | None:
+        """加载指定日期的 skew surface"""
+        path = self.data_dir / f'skew_surface_{symbol}_{date_str}.parquet'
+        if not path.exists():
+            return None
+        with self._io_lock:
+            return pd.read_parquet(path)
+
+    def load_surface_history(
+        self, symbol: str, n_days: int = 20
+    ) -> pd.DataFrame | None:
+        """加载最近 N 天的 skew surface 数据，用于分位数计算"""
+        files = sorted(self.data_dir.glob(f'skew_surface_{symbol}_*.parquet'))
+        if not files:
+            return None
+
+        # 取最近 n_days 个文件
+        recent = files[-n_days:]
+        dfs = []
+        for f in recent:
+            try:
+                with self._io_lock:
+                    dfs.append(pd.read_parquet(f))
+            except Exception as e:
+                log.warning(f"Failed to read {f}: {e}")
+
+        if not dfs:
+            return None
+        return pd.concat(dfs, ignore_index=True)
+
+    def list_available_dates(self, symbol: str) -> list[str]:
+        """列出有 skew surface 数据的日期"""
+        files = sorted(self.data_dir.glob(f'skew_surface_{symbol}_*.parquet'))
+        return [f.stem.split('_')[-1] for f in files]
+
+    def save_hedge_signal(self, signal_dict: dict) -> None:
+        """保存对冲信号"""
+        if not signal_dict:
+            return
+        symbol = signal_dict['symbol']
+        path = self.data_dir / f'hedge_signals_{symbol}.parquet'
+        df = pd.DataFrame([signal_dict])
+        _merge_and_write(path, df, ['ts', 'symbol'], self._io_lock)
+
+    def load_hedge_signals(self, symbol: str) -> pd.DataFrame | None:
+        """加载历史对冲信号"""
+        path = self.data_dir / f'hedge_signals_{symbol}.parquet'
+        if not path.exists():
+            return None
+        with self._io_lock:
+            return pd.read_parquet(path)
+
+    def get_last_signal(self, symbol: str) -> dict | None:
+        """获取最近一次对冲信号"""
+        df = self.load_hedge_signals(symbol)
+        if df is None or df.empty:
+            return None
+        df = df.sort_values('ts')
+        return df.iloc[-1].to_dict()
+
+
 # ==================== 分段标注存储 ====================
 SEGMENT_COLUMNS = ['id', 'date', 'start_ts', 'end_ts', 'symbol',
                    'label', 'note', 'labeled_at']

@@ -2,7 +2,7 @@
 
 ib:
   host: "127.0.0.1"           # Docker 内用 "host.docker.internal"
-  port: 7497                   # IB Gateway Live 端口 (Paper: 7497)
+  port: 4002                   # IB Gateway Live 端口 (Paper: 7497)
   client_id_base: 10           # 每个标的递增 client_id
 
 symbols:
@@ -14,29 +14,44 @@ symbols:
   - name: SPY
     trading_class: SPY
     strike_range: 0.04
-    enabled: false
+    enabled: false             # 2026-04-17: SPY 期权数据拿不到，改用 SPX
 
   - name: SPX
     trading_class: SPXW        # SPX 周权
-    strike_range: 0.03
+    strike_range: 0.02         # 2026-04-17: spot~7100, ±2%≈±$142, ~30 strikes, ~60 订阅行
     sec_type: IND              # 指数
-    enabled: false             # 默认关闭
+    enabled: true              # 2026-04-17: 替代 SPY
 
-  # 个股周期权
+  # 个股周期权（2026-04-17 暂关：为 SPY 腾 IB 行情订阅额度）
   - name: NVDA
     trading_class: NVDA        # NVDA 周权
     strike_range: 0.05         # ATM 上下 5%
-    enabled: true
+    enabled: false
 
   - name: AMD
     trading_class: AMD         # AMD 周权
     strike_range: 0.05
-    enabled: true
+    enabled: false
 
   - name: MRVL
     trading_class: MRVL        # MRVL 周权
     strike_range: 0.06         # 价格较低，范围稍大
-    enabled: true
+    enabled: false
+
+  - name: PLTR
+    trading_class: PLTR
+    strike_range: 0.05
+    enabled: false
+
+  - name: SNOW
+    trading_class: SNOW
+    strike_range: 0.05
+    enabled: false
+
+  - name: BABA
+    trading_class: BABA
+    strike_range: 0.05
+    enabled: false
 
 storage:
   data_dir: "./data"           # Docker 内用 "/data"
@@ -56,3 +71,36 @@ timing:
   reconnect_delay_sec: 10      # IB 重连等待（秒）
   market_closed_check_sec: 300 # 非交易时段检查间隔（秒）
   max_sleep_sec: 1800          # 非交易时段最长休眠（秒）
+
+# L2 级 ddput 实时信号（仅观察 + 自动记录，不是交易指令）
+# 见 data/analysis/memory 里的 project_ddput_signal_hypothesis
+signals:
+  ddput:
+    enabled: true
+    symbols: [QQQ, SPX]        # 启用的标的
+    # 2026-04-21 实验记录: 试过 rolling-60 std + z>=2.5 + no cooldown，5 天回放发现
+    # long-short diff 从 -0.87 变 -8.11（更糟），已回滚到下列原参数。
+    # 结论: ddput 的 mild 区间 (1.5~2.5) 可能反而有价值；cooldown 合并了同拐点
+    # 的重复触发，对质量有帮助。暂不继续参数搜索，攒 10+ 天再评估。
+    z_mild: 1.5                # |z| >= 1.5 算温和极值
+    z_strong: 2.5              # |z| >= 2.5 算强极值
+    min_time_et: 10.0          # 10:00 ET 前 silent（开盘噪声）
+    max_time_et: 15.0          # 15:00 ET 后 silent（尾盘机械噪声）
+    cooldown_sec: 300          # 同方向 5 分钟冷却（合并同拐点重复触发）
+    smooth_window: 5           # trailing rolling mean 窗口（分钟）
+    buffer_minutes: 60         # 保留多少分钟历史
+    min_history_min: 10        # 少于这么多分钟不评估
+    std_window_min: null       # null = from-open expanding（原默认）
+    # 邮件推送（需要设置环境变量 GMAIL_APP_PASSWORD）
+    email:
+      enabled: false           # 2026-04-24 再次关闭: 用户观察一天后取消推送
+                               #   项目状态 closed-failed 不变, signals_live 仍记录
+                               #   dashboard 保留纯观察, 不发邮件
+                               #   历史: 04-22 上午关 → 下午重开 → 04-24 再关
+      sender: fzhouxu615@gmail.com
+      password_env: GMAIL_APP_PASSWORD
+      recipients:
+        - wenyi.hann@gmail.com
+      only_strong: false
+      cooldown_sec: 900
+      subject_prefix: '[GEX]'

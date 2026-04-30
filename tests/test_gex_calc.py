@@ -82,6 +82,43 @@ class TestCalculateGex:
         assert result is not None
         assert result.missing_oi == 1
 
+    def test_partial_flag_default_false(self, mock_ib_ticker):
+        """Test that partial flag defaults to False."""
+        tickers = [
+            mock_ib_ticker(500, 'C', gamma=0.10, oi=1000),
+            mock_ib_ticker(500, 'P', gamma=0.10, oi=800),
+        ]
+        result = calculate_gex(tickers, spot=502.0)
+        assert result is not None
+        assert result.partial is False
+
+    def test_partial_flag_settable(self, mock_ib_ticker):
+        """Test that partial flag can be set to True (used by degraded mode)."""
+        tickers = [
+            mock_ib_ticker(500, 'C', gamma=0.10, oi=1000),
+            mock_ib_ticker(500, 'P', gamma=0.10, oi=800),
+        ]
+        result = calculate_gex(tickers, spot=502.0)
+        assert result is not None
+        result.partial = True
+        assert result.partial is True
+
+    def test_zero_oi_threshold_accepts_all(self, mock_ib_ticker):
+        """Test oi_ready_threshold=0.0 accepts data even with all OI missing (degraded mode)."""
+        # All tickers have missing OI
+        t1 = mock_ib_ticker(500, 'C', gamma=0.10, oi=1000)
+        t1.callOpenInterest = None
+        t2 = mock_ib_ticker(500, 'P', gamma=0.10, oi=800)
+        t2.putOpenInterest = None
+        tickers = [t1, t2]
+        # Default threshold would reject this
+        result_default = calculate_gex(tickers, spot=502.0, oi_ready_threshold=0.8)
+        assert result_default is None
+        # Zero threshold accepts it
+        result_degraded = calculate_gex(tickers, spot=502.0, oi_ready_threshold=0.0)
+        assert result_degraded is not None
+        assert result_degraded.missing_oi == 2
+
     def test_gamma_flip_single_strike(self, mock_ib_ticker):
         """Test gamma flip calculation with single strike."""
         tickers = [

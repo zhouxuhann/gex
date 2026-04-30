@@ -2,6 +2,7 @@
 import dash
 from flask import Flask, jsonify
 
+from ..db_storage import GEXDBStorage
 from ..state import StateRegistry
 from ..storage import StorageManager, SegmentStorage
 from .layout import create_layout
@@ -13,6 +14,7 @@ def create_app(
     storage: StorageManager,
     segments: SegmentStorage,
     symbols: list[str],
+    db_storage: GEXDBStorage | None = None,
 ) -> dash.Dash:
     """
     创建 Dash 应用
@@ -56,6 +58,6 @@ def create_app(
     app.layout = create_layout(symbols)
 
     # 注册回调
-    register_callbacks(app, registry, storage, segments)
+    register_callbacks(app, registry, storage, segments, db_storage=db_storage)
 
     return app

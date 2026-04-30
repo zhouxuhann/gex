@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from ..db_storage import GEXDBStorage
 from ..state import StateRegistry
 from ..storage import StorageManager, SegmentStorage
 from ..time_utils import et_now
@@ -14,11 +15,31 @@ from .layout import LABEL_COLORS, LEVEL_COLORS
 STALE_SECONDS = 15
 
 
+def _load_ohlc(storage: StorageManager, db_storage: GEXDBStorage | None,
+               symbol: str, date_str: str) -> pd.DataFrame | None:
+    """加载 OHLC: 优先 DB，fallback parquet"""
+    if db_storage is not None:
+        df = db_storage.load_ohlc(symbol, date_str)
+        if df is not None and not df.empty:
+            return df
+    return storage.load_day_ohlc(symbol, date_str)
+
+
+def _list_dates(storage: StorageManager, db_storage: GEXDBStorage | None,
+                symbol: str) -> list[str]:
+    """列出可用日期: 合并 DB + parquet"""
+    dates = set(storage.list_available_dates(symbol))
+    if db_storage is not None:
+        dates.update(db_storage.list_available_dates(symbol))
+    return sorted(dates)
+
+
 def register_callbacks(
     app: dash.Dash,
     registry: StateRegistry,
     storage: StorageManager,
     segments: SegmentStorage,
+    db_storage: GEXDBStorage | None = None,
 ):
     """注册所有回调"""
 
@@ -83,6 +104,15 @@ def register_callbacks(
         put_wall_txt = f"{put_wall:.0f}" if put_wall else "—"
         max_pain_txt = f"{max_pain:.0f}" if max_pain else "—"
 
+        # Skew 指标
+        rr_25 = s.get('rr_25')
+        skew_slope = s.get('skew_slope')
+        rr_25_zscore = s.get('rr_25_zscore')
+        skew_signal = s.get('skew_signal')
+        rr_txt = f"{rr_25*100:.1f}%" if rr_25 is not None else "—"
+        skew_txt = f"{skew_slope:.2f}" if skew_slope is not None else "—"
+        zscore_txt = f"{rr_25_zscore:+.1f}" if rr_25_zscore is not None else "—"
+
         stats_children = [
             html.Span(f"{symbol}  |  ", style={'color': '#ffaa00', 'fontWeight': 'bold'}),
             html.Span(f"Spot: {s['spot']:.2f}  |  ", style={'color': '#00d4ff'}),
@@ -95,10 +125,19 @@ def register_callbacks(
             html.Span(f"Put Wall: {put_wall_txt}  |  ", style={'color': '#ff66cc'}),
             html.Span(f"Max Pain: {max_pain_txt}  |  ", style={'color': '#aaaaaa'}),
             html.Span(f"ATM IV: {iv_txt}%  |  ", style={'color': '#ff66cc'}),
+            html.Span(f"RR25: {rr_txt} (z={zscore_txt})  |  ",
+                      style={'color': '#ff8800' if rr_25 and rr_25 > 0 else '#00d4ff'}),
+            html.Span(f"Skew: {skew_txt}  |  ", style={'color': '#cc88ff'}),
             html.Span(f"Exp: {exp_txt}  |  ",
                       style={'color': '#ff4444' if not s.get('is_true_0dte') else '#aaaaaa'}),
             html.Span(f"Updated: {s['updated']}", style={'color': updated_color}),
         ]
+        if skew_signal:
+            signal_color = '#ff4444' if skew_signal == 'BEARISH_ACCELERATION' else '#ffaa00'
+            stats_children.append(
+                html.Span(f"  [{skew_signal}]",
+                          style={'color': signal_color, 'fontWeight': 'bold'})
+            )
         if stale_warning:
             stats_children.append(
                 html.Span(f"  {stale_warning}",
@@ -175,10 +214,11 @@ def register_callbacks(
         fig1.update_xaxes(title_text='Strike', row=2, col=1)
 
         # 历史演化图
-        fig2 = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                             subplot_titles=('Total GEX ($M)', 'Spot / Flip / Walls', 'ATM IV (%)'),
-                             vertical_spacing=0.08,
-                             row_heights=[0.4, 0.35, 0.25])
+        fig2 = make_subplots(rows=4, cols=1, shared_xaxes=True,
+                             subplot_titles=('Total GEX ($M)', 'Spot / Flip / Walls',
+                                             'ATM IV (%)', '25Δ RR / Skew Slope'),
+                             vertical_spacing=0.06,
+                             row_heights=[0.3, 0.3, 0.2, 0.2])
 
         grids = [('30s', '30s', '#00d4ff'),
                  ('1min', '1m', '#00ff88'),
@@ -223,13 +263,37 @@ def register_callbacks(
                                           name='ATM IV',
                                           line=dict(color='#ff66cc', width=2)),
                                row=3, col=1)
+            # Skew 指标
+            if 'rr_25' in r1.columns:
+                rr_pct = r1['rr_25'].dropna() * 100
+                if not rr_pct.empty:
+                    fig2.add_trace(go.Scatter(x=rr_pct.index, y=rr_pct, mode='lines',
+                                              name='RR 25Δ (%)',
+                                              line=dict(color='#ff8800', width=2)),
+                                   row=4, col=1)
+            if 'skew_slope' in r1.columns:
+                ss = r1['skew_slope'].dropna()
+                if not ss.empty:
+                    fig2.add_trace(go.Scatter(x=ss.index, y=ss, mode='lines',
+                                              name='Skew Slope',
+                                              line=dict(color='#cc88ff', width=2)),
+                                   row=4, col=1)
+            if 'rr_25_zscore' in r1.columns:
+                zs = r1['rr_25_zscore'].dropna()
+                if not zs.empty:
+                    fig2.add_trace(go.Scatter(x=zs.index, y=zs, mode='lines',
+                                              name='RR z-score',
+                                              line=dict(color='#ffaa00', width=1.5, dash='dot')),
+                                   row=4, col=1)
 
         fig2.add_hline(y=0, line=dict(color='gray', dash='dash'), row=1, col=1)
-        fig2.update_layout(template='plotly_dark', height=750,
+        fig2.add_hline(y=0, line=dict(color='gray', dash='dash'), row=4, col=1)
+        fig2.update_layout(template='plotly_dark', height=900,
                            paper_bgcolor='#0e1117', plot_bgcolor='#0e1117')
         fig2.update_yaxes(title_text='$M', row=1, col=1)
         fig2.update_yaxes(title_text='Price', row=2, col=1)
         fig2.update_yaxes(title_text='IV%', row=3, col=1)
+        fig2.update_yaxes(title_text='RR% / Slope', row=4, col=1)
 
         return stats, fig1, fig2, log_children
 
@@ -243,7 +307,7 @@ def register_callbacks(
     def refresh_dates(_, symbol, current):
         if not symbol:
             return [], None
-        dates = storage.list_available_dates(symbol)
+        dates = _list_dates(storage, db_storage, symbol)
         opts = [{'label': d, 'value': d} for d in dates]
         val = current if current in dates else (dates[-1] if dates else None)
         return opts, val
@@ -262,7 +326,7 @@ def register_callbacks(
         summary = ""
 
         if date_str and symbol:
-            ohlc = storage.load_day_ohlc(symbol, date_str)
+            ohlc = _load_ohlc(storage, db_storage, symbol, date_str)
             bars = storage.resample_5min(ohlc)
 
             if bars is not None and not bars.empty:
@@ -456,7 +520,7 @@ def register_callbacks(
         strikes_df = storage.get_strikes_at_time(symbol, date_str, target_ts)
 
         # K 线图 + 当前位置
-        ohlc = storage.load_day_ohlc(symbol, date_str)
+        ohlc = _load_ohlc(storage, db_storage, symbol, date_str)
         bars = storage.resample_5min(ohlc)
 
         fig_kline = go.Figure()

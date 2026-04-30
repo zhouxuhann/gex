@@ -26,6 +26,41 @@ LEVEL_COLORS = {
     'error': '#ff6666',
 }
 
+# Macro dashboard 配色
+MACRO_GREEN = '#00ff88'
+MACRO_ORANGE = '#ffaa00'
+MACRO_RED = '#ff4444'
+MACRO_GRAY = '#666'
+
+
+def _macro_panel() -> html.Div:
+    """宏观数据三大类面板骨架 — 数据由回调填充"""
+    return html.Div([
+        # Summary bar
+        html.Div(id='macro-summary', style={
+            'textAlign': 'center', 'fontSize': '16px',
+            'padding': '12px', 'marginBottom': '16px',
+            'backgroundColor': PANEL_BG, 'borderRadius': '8px',
+        }),
+        # Three cards
+        html.Div(id='macro-cards', style={
+            'display': 'flex', 'gap': '16px', 'flexWrap': 'wrap',
+            'justifyContent': 'center',
+        }),
+        # AI 解读区域
+        html.Details([
+            html.Summary("🤖 AI 宏观解读",
+                         style={'cursor': 'pointer', 'color': '#888',
+                                'fontSize': '14px', 'marginTop': '16px'}),
+            html.Div(id='macro-ai-interpretation', style={
+                'backgroundColor': PANEL_BG, 'padding': '16px',
+                'fontSize': '14px', 'lineHeight': '1.6',
+                'borderRadius': '6px', 'marginTop': '8px',
+                'whiteSpace': 'pre-wrap',
+            }),
+        ], style={'maxWidth': '1100px', 'margin': '16px auto 0'}),
+    ], style={'maxWidth': '1100px', 'margin': '0 auto 20px'})
+
 
 def create_layout(symbols: list[str]) -> html.Div:
     """
