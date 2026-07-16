@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .config import IntradayVRPConfig
+from .intraday_vrp_audit import build_vrp_daily_audit, write_vrp_daily_audit
 from .storage import StorageManager, read_parquet_et
 from .time_utils import ET, et_now, trading_date_str
 
@@ -226,6 +227,7 @@ class IntradayVRPMonitor:
         bars, source = self._load_clean_bars(date_str)
         if bars.empty:
             log.warning("[%s] VRP settlement %s: no clean OHLC", self.symbol, date_str)
+            self.audit_date(date_str)
             return 0
         settle = _finite(bars.iloc[-1]["close"])
         if settle is None:
@@ -262,9 +264,35 @@ class IntradayVRPMonitor:
             })
             rows.append(row)
         self.storage.persist_vrp_observations(self.symbol, date_str, rows)
+        self.audit_date(date_str)
         log.info("[%s] VRP settled %s: %s observations (%s)",
                  self.symbol, date_str, len(rows), source)
         return len(rows)
+
+    def audit_date(self, date_str: str) -> dict:
+        """审计指定日期并写入 vrp_quality_<symbol>_<date>.json。"""
+        quotes = self.storage.load_vrp_quotes(self.symbol, date_str)
+        observations = self.storage.load_vrp_observations(self.symbol, date_str)
+        report = build_vrp_daily_audit(
+            symbol=self.symbol,
+            date_str=date_str,
+            schedule=self._schedule,
+            quotes=quotes,
+            observations=observations,
+        )
+        path = write_vrp_daily_audit(report, self.storage.data_dir)
+        level = logging.INFO if report["quality"] == "good" else logging.WARNING
+        log.log(
+            level,
+            "[%s] VRP audit %s quality=%s coverage=%.1f%% settled=%.1f%% report=%s",
+            self.symbol,
+            date_str,
+            report["quality"],
+            report["coverage"] * 100,
+            report["settled_coverage"] * 100,
+            path,
+        )
+        return report
 
     def recover_unsettled(self) -> int:
         today = trading_date_str()
