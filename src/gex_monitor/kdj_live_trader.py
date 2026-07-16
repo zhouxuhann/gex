@@ -42,7 +42,10 @@ from gex_regime_reader import GEXRegimeReader
 ET = pytz.timezone('America/New_York')
 
 # 日志 + 数据目录
-_data_dir = os.path.expanduser('~/Downloads/gex/logs')
+_default_log_dir = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), '..', '..', 'logs')
+)
+_data_dir = os.path.expanduser(os.environ.get('GEX_LOG_DIR', _default_log_dir))
 os.makedirs(_data_dir, exist_ok=True)
 _today = datetime.now(ET).strftime('%Y%m%d')
 _log_file = os.path.join(_data_dir, f"kdj_trader_{_today}.log")
@@ -767,8 +770,8 @@ class KDJLiveTrader:
 
     def _exhaust_allows(self, direction, score, prev):
         if direction == 1:   # 做多: 动量不能强看空
-            return score > -2
-        return score < 2     # 做空: 动量不能强看多
+            return score > -2 or score > prev
+        return score < 2 or score < prev  # 极端动量明显改善时允许反向信号
 
     def _gen_signals(self, j, prev_j, prev_prev_j, close, in_trend, trend_dir,
                      bull_div, bear_div, pure_c_long, pure_c_short,

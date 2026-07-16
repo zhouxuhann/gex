@@ -14,32 +14,34 @@ symbols:
   - name: SPY
     trading_class: SPY
     strike_range: 0.04
-    enabled: false
+    enabled: true
 
   - name: SPX
     trading_class: SPXW        # SPX 周权
     strike_range: 0.03
     sec_type: IND              # 指数
+    extended_hours: true       # Cboe GTH/Curb：20:15-9:25 / 16:15-17:00 ET
     enabled: false             # 默认关闭
 
   # 个股周期权
   - name: NVDA
     trading_class: NVDA        # NVDA 周权
     strike_range: 0.05         # ATM 上下 5%
-    enabled: true
+    enabled: false
 
   - name: AMD
     trading_class: AMD         # AMD 周权
     strike_range: 0.05
-    enabled: true
+    enabled: false
 
   - name: MRVL
     trading_class: MRVL        # MRVL 周权
     strike_range: 0.06         # 价格较低，范围稍大
-    enabled: true
+    enabled: false
 
 storage:
-  data_dir: "./data"           # Docker 内用 "/data"
+  # 相对路径由程序固定按项目根目录解析，不再依赖启动 cwd；Docker 用 "/data"
+  data_dir: "./data"
   max_history: 8000            # 内存中保留的历史条数
 
 server:
@@ -49,6 +51,34 @@ server:
 monitoring:
   stale_seconds: 15            # 数据陈旧警告阈值
   spot_sanity_pct: 0.01        # spot 单 tick 最大漂移 (1%)
+  quality_min_contracts: 20    # 每个快照至少需要的有效期权合约数
+  quality_max_missing_ratio: 0.25
+  quality_min_rth_coverage: 0.95
+  quality_max_gap_seconds: 60
+  quality_max_derived_null_ratio: 0.10
+
+# 0DTE ATM straddle 观测器：只记录报价并在收盘结算，永不下单。
+intraday_vrp:
+  enabled: true
+  observation_only: true
+  symbols: [QQQ, SPY]
+  schedule_et: ["09:35", "10:00", "10:30", "11:00", "12:00", "13:00", "14:00", "14:30", "15:00"]
+  sample_window_seconds: 180
+  candidate_strikes_each_side: 2
+  max_quote_age_seconds: 10
+  max_combined_spread_ratio: 0.10
+  commission_per_straddle: 1.30
+
+alerts:
+  ib_errors:
+    email:
+      enabled: true
+      sender: "fzhouxu615@gmail.com"
+      password_env: "GMAIL_APP_PASSWORD"
+      recipients:
+        - "wenyi.hann@gmail.com"
+      subject_prefix: "[GEX-IB]"
+      cooldown_sec: 600          # 同一 IB error 10 分钟最多提醒一次
 
 timing:
   tick_interval_sec: 3         # 主循环间隔（秒）

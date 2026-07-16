@@ -1,0 +1,28 @@
+# Symbols watched by the MA5 pullback monitor.
+# One symbol per line. Blank lines and comments are ignored.
+# Comma-separated lines are also accepted; only the first field is used.
+
+ORCL
+AAOI
+MRVL
+FSLR
+SMCI
+NOK
+TSEM
+CRDO
+LRCX
+SOXX
+QQQ
+AMD
+INTC
+LITE
+CRWV
+AAPL
+IGV
+COHR
+MTSI
+NBIS
+TER
+GFS
+F
+AMKR

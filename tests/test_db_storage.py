@@ -1,8 +1,9 @@
 """db_storage 模块测试（mock psycopg2，不需要真实 DB）"""
-import pytest
 from datetime import datetime
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
+
 import pandas as pd
+import pytest
 
 from gex_monitor.config import DatabaseConfig
 
@@ -145,6 +146,26 @@ class TestOHLCRead:
         with patch('pandas.read_sql_query', return_value=pd.DataFrame()):
             result = db.load_ohlc('QQQ', '20260412')
         assert result is None
+
+
+class TestMarketBarWrite:
+    def test_upsert_market_data_bars(self, db, mock_psycopg2):
+        mock_cursor = MagicMock()
+        db._conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        db._conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        records = [{
+            'symbol': 'QQQ', 'bar_size': '1 min',
+            'datetime': datetime(2026, 4, 12, 9, 30),
+            'open': 500.0, 'high': 501.0, 'low': 499.0, 'close': 500.5,
+            'volume': 1000, 'bar_count': 10, 'average': 500.2,
+            'has_gaps': False, 'source': 'ib_historical_trades',
+            'created_at': datetime(2026, 4, 12, 16, 1),
+        }]
+
+        count = db.upsert_market_data_bars(records)
+
+        assert count == 1
+        mock_psycopg2.psycopg2.extras.execute_batch.assert_called_once()
 
     def test_load_ohlc_no_connection(self, mock_psycopg2):
         config = DatabaseConfig(enabled=True, password='x')

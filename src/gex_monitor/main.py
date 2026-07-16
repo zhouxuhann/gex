@@ -7,6 +7,7 @@ Usage:
 import argparse
 import atexit
 import logging
+import os
 import signal
 import sys
 import threading
@@ -16,9 +17,11 @@ from pathlib import Path
 
 from .config import AppConfig
 from .db_storage import GEXDBStorage
+from .email_notifier import EmailConfig, EmailNotifier
 from .ib_client import IBWorker
+from .ib_error_watcher import IBErrorWatcher
 from .state import registry
-from .storage import StorageManager, SegmentStorage
+from .storage import SegmentStorage, StorageManager, find_split_data_dirs
 from .ui import create_app
 
 # 日志目录
@@ -52,6 +55,31 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def _build_ib_error_watcher(config: AppConfig) -> IBErrorWatcher:
+    email_cfg = config.alerts.ib_errors.email
+    notifier = None
+    if email_cfg.enabled:
+        # cooldown_sec 排除：EmailNotifier 的 cooldown 控制 ddput signal 节流，
+        # 与 IB error 无关。IB error 的节流由 IBErrorWatcher 自己管理。
+        notifier = EmailNotifier(EmailConfig(
+            **email_cfg.model_dump(exclude={'cooldown_sec'})
+        ))
+        if not os.environ.get(email_cfg.password_env, ''):
+            log.warning(
+                "IB error email alerts enabled but env %s is NOT set — "
+                "alert emails will silently fail until it is exported",
+                email_cfg.password_env,
+            )
+        log.info(
+            "IB error email alerts enabled: recipients=%s cooldown=%ss",
+            len(email_cfg.recipients),
+            email_cfg.cooldown_sec,
+        )
+    else:
+        log.info("IB error email alerts disabled")
+    return IBErrorWatcher(email_notifier=notifier, cooldown_sec=email_cfg.cooldown_sec)
+
+
 def main():
     parser = argparse.ArgumentParser(description='GEX Monitor')
     parser.add_argument('--config', '-c', type=str, default=None,
@@ -83,8 +111,23 @@ def main():
         config.server.port = args.port
 
     # 初始化存储
-    storage = StorageManager(config.storage.data_dir)
+    data_dir = Path(config.storage.data_dir).expanduser().resolve()
+    log.info("GEX data directory: %s", data_dir)
+    split_dirs = find_split_data_dirs(data_dir)
+    if split_dirs:
+        log.warning(
+            "检测到历史 GEX 数据分散在其他目录（不会自动合并）: %s",
+            [str(p) for p in split_dirs],
+        )
+    quality_options = {
+        'min_rth_coverage': config.monitoring.quality_min_rth_coverage,
+        'max_gap_seconds': config.monitoring.quality_max_gap_seconds,
+        'max_derived_null_ratio': config.monitoring.quality_max_derived_null_ratio,
+        'min_contracts': config.monitoring.quality_min_contracts,
+    }
+    storage = StorageManager(data_dir, quality_options=quality_options)
     segments = SegmentStorage(config.storage.data_dir)
+    ib_error_watcher = _build_ib_error_watcher(config)
 
     # 初始化 DB 存储
     db_storage = None
@@ -131,10 +174,16 @@ def main():
             connect_timeout=config.ib.connect_timeout,
             max_retries=config.ib.max_retries,
             timing=config.timing,
+            market_data_stale_sec=config.monitoring.reconnect_stale_seconds,
+            quality_min_contracts=config.monitoring.quality_min_contracts,
+            quality_max_missing_ratio=config.monitoring.quality_max_missing_ratio,
             db_storage=db_storage,
             hedge_enabled=not args.no_hedge,
             hedge_dry_run=args.hedge_dry_run,
             hedge_qty=args.hedge_qty,
+            ib_error_watcher=ib_error_watcher,
+            extended_hours=sym_config.extended_hours,
+            intraday_vrp_config=config.intraday_vrp,
         )
         workers.append(worker)
 
@@ -151,6 +200,7 @@ def main():
         segments=segments,
         symbols=[s.name for s in enabled_symbols],
         db_storage=db_storage,
+        extended_symbols={s.name for s in enabled_symbols if s.extended_hours},
     )
 
     # 优雅关闭

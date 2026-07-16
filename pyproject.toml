@@ -21,6 +21,7 @@ dependencies = [
     "pyyaml>=6.0",
     "exchange-calendars>=4.2",
     "flask>=3.0",
+    "pytz>=2024.1",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +34,7 @@ dev = [
 
 [project.scripts]
 gex-monitor = "gex_monitor.main:main"
+gex-bars = "gex_monitor.qqq_bars:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

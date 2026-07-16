@@ -3,30 +3,57 @@ import asyncio
 import logging
 import time
 from collections import deque
+from datetime import datetime
 from statistics import median
 
 import numpy as np
-from ib_insync import IB, Stock, Index, Option
+from ib_insync import IB, Index, Option, Stock
 
-from .config import TimingConfig
-from .gex_calc import calculate_gex, pick_expiry
-from .features import compute_realtime_features
-from .skew import compute_skew, SkewTracker
-from .skew_surface import collect_skew_surface
-from .hedge_signal import generate_hedge_signal, format_recommendation
-from .hedge_executor import HedgeExecutor, format_trade_result
-from .macro import fetch_macro_snapshot
+from .config import IntradayVRPConfig, TimingConfig
+from .data_quality import evaluate_tick_quality
 from .db_storage import GEXDBStorage
+from .features import compute_realtime_features
+from .gex_calc import calculate_gex, pick_expiry
+from .hedge_executor import HedgeExecutor, format_trade_result
+from .hedge_signal import format_recommendation, generate_hedge_signal
+from .intraday_vrp_monitor import IntradayVRPMonitor
+from .macro import fetch_macro_snapshot
+from .skew import SkewTracker, compute_skew
+from .skew_surface import collect_skew_surface
 from .state import StateManager
-from .storage import StorageManager, SkewSurfaceStorage
+from .storage import SkewSurfaceStorage, StorageManager
 from .time_utils import (
-    et_now, trading_date_str, is_market_open, should_connect, seconds_until_next_open
+    et_now,
+    is_extended_hours,
+    is_market_open,
+    option_expiry_date_str,
+    seconds_until_next_open,
+    seconds_until_next_session,
+    should_connect,
+    trading_date_str,
 )
 
 log = logging.getLogger(__name__)
 
 # IB market data generic ticks
 GENERIC_TICKS = '100,101,104,106'
+RECOVERABLE_IB_ERROR_CODES = {10197, 1100, 1101}
+
+
+def select_option_chain(chains, trading_class: str):
+    """Select the option chain matching the configured trading class.
+
+    Fallback order:
+      1. SMART exchange + exact tradingClass  (best: 0DTE weekly chains)
+      2. Any exchange  + exact tradingClass   (e.g. CBOE+SPXW)
+    Never fall back to a different tradingClass — SPX monthly vs SPXW weekly
+    have different strike intervals and expiry sets.
+    """
+    return (
+        next((c for c in chains
+              if c.exchange == 'SMART' and c.tradingClass == trading_class), None)
+        or next((c for c in chains if c.tradingClass == trading_class), None)
+    )
 
 
 class IBWorker:
@@ -51,13 +78,20 @@ class IBWorker:
         connect_timeout: int = 20,
         max_retries: int = 3,
         timing: TimingConfig | None = None,
+        market_data_stale_sec: int = 60,
+        quality_min_contracts: int = 20,
+        quality_max_missing_ratio: float = 0.25,
         db_storage: GEXDBStorage | None = None,
         hedge_enabled: bool = False,
         hedge_dry_run: bool = False,
         hedge_qty: int = 1,
+        ib_error_watcher=None,
+        extended_hours: bool = False,
+        intraday_vrp_config: IntradayVRPConfig | None = None,
     ):
         self.symbol = symbol
         self.trading_class = trading_class
+        self.extended_hours = extended_hours
         self.state = state
         self.storage = storage
         self.db_storage = db_storage
@@ -70,15 +104,27 @@ class IBWorker:
         self.connect_timeout = connect_timeout
         self.max_retries = max_retries
         self.timing = timing or TimingConfig()
+        self.market_data_stale_sec = max(
+            int(market_data_stale_sec),
+            self.timing.tick_interval_sec * 3,
+        )
+        self.quality_min_contracts = max(1, int(quality_min_contracts))
+        self.quality_max_missing_ratio = float(quality_max_missing_ratio)
 
         self.ib: IB | None = None
         self.underlying = None
         self.chain = None
         self.current_key: tuple | None = None
         self.current_contracts: list = []
+        self._invalid_contract_cache: set[tuple[str, float, str]] = set()
         self.last_persist: float = 0
         self.last_expiry_seen: str | None = None
         self.last_good_spot: float | None = None
+        self._connected_at_ts: float = 0.0
+        self._last_success_ts: float = 0.0
+        self._last_market_data_marker: float | None = None
+        self._reconnect_requested_reason: str | None = None
+        self._last_quality_reasons: tuple[str, ...] = ()
         self._running: bool = True
 
         # ΔOI 相关
@@ -101,15 +147,27 @@ class IBWorker:
         self._hedge_enabled = hedge_enabled
         self._hedge_dry_run = hedge_dry_run
         self._hedge_qty = hedge_qty
+        self._ib_error_watcher = ib_error_watcher
+        self._vrp_monitor = None
+        if (intraday_vrp_config is not None
+                and intraday_vrp_config.enabled
+                and self.symbol in intraday_vrp_config.symbols):
+            self._vrp_monitor = IntradayVRPMonitor(
+                self.symbol, self.storage, intraday_vrp_config
+            )
+            self._log('info', 'Intraday VRP observation enabled (no order execution)')
 
     def _load_prev_oi(self) -> None:
         """加载前一交易日的 OI 快照"""
-        today = trading_date_str()
+        today = option_expiry_date_str()
         prev_date = self.storage.get_previous_trading_day(today)
         if prev_date:
             self.prev_oi = self.storage.load_oi_snapshot(self.symbol, prev_date)
             if self.prev_oi:
-                log.info(f"[{self.symbol}] Loaded prev OI from {prev_date}: {len(self.prev_oi)} strikes")
+                log.info(
+                    f"[{self.symbol}] Loaded prev OI from {prev_date}: "
+                    f"{len(self.prev_oi)} strikes"
+                )
             else:
                 log.info(f"[{self.symbol}] No prev OI found for {prev_date}")
         else:
@@ -118,6 +176,71 @@ class IBWorker:
     def _log(self, level: str, msg: str) -> None:
         """记录日志到 state 和 logger"""
         self.state.log(level, msg)
+
+    def _detach_ib_handlers(self, ib) -> None:
+        if self._ib_error_watcher is not None:
+            self._ib_error_watcher.detach(ib)
+        try:
+            ib.errorEvent -= self._on_ib_error
+        except Exception:
+            pass
+
+    def _request_reconnect(self, reason: str) -> None:
+        if self._reconnect_requested_reason is None:
+            self._reconnect_requested_reason = reason
+            self._log('warning', f"{reason}; 将重建 IB 行情连接")
+
+    def _on_ib_error(self, reqId, errorCode, errorString, contract) -> None:
+        if errorCode not in RECOVERABLE_IB_ERROR_CODES:
+            return
+        if errorCode == 10197:
+            reason = "IB 10197: 实时行情被另一端会话占用"
+        elif errorCode == 1100:
+            self.state.set_status(connected=False)
+            reason = "IB 1100: Gateway/TWS 连接断开"
+        else:
+            reason = f"IB {errorCode}: 连接恢复/行情 reset，需要重新订阅"
+        self._request_reconnect(reason)
+
+    def _force_reconnect(self, reason: str) -> None:
+        self._log('warning', f"{reason}; 正在断开并重新订阅行情")
+        self.state.set_status(connected=False, updated=f"重连中: {reason}")
+        if self.ib is not None:
+            try:
+                self._detach_ib_handlers(self.ib)
+                for c in self.current_contracts:
+                    try:
+                        self.ib.cancelMktData(c)
+                    except Exception:
+                        pass
+                if self.underlying is not None:
+                    try:
+                        self.ib.cancelMktData(self.underlying)
+                    except Exception:
+                        pass
+                self.ib.disconnect()
+            except Exception as e:
+                self._log('warning', f"IB reconnect cleanup failed: {e}")
+        self.ib = None
+        self.current_key = None
+        self.current_contracts = []
+        self._last_strike_spot = None
+        self.last_good_spot = None
+        self._connected_at_ts = 0.0
+        self._last_market_data_marker = None
+        self._reconnect_requested_reason = None
+
+    def _stale_reconnect_reason(self) -> str | None:
+        if self.ib is None or not self.ib.isConnected():
+            return None
+        now_ts = time.time()
+        ref_ts = self._last_success_ts or self._connected_at_ts
+        if ref_ts <= 0:
+            return None
+        age = now_ts - ref_ts
+        if age >= self.market_data_stale_sec:
+            return f"行情 {age:.0f}s 未成功更新，疑似订阅失效"
+        return None
 
     def _sleep(self, sec: float) -> None:
         """睡眠，同时推进 IB event loop"""
@@ -130,6 +253,7 @@ class IBWorker:
         """建立 IB 连接（带重试和超时）"""
         if self.ib is not None:
             try:
+                self._detach_ib_handlers(self.ib)
                 self.ib.disconnect()
             except Exception:
                 pass
@@ -138,6 +262,9 @@ class IBWorker:
         for attempt in range(1, self.max_retries + 1):
             try:
                 self.ib = IB()
+                if self._ib_error_watcher is not None:
+                    self._ib_error_watcher.attach(self.ib)
+                self.ib.errorEvent += self._on_ib_error
                 self.ib.connect(
                     self.ib_host, self.ib_port, clientId=self.client_id,
                     timeout=self.connect_timeout
@@ -168,11 +295,11 @@ class IBWorker:
         chains = self.ib.reqSecDefOptParams(
             self.underlying.symbol, '', self.underlying.secType, self.underlying.conId
         )
-        self.chain = next((c for c in chains if c.exchange == 'SMART'), None)
+        self.chain = select_option_chain(chains, self.trading_class)
         if self.chain is None:
             raise RuntimeError(
-                f"No SMART option chain for {self.symbol}, "
-                f"available exchanges: {[c.exchange for c in chains]}"
+                f"No option chain for {self.symbol}/{self.trading_class}, "
+                f"available: {[(c.exchange, c.tradingClass) for c in chains]}"
             )
 
         # 订阅 underlying 行情
@@ -181,10 +308,27 @@ class IBWorker:
         self.current_key = None
         self.current_contracts = []
         self.last_good_spot = None
+        self._connected_at_ts = time.time()
+        self._last_success_ts = 0.0
+        self._last_market_data_marker = None
+        self._reconnect_requested_reason = None
+
+        # 重新加载 ΔOI 基线：进程跨天长跑时，"前一交易日"会变，
+        # 只在 __init__ 加载一次会让基线越来越陈旧
+        self._load_prev_oi()
 
         self.state.set_status(connected=True, market_open=True)
         self._log('info', f"IB connected (host={self.ib_host}, port={self.ib_port})")
         self.ib.sleep(1)
+
+        # 补结算仅依赖历史 Parquet；失败不影响实时 GEX 连接。
+        if self._vrp_monitor is not None:
+            try:
+                recovered = self._vrp_monitor.recover_unsettled()
+                if recovered:
+                    self._log('info', f'VRP recovered {recovered} historical observations')
+            except Exception as e:
+                self._log('warning', f'VRP recovery failed: {e}')
 
         # 连接后执行预热，确保数据就绪
         self._warmup()
@@ -213,7 +357,7 @@ class IBWorker:
             return
 
         # 2. 获取 expiry
-        today_str = trading_date_str()
+        today_str = option_expiry_date_str()
         expiry, _ = pick_expiry(self.chain, today_str)
         if expiry is None:
             self._log('warning', "预热: 无可用 expiry")
@@ -263,12 +407,15 @@ class IBWorker:
             change = abs(spot - self.last_good_spot)
             if change < 1.0:  # 变化 < $1，不需要更新
                 return
-            self._log('info', f"预热: spot 变化 {self.last_good_spot:.2f} → {spot:.2f} (${change:.2f})")
+            self._log(
+                'info',
+                f"预热: spot 变化 {self.last_good_spot:.2f} → {spot:.2f} (${change:.2f})",
+            )
 
         self.last_good_spot = spot
 
         # 获取 expiry
-        today_str = trading_date_str()
+        today_str = option_expiry_date_str()
         expiry, _ = pick_expiry(self.chain, today_str)
         if expiry is None:
             return
@@ -314,8 +461,14 @@ class IBWorker:
             Option(self.symbol, expiry, s, r, 'SMART',
                    tradingClass=self.trading_class)
             for s in strikes for r in ['C', 'P']
+            if (expiry, float(s), r) not in self._invalid_contract_cache
         ]
         expected = len(raw)
+        if not raw:
+            self.current_contracts = []
+            self.current_key = key
+            self._log('warning', f"订阅跳过：{expiry} 所有候选合约均已确认无效")
+            return
         self.current_contracts = self.ib.qualifyContracts(*raw)
         actual = len(self.current_contracts)
 
@@ -328,6 +481,12 @@ class IBWorker:
             if missing:
                 self._log('warning',
                           f"合约验证失败: {len(missing)} 个 - {missing[:5]}...")
+                # 只在大部分合约都能 qualify 时缓存少数无效项。
+                # 如果整批大面积失败，更可能是 IB/网络暂时故障，不能永久记黑。
+                if actual >= expected * 0.5:
+                    self._invalid_contract_cache.update(
+                        (expiry, float(s), r) for s, r in missing
+                    )
 
         # 订阅行情
         for c in self.current_contracts:
@@ -338,8 +497,33 @@ class IBWorker:
                           f"expiry={expiry} strikes={len(strikes)}")
         self.ib.sleep(2)
 
+    def _latest_market_data_marker(self) -> float | None:
+        """返回 IB ticker 中最新一次真实行情事件时间。
+
+        ib_insync 在订阅停止后仍会保留 Ticker 对象和旧值，因此不能把
+        marketPrice()/Greeks 仍可读当成“行情有更新”。
+        """
+        if self.ib is None:
+            return None
+        contracts = ([self.underlying] if self.underlying is not None else [])
+        contracts += list(self.current_contracts)
+        markers: list[float] = []
+        for contract in contracts:
+            ticker = self.ib.ticker(contract)
+            ticker_time = getattr(ticker, 'time', None) if ticker is not None else None
+            if isinstance(ticker_time, datetime):
+                markers.append(ticker_time.timestamp())
+            elif isinstance(ticker_time, (int, float)) and ticker_time > 0:
+                markers.append(float(ticker_time))
+        return max(markers) if markers else None
+
     def _process_tick(self) -> bool:
         """处理一次 tick"""
+        market_data_marker = self._latest_market_data_marker()
+        if (market_data_marker is not None
+                and market_data_marker == self._last_market_data_marker):
+            return False
+
         # 获取 spot
         u_ticker = self.ib.ticker(self.underlying)
         spot = u_ticker.marketPrice() if u_ticker else None
@@ -357,7 +541,7 @@ class IBWorker:
         self.last_good_spot = spot
 
         # 选择 expiry
-        today_str = trading_date_str()
+        today_str = option_expiry_date_str()
         expiry, is_true_0dte = pick_expiry(self.chain, today_str)
         if expiry is None:
             self._log('error', '无可用 expiry')
@@ -420,6 +604,22 @@ class IBWorker:
                 self._log('warning',
                           f'数据缺失较多: missing_greeks={result.missing_greeks} '
                           f'missing_oi={result.missing_oi}')
+
+        quality_reasons = evaluate_tick_quality(
+            result,
+            len(self.current_contracts),
+            min_contracts=self.quality_min_contracts,
+            max_missing_ratio=self.quality_max_missing_ratio,
+        )
+        if quality_reasons:
+            result.partial = True
+        quality_key = tuple(quality_reasons)
+        if quality_key != self._last_quality_reasons:
+            if quality_reasons:
+                self._log('warning', '快照质量降级: ' + '; '.join(quality_reasons))
+            elif self._last_quality_reasons:
+                self._log('info', '快照质量恢复正常')
+            self._last_quality_reasons = quality_key
 
         # 收集今日 OI（用于收盘保存）
         for _, row in result.df.iterrows():
@@ -486,7 +686,23 @@ class IBWorker:
             skew_slope=skew_slope,
             rr_25_zscore=rr_25_zscore,
             skew_signal=skew_signal,
+            partial=getattr(result, 'partial', False),
+            quality_reasons=quality_reasons,
         )
+
+        if self._vrp_monitor is not None:
+            try:
+                self._vrp_monitor.on_gex_update(
+                    self.ib,
+                    self.current_contracts,
+                    now=et_now(),
+                    spot=spot,
+                    expiry=expiry,
+                    is_true_0dte=is_true_0dte,
+                    gex_state=self.state.get_snapshot(),
+                )
+            except Exception as e:
+                self._log('warning', f'VRP observation failed: {e}')
 
         # 缓冲到 DB
         if self.db_storage is not None:
@@ -523,6 +739,7 @@ class IBWorker:
                     log.warning(f"DB flush error: {e}")
             self.last_persist = time.time()
 
+        self._last_market_data_marker = market_data_marker
         return True
 
     def run(self) -> None:
@@ -532,7 +749,9 @@ class IBWorker:
         while self._running:
             now = et_now()
             market_open = is_market_open(now)
-            should_conn = should_connect(now, warmup_minutes=5)
+            extended = self.extended_hours and is_extended_hours(now)
+            should_conn = should_connect(now, warmup_minutes=5,
+                                         include_extended=self.extended_hours)
 
             # 非连接时段（收盘后且不在预热期）
             if not should_conn:
@@ -543,26 +762,58 @@ class IBWorker:
 
                 if self.ib is not None and self.ib.isConnected():
                     # 盘后落盘
+                    today = trading_date_str(now)
                     try:
                         hist, ohlc, strikes = self.state.get_persist_data()
-                        self.storage.persist_async(self.symbol, hist, ohlc, strikes)
+                        # 收盘路径允许阻塞：先等周期任务，再同步追加最后一批，
+                        # 防止 persist_async 正忙时跳过收盘快照。
+                        self.storage.wait_for_persist(self.symbol)
+                        self.storage.persist_sync(self.symbol, hist, ohlc, strikes)
                     except Exception as e:
                         self._log('error', f"盘后 persist 失败: {e}")
+
+                    if self._vrp_monitor is not None and now.hour >= 16:
+                        try:
+                            self._vrp_monitor.settle_date(today)
+                        except Exception as e:
+                            self._log('error', f'VRP settlement failed: {e}')
 
                     # 保存今日 OI 快照（用于明天计算 ΔOI）
                     try:
                         if self.today_oi:
-                            today = trading_date_str()
                             self.storage.save_oi_snapshot(self.symbol, today, self.today_oi)
                             self._log('info', f"Saved OI snapshot: {len(self.today_oi)} strikes")
+                            # 清空，否则跨天长跑时次日快照混入今天的 stale strikes
+                            self.today_oi = {}
                     except Exception as e:
                         self._log('error', f"保存 OI 快照失败: {e}")
+
+                    if self.db_storage is not None:
+                        try:
+                            self.db_storage.flush()
+                        except Exception as e:
+                            self._log('error', f"盘后 DB flush 失败: {e}")
+
+                    # GTH 早盘 09:25 的短暂停顿不能提前生成“空白日”报告。
+                    if now.hour >= 16:
+                        try:
+                            report = self.storage.finalize_day(self.symbol, today)
+                            level = 'info' if report.status == 'good' else 'warning'
+                            self._log(
+                                level,
+                                f"日终数据质量 {report.status.upper()} "
+                                f"score={report.score} coverage={report.gex_coverage:.1%}; "
+                                f"{'; '.join(report.reasons[:4]) or '无异常'}",
+                            )
+                        except Exception as e:
+                            self._log('error', f"生成日终质量报告失败: {e}")
 
                     # 重置每日 skew surface 标志
                     self._skew_surface_captured_today = False
 
                     # 断开连接
                     try:
+                        self._detach_ib_handlers(self.ib)
                         for c in self.current_contracts:
                             try:
                                 self.ib.cancelMktData(c)
@@ -576,10 +827,17 @@ class IBWorker:
                     self.current_contracts = []
                     self.last_good_spot = None
 
-                # 等待下一个交易日
+                # 等待下一个数据时段。延伸标的不能只算常规开盘，
+                # 否则 16:00 后的 30min cap 会越过 16:15 Curb 开始。
                 try:
-                    sleep_sec = max(seconds_until_next_open() - 60, 30)
-                    self._log('info', f"Market closed, next check in {sleep_sec:.0f}s")
+                    if self.extended_hours:
+                        sleep_sec = max(
+                            seconds_until_next_session(include_extended=True) - 5,
+                            5,
+                        )
+                    else:
+                        sleep_sec = max(seconds_until_next_open() - 60, 30)
+                    self._log('info', f"Market closed, next session check in {sleep_sec:.0f}s")
                     time.sleep(min(sleep_sec, self.timing.max_sleep_sec))
                 except RuntimeError as e:
                     self._log('error', f"{e}; retrying in {self.timing.market_closed_check_sec}s")
@@ -596,6 +854,35 @@ class IBWorker:
                     time.sleep(self.timing.reconnect_delay_sec)
                     continue
 
+            # 延伸时段（GTH 20:15-9:25 / Curb 16:15-17:00）：直接跑 tick
+            if extended and not market_open:
+                if self._reconnect_requested_reason:
+                    self._force_reconnect(self._reconnect_requested_reason)
+                    time.sleep(self.timing.reconnect_delay_sec)
+                    continue
+
+                self.state.set_status(
+                    # UI 的 market_open 实际表示“当前有 live data session”。
+                    # 延伸时段若继续设 False，Dash 会主动返回休市空图。
+                    market_open=True,
+                    updated=f"延伸时段 ({now.strftime('%H:%M:%S ET')})"
+                )
+                try:
+                    if (self._process_tick()
+                            and self._last_market_data_marker is not None):
+                        self._last_success_ts = time.time()
+                except Exception as e:
+                    self._log('error', f"Extended hours tick error: {e}")
+                    if self.ib is not None and not self.ib.isConnected():
+                        self.state.set_status(connected=False)
+                stale_reason = self._stale_reconnect_reason()
+                if stale_reason:
+                    self._force_reconnect(stale_reason)
+                    time.sleep(self.timing.reconnect_delay_sec)
+                    continue
+                self._sleep(self.timing.tick_interval_sec)
+                continue
+
             # 预热期：已连接但市场未开，持续更新 strikes
             if not market_open:
                 self.state.set_status(
@@ -610,12 +897,24 @@ class IBWorker:
                 continue
 
             # 主循环：市场已开
+            if self._reconnect_requested_reason:
+                self._force_reconnect(self._reconnect_requested_reason)
+                time.sleep(self.timing.reconnect_delay_sec)
+                continue
+
             try:
-                self._process_tick()
+                if (self._process_tick()
+                        and self._last_market_data_marker is not None):
+                    self._last_success_ts = time.time()
             except Exception as e:
                 self._log('error', f"Main loop error: {e}")
                 if self.ib is not None and not self.ib.isConnected():
                     self.state.set_status(connected=False)
+            stale_reason = self._stale_reconnect_reason()
+            if stale_reason:
+                self._force_reconnect(stale_reason)
+                time.sleep(self.timing.reconnect_delay_sec)
+                continue
 
             # 15:30 ET 自动采集 multi-tenor skew surface
             self._maybe_capture_skew_surface(now)
@@ -752,6 +1051,7 @@ class IBWorker:
         self._running = False
         if self.ib is not None and self.ib.isConnected():
             try:
+                self._detach_ib_handlers(self.ib)
                 self.ib.disconnect()
             except Exception:
                 pass

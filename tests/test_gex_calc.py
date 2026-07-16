@@ -119,6 +119,22 @@ class TestCalculateGex:
         assert result_degraded is not None
         assert result_degraded.missing_oi == 2
 
+    def test_missing_oi_with_volume_is_usable(self, mock_ib_ticker):
+        """IB can return 0DTE Greeks/volume before OI; volume should keep GEX usable."""
+        t1 = mock_ib_ticker(500, 'C', gamma=0.10, oi=1000)
+        t1.callOpenInterest = float('nan')
+        t1.volume = 1200
+        t2 = mock_ib_ticker(500, 'P', gamma=0.10, oi=800)
+        t2.putOpenInterest = float('nan')
+        t2.volume = 900
+
+        result = calculate_gex([t1, t2], spot=502.0)
+
+        assert result is not None
+        assert result.missing_oi == 2
+        assert result.df['volume'].sum() == 2100
+        assert result.total_gex != 0
+
     def test_gamma_flip_single_strike(self, mock_ib_ticker):
         """Test gamma flip calculation with single strike."""
         tickers = [

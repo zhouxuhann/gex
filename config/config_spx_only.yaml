@@ -1,0 +1,47 @@
+# GEX Monitor 单独启动 SPX/SPXW 配置
+
+ib:
+  host: "127.0.0.1"
+  port: 4002
+  client_id_base: 10
+
+symbols:
+  - name: SPX
+    trading_class: SPXW
+    strike_range: 0.005
+    sec_type: IND
+    enabled: true
+
+storage:
+  data_dir: "./data"
+  max_history: 8000
+
+server:
+  host: "0.0.0.0"
+  port: 8050
+  ui_live_interval_sec: 10
+  ui_closed_wakeup_padding_sec: 5
+  ui_slow_interval_sec: 120
+
+monitoring:
+  stale_seconds: 15
+  spot_sanity_pct: 0.01
+  oi_ready_threshold: 0.55
+  flip_oi_decay_factor: 0.3
+
+timing:
+  tick_interval_sec: 3
+  persist_interval_sec: 60
+  reconnect_delay_sec: 10
+  market_closed_check_sec: 300
+  max_sleep_sec: 1800
+
+signals:
+  ddput:
+    enabled: false
+  iv_hv:
+    enabled: false
+  options_assistant:
+    enabled: false
+  synthetic_roll:
+    enabled: false

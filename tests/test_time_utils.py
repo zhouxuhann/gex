@@ -5,9 +5,10 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from gex_monitor.time_utils import (
-    ET, UTC, MARKET_OPEN, MARKET_CLOSE,
-    et_now, trading_date_str, market_session_today,
-    is_market_open, seconds_until_next_open
+    ET, UTC, MARKET_OPEN, MARKET_CLOSE, HAS_CALENDAR,
+    et_now, trading_date_str, option_expiry_date_str, market_session_today,
+    is_market_open, is_extended_hours, should_connect,
+    seconds_until_next_open, seconds_until_next_session
 )
 
 
@@ -129,6 +130,151 @@ class TestIsMarketOpen:
         result = is_market_open(at_close)
         # At exactly 4:00 PM, market should still be considered open (<=)
         assert isinstance(result, bool)
+
+
+class TestIsExtendedHours:
+    """Tests for is_extended_hours (SPX overnight/pre/post market)."""
+
+    def _dt(self, h, m):
+        return datetime(2024, 1, 16, h, m, tzinfo=ET)  # 周二
+
+    def test_overnight_pre_market(self):
+        assert is_extended_hours(self._dt(4, 0)) is True
+
+    def test_pre_market_start_boundary(self):
+        assert is_extended_hours(self._dt(3, 0)) is True
+
+    def test_pre_market_end_boundary(self):
+        assert is_extended_hours(self._dt(9, 24)) is True
+        assert is_extended_hours(self._dt(9, 25)) is False
+
+    def test_regular_session_not_extended(self):
+        assert is_extended_hours(self._dt(11, 0)) is False
+
+    def test_post_market(self):
+        assert is_extended_hours(self._dt(16, 30)) is True
+
+    def test_post_market_end_boundary(self):
+        assert is_extended_hours(self._dt(16, 59)) is True
+        assert is_extended_hours(self._dt(17, 0)) is False
+
+    def test_evening_gth(self):
+        assert is_extended_hours(self._dt(22, 0)) is True
+
+    def test_overnight_continues_after_midnight(self):
+        assert is_extended_hours(self._dt(2, 59)) is True
+
+    def test_weekend_never_extended(self):
+        saturday = datetime(2024, 1, 13, 4, 0, tzinfo=ET)
+        sunday = datetime(2024, 1, 14, 4, 0, tzinfo=ET)
+        assert is_extended_hours(saturday) is False
+        assert is_extended_hours(sunday) is False
+
+    def test_sunday_evening_opens_monday_gth(self):
+        sunday = datetime(2024, 1, 14, 20, 15, tzinfo=ET)
+        assert is_extended_hours(sunday) is True
+
+    @pytest.mark.skipif(not HAS_CALENDAR, reason="需要 exchange_calendars 识别假日")
+    def test_holiday_gth_is_not_filtered_by_xnys(self):
+        """Cboe 节假日 GTH 不能被 XNYS 休市日历直接排除。"""
+        mlk_pre = datetime(2024, 1, 15, 4, 0, tzinfo=ET)
+        mlk_post = datetime(2024, 1, 15, 16, 30, tzinfo=ET)
+        assert is_extended_hours(mlk_pre) is True
+        assert is_extended_hours(mlk_post) is True
+
+
+class TestShouldConnect:
+    """Tests for should_connect — covers extended hours + warmup + regular."""
+
+    def _dt(self, h, m):
+        return datetime(2024, 1, 16, h, m, tzinfo=ET)
+
+    def test_extended_pre_market(self):
+        assert should_connect(self._dt(5, 0)) is True
+
+    def test_extended_post_market(self):
+        assert should_connect(self._dt(16, 30)) is True
+
+    def test_warmup_period(self):
+        assert should_connect(self._dt(9, 26)) is True
+
+    def test_regular_session(self):
+        assert should_connect(self._dt(11, 0)) is True
+
+    def test_evening_gth_connects(self):
+        assert should_connect(self._dt(22, 0)) is True
+
+    def test_friday_evening_no_weekend_session(self):
+        friday = datetime(2024, 1, 19, 22, 0, tzinfo=ET)
+        assert should_connect(friday) is False
+
+    def test_weekend_no_connect(self):
+        saturday = datetime(2024, 1, 13, 10, 0, tzinfo=ET)
+        assert should_connect(saturday) is False
+
+    def test_no_gap_between_extended_pre_and_warmup(self):
+        """09:20-09:30 must all connect — no gap between extended and warmup."""
+        for minute in range(20, 30):
+            t = self._dt(9, minute)
+            assert should_connect(t) is True, f"09:{minute:02d} should connect"
+
+    def test_include_extended_false_pre_market(self):
+        """股票期权 worker（无 GTH）盘前不应连接。"""
+        assert should_connect(self._dt(5, 0), include_extended=False) is False
+
+    def test_include_extended_false_post_market(self):
+        assert should_connect(self._dt(16, 30), include_extended=False) is False
+
+    def test_include_extended_false_regular_unaffected(self):
+        """关掉延伸时段不影响预热期和常规时段。"""
+        assert should_connect(self._dt(9, 26), include_extended=False) is True
+        assert should_connect(self._dt(11, 0), include_extended=False) is True
+
+
+class TestSecondsUntilNextSession:
+    """Tests for seconds_until_next_session（UI 闭市定时器调度）."""
+
+    def test_midday_next_is_post_extended(self):
+        """周二 12:00 → 下一段是当天 16:15 盘后延伸（4.25h）。"""
+        t = datetime(2024, 1, 16, 12, 0, tzinfo=ET)
+        assert seconds_until_next_session(t) == pytest.approx(4.25 * 3600)
+
+    def test_midday_without_extended_is_next_open(self):
+        """周二 12:00 无延伸标的 → 周三 9:30 开盘（21.5h）。"""
+        t = datetime(2024, 1, 16, 12, 0, tzinfo=ET)
+        sec = seconds_until_next_session(t, include_extended=False)
+        assert sec == pytest.approx(21.5 * 3600)
+
+    def test_after_curb_next_is_evening_gth(self):
+        """周二 17:00 → 当天 20:15 GTH（3.25h），不是次日开盘。"""
+        t = datetime(2024, 1, 16, 17, 0, tzinfo=ET)
+        assert seconds_until_next_session(t) == pytest.approx(3.25 * 3600)
+
+    def test_weekend_next_is_monday_pre(self):
+        """周六 12:00 → 周日 20:15（32.25h）。"""
+        sat = datetime(2024, 1, 20, 12, 0, tzinfo=ET)
+        assert seconds_until_next_session(sat) == pytest.approx(32.25 * 3600)
+
+    def test_never_later_than_next_open(self):
+        """有延伸时段时，下一 session 永远不晚于下一开盘。"""
+        for t in (
+            datetime(2024, 1, 16, 17, 0, tzinfo=ET),
+            datetime(2024, 1, 20, 12, 0, tzinfo=ET),
+            datetime(2024, 1, 16, 12, 0, tzinfo=ET),
+        ):
+            assert seconds_until_next_session(t) <= seconds_until_next_open(t)
+
+
+class TestOptionExpiryDate:
+    def test_regular_and_morning_use_calendar_date(self):
+        assert option_expiry_date_str(
+            datetime(2024, 1, 16, 9, 0, tzinfo=ET)) == '20240116'
+
+    def test_curb_and_evening_exclude_expired_0dte(self):
+        assert option_expiry_date_str(
+            datetime(2024, 1, 16, 16, 30, tzinfo=ET)) == '20240117'
+        assert option_expiry_date_str(
+            datetime(2024, 1, 16, 20, 15, tzinfo=ET)) == '20240117'
 
 
 class TestSecondsUntilNextOpen:

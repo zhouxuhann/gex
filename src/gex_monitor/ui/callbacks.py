@@ -9,7 +9,13 @@ from plotly.subplots import make_subplots
 from ..db_storage import GEXDBStorage
 from ..state import StateRegistry
 from ..storage import StorageManager, SegmentStorage
-from ..time_utils import et_now
+from ..time_utils import (
+    et_now,
+    is_extended_hours,
+    is_market_open,
+    seconds_until_next_open,
+    seconds_until_next_session,
+)
 from .layout import LABEL_COLORS, LEVEL_COLORS
 
 STALE_SECONDS = 15
@@ -34,16 +40,96 @@ def _list_dates(storage: StorageManager, db_storage: GEXDBStorage | None,
     return sorted(dates)
 
 
+def _format_countdown(seconds: float) -> str:
+    """Format seconds as Dd HH:MM:SS or HH:MM:SS."""
+    total = max(0, int(seconds))
+    days, rem = divmod(total, 24 * 3600)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    clock = f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{days}d {clock}" if days else clock
+
+
 def register_callbacks(
     app: dash.Dash,
     registry: StateRegistry,
     storage: StorageManager,
     segments: SegmentStorage,
     db_storage: GEXDBStorage | None = None,
+    extended_symbols: set[str] | None = None,
 ):
     """注册所有回调"""
+    extended_symbols = extended_symbols or set()
 
     # ==================== 实时图回调 ====================
+    def _closed_interval_ms() -> int:
+        # 睡到下一个数据时段开始 +5s。有 GTH 标的时必须算上
+        # 20:15 夜盘和 16:15 Curb，否则定时器会一直睡到常规开盘。
+        try:
+            sec = seconds_until_next_session(
+                et_now(), include_extended=bool(extended_symbols))
+            return int((sec + 5) * 1000)
+        except RuntimeError:
+            return 24 * 3600 * 1000
+
+    @app.callback(
+        [Output('interval', 'interval'),
+         Output('slow-interval', 'interval')],
+        [Input('interval', 'n_intervals'),
+         Input('slow-interval', 'n_intervals'),
+         Input('symbol-dropdown', 'value')])
+    def tune_intervals(_fast, _slow, symbol):
+        live_ms = 4000
+        slow_ms = 30000
+        closed_ms = max(live_ms, slow_ms, _closed_interval_ms())
+        if not symbol:
+            return closed_ms, closed_ms
+        state = registry.get(symbol)
+        if state is None:
+            return closed_ms, closed_ms
+        snapshot = state.get_snapshot()
+        # 延伸时段只在配置了 GTH 的标的存在时才算 live（定时器是全局的，
+        # 任一 GTH 标的在产数据就保持刷新）
+        extended_live = bool(extended_symbols) and is_extended_hours()
+        if snapshot.get('market_open') or extended_live:
+            return live_ms, slow_ms
+        return closed_ms, closed_ms
+
+    @app.callback(
+        Output('market-countdown', 'children'),
+        [Input('countdown-interval', 'n_intervals'),
+         Input('symbol-dropdown', 'value')])
+    def update_market_countdown(_, symbol):
+        now = et_now()
+        now_txt = now.strftime('%H:%M:%S ET')
+
+        if symbol in extended_symbols and is_extended_hours(now):
+            return html.Div([
+                html.Span("延伸时段交易中",
+                          style={'color': '#00ff88', 'fontWeight': 'bold'}),
+                html.Span(f"  |  {now_txt}", style={'color': '#888'}),
+            ])
+
+        if is_market_open(now):
+            return html.Div([
+                html.Span("已开盘", style={'color': '#00ff88', 'fontWeight': 'bold'}),
+                html.Span(f"  |  {now_txt}", style={'color': '#888'}),
+            ])
+
+        try:
+            seconds = seconds_until_next_open(now)
+        except RuntimeError:
+            return html.Div("暂时无法计算下次开盘时间", style={'color': '#ff4444'})
+
+        target = now + pd.Timedelta(seconds=seconds)
+        return html.Div([
+            html.Span("离开盘 ", style={'color': '#888'}),
+            html.Span(_format_countdown(seconds),
+                      style={'color': '#ffaa00', 'fontWeight': 'bold', 'fontSize': '22px'}),
+            html.Span(f"  |  下次开盘 {target.strftime('%m/%d %H:%M ET')}  |  {now_txt}",
+                      style={'color': '#888'}),
+        ])
+
     @app.callback(
         [Output('stats', 'children'),
          Output('gex-chart', 'figure'),

@@ -13,14 +13,6 @@ from collections import deque
 
 import pytz
 
-# Mock ib_insync before any import
-_ib_mock = types.ModuleType('ib_insync')
-_ib_mock.IB = MagicMock
-_ib_mock.Stock = MagicMock
-_ib_mock.MarketOrder = MagicMock
-_ib_mock.util = MagicMock()
-sys.modules['ib_insync'] = _ib_mock
-
 # Mock momentum_scorer
 _mom_mock = types.ModuleType('momentum_scorer')
 _mom_scorer = MagicMock()

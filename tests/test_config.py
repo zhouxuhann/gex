@@ -1,13 +1,16 @@
 """Tests for config module."""
-import tempfile
 from pathlib import Path
 
 import pytest
-import yaml
 
 from gex_monitor.config import (
-    IBConfig, SymbolConfig, StorageConfig, ServerConfig,
-    MonitoringConfig, AppConfig
+    AppConfig,
+    EmailAlertConfig,
+    IBConfig,
+    MonitoringConfig,
+    ServerConfig,
+    StorageConfig,
+    SymbolConfig,
 )
 
 
@@ -54,6 +57,13 @@ class TestSymbolConfig:
         assert config.enabled is True
         assert config.sec_type == "STK"
         assert config.multiplier is None
+        assert config.extended_hours is False  # 股票期权无 GTH，默认必须关
+
+    def test_extended_hours_opt_in(self):
+        """SPX 等指数期权显式开启 GTH 延伸时段。"""
+        config = SymbolConfig(name="SPX", trading_class="SPXW",
+                              sec_type="IND", extended_hours=True)
+        assert config.extended_hours is True
 
     def test_trading_class_defaults_to_name(self):
         """Test that trading_class defaults to name."""
@@ -148,6 +158,29 @@ class TestMonitoringConfig:
         assert config.spot_sanity_pct == 0.02
 
 
+class TestEmailAlertConfig:
+    """Tests for generic email alert configuration."""
+
+    def test_default_values(self, monkeypatch):
+        for key in (
+            "EMAIL_SENDER",
+            "EMAIL_PASSWORD_ENV",
+            "EMAIL_RECIPIENTS",
+            "EMAIL_SMTP_HOST",
+            "EMAIL_SMTP_PORT",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        config = EmailAlertConfig()
+
+        assert config.enabled is False
+        assert config.sender == "fzhouxu615@gmail.com"
+        assert config.password_env == "GMAIL_APP_PASSWORD"
+        assert config.recipients == ["wenyi.hann@gmail.com"]
+        assert config.subject_prefix == "[GEX-IB]"
+        assert config.cooldown_sec == 600
+
+
 class TestAppConfig:
     """Tests for AppConfig class."""
 
@@ -158,8 +191,22 @@ class TestAppConfig:
         assert len(config.symbols) == 1
         assert config.symbols[0].name == "QQQ"
         assert config.ib.host == "127.0.0.1"
-        assert config.storage.data_dir == "./data"
+        assert Path(config.storage.data_dir).is_absolute()
+        assert Path(config.storage.data_dir).name == "data"
         assert config.server.port == 8050
+
+    def test_relative_data_dir_is_stable_across_cwd(self, temp_dir, monkeypatch):
+        config_dir = temp_dir / "settings"
+        config_dir.mkdir()
+        yaml_file = config_dir / "config.yaml"
+        yaml_file.write_text("storage:\n  data_dir: ./archive\n")
+        elsewhere = temp_dir / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        config = AppConfig.from_yaml(yaml_file)
+
+        assert Path(config.storage.data_dir) == (config_dir / "archive").resolve()
 
     def test_get_enabled_symbols(self):
         """Test getting enabled symbols."""
@@ -216,6 +263,15 @@ server:
 monitoring:
   stale_seconds: 20
   spot_sanity_pct: 0.015
+
+alerts:
+  ib_errors:
+    email:
+      enabled: true
+      recipients:
+        - "ops@example.com"
+      subject_prefix: "[TEST-IB]"
+      cooldown_sec: 123
 """
         yaml_file = temp_dir / "config.yaml"
         yaml_file.write_text(yaml_content)
@@ -230,6 +286,10 @@ monitoring:
         assert config.storage.data_dir == "/data/gex"
         assert config.server.port == 9000
         assert config.monitoring.stale_seconds == 20
+        assert config.alerts.ib_errors.email.enabled is True
+        assert config.alerts.ib_errors.email.recipients == ["ops@example.com"]
+        assert config.alerts.ib_errors.email.subject_prefix == "[TEST-IB]"
+        assert config.alerts.ib_errors.email.cooldown_sec == 123
 
     def test_from_yaml_minimal(self, temp_dir):
         """Test loading minimal YAML configuration."""

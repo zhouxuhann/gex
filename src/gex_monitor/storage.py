@@ -9,7 +9,7 @@ import logging
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -18,6 +18,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .data_quality import audit_daily_data, write_quality_report
 from .time_utils import ET, UTC, et_now
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,44 @@ BUFFER_FLUSH_THRESHOLD = 100  # 缓冲记录数阈值
 BUFFER_FLUSH_INTERVAL = 60.0  # 缓冲最大保留时间（秒）
 PARQUET_ROW_GROUP_SIZE = 10000  # Parquet row group 大小
 PARQUET_COMPRESSION = 'snappy'  # 压缩算法（snappy: 速度快，gzip: 压缩率高）
+
+
+def find_split_data_dirs(
+    primary_dir: Path | str,
+    candidates: list[Path | str] | None = None,
+) -> list[Path]:
+    """查找项目中仍包含 GEX 日文件的其他数据目录。"""
+    primary = Path(primary_dir).expanduser().resolve()
+    if candidates is None:
+        root = Path(__file__).resolve().parents[2]
+        candidates = [root / 'data', root / 'src' / 'data']
+    result: list[Path] = []
+    for candidate in candidates:
+        path = Path(candidate).expanduser().resolve()
+        if path == primary or not path.is_dir():
+            continue
+        if any(path.glob('gex_*_*.parquet')):
+            result.append(path)
+    return result
+
+
+def _group_records_by_et_date(records: list[dict]) -> dict[str, list[dict]]:
+    """按记录自身时间戳的美东交易日期分组，避免跨夜写错日文件。"""
+    groups: dict[str, list[dict]] = {}
+    fallback = et_now().strftime('%Y%m%d')
+    for record in records:
+        value = record.get('ts')
+        if value is None:
+            date_str = fallback
+        else:
+            ts = pd.Timestamp(value)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(ET)
+            else:
+                ts = ts.tz_convert(ET)
+            date_str = ts.strftime('%Y%m%d')
+        groups.setdefault(date_str, []).append(record)
+    return groups
 
 
 def _normalize_ts_to_utc(df: "pd.DataFrame") -> "pd.DataFrame":
@@ -211,9 +250,11 @@ class StorageManager:
 
     def __init__(self, data_dir: Path | str,
                  buffer_threshold: int = BUFFER_FLUSH_THRESHOLD,
-                 buffer_max_age: float = BUFFER_FLUSH_INTERVAL):
-        self.data_dir = Path(data_dir)
+                 buffer_max_age: float = BUFFER_FLUSH_INTERVAL,
+                 quality_options: dict | None = None):
+        self.data_dir = Path(data_dir).expanduser().resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self._quality_options = dict(quality_options or {})
 
         # 缓冲配置
         self._buffer_threshold = buffer_threshold
@@ -249,29 +290,60 @@ class StorageManager:
                 )
             return self._buffers[key]
 
+    def persist_vrp_quote(self, symbol: str, date_str: str, row: dict) -> None:
+        """原子追加一条 VRP 原始报价；计划时点是日内唯一键。"""
+        path = self.data_dir / f'vrp_quotes_{symbol}_{date_str}.parquet'
+        _merge_and_write(
+            path, pd.DataFrame([row]),
+            ['symbol', 'trading_date', 'scheduled_time'], self._io_lock,
+        )
+
+    def persist_vrp_observations(self, symbol: str, date_str: str,
+                                 rows: list[dict]) -> None:
+        """写入可由原始报价重新生成的 VRP 结算结果。"""
+        if not rows:
+            return
+        path = self.data_dir / f'vrp_observations_{symbol}_{date_str}.parquet'
+        _merge_and_write(
+            path, pd.DataFrame(rows),
+            ['symbol', 'trading_date', 'scheduled_time'], self._io_lock,
+        )
+
+    def load_vrp_quotes(self, symbol: str, date_str: str) -> "pd.DataFrame":
+        path = self.data_dir / f'vrp_quotes_{symbol}_{date_str}.parquet'
+        if not path.exists():
+            return pd.DataFrame()
+        return read_parquet_et(path, self._io_lock)
+
+    def load_vrp_observations(self, symbol: str, date_str: str) -> "pd.DataFrame":
+        path = self.data_dir / f'vrp_observations_{symbol}_{date_str}.parquet'
+        if not path.exists():
+            return pd.DataFrame()
+        return read_parquet_et(path, self._io_lock)
+
     def persist_sync(self, symbol: str, hist: list[dict], ohlc: list[dict],
                      strikes: list[dict] | None = None) -> None:
         """同步落盘（使用缓冲区，达到阈值才写磁盘）"""
-        date_str = et_now().strftime('%Y%m%d')
         try:
-            # 添加到缓冲区
-            if hist:
+            # 必须按记录时间戳分区；StateManager 跨日长跑时仍可能保留前日
+            # 历史，若按“当前时间”选文件会把前日数据污染到次日文件。
+            for date_str, records in _group_records_by_et_date(hist).items():
                 buf = self._get_buffer(symbol, date_str, 'gex', ['ts'])
-                buf.append(hist)
+                buf.append(records)
                 if buf.should_flush():
                     count = buf.flush()
                     log.debug(f"[{symbol}] Flushed {count} gex records")
 
-            if ohlc:
+            for date_str, records in _group_records_by_et_date(ohlc).items():
                 buf = self._get_buffer(symbol, date_str, 'ohlc', ['ts'])
-                buf.append(ohlc)
+                buf.append(records)
                 if buf.should_flush():
                     count = buf.flush()
                     log.debug(f"[{symbol}] Flushed {count} ohlc records")
 
-            if strikes:
+            for date_str, records in _group_records_by_et_date(strikes or []).items():
                 buf = self._get_buffer(symbol, date_str, 'strikes', ['ts', 'strike', 'right'])
-                buf.append(strikes)
+                buf.append(records)
                 if buf.should_flush():
                     count = buf.flush()
                     log.debug(f"[{symbol}] Flushed {count} strikes records")
@@ -303,8 +375,9 @@ class StorageManager:
             if now - cached_time < self._dates_cache_ttl:
                 return cached_dates
 
-        files = sorted(self.data_dir.glob(f'ohlc_{symbol}_*.parquet'))
-        dates = [f.stem.split('_')[-1] for f in files]
+        files = list(self.data_dir.glob(f'ohlc_{symbol}_*.parquet'))
+        files += list(self.data_dir.glob(f'official_ohlc_{symbol}_*.parquet'))
+        dates = sorted({f.stem.split('_')[-1] for f in files})
         self._dates_cache[symbol] = (now, dates)
         return dates
 
@@ -315,10 +388,10 @@ class StorageManager:
 
     def load_day_ohlc(self, symbol: str, date_str: str) -> pd.DataFrame | None:
         """加载指定日期的 OHLC 数据"""
-        p = self.data_dir / f'ohlc_{symbol}_{date_str}.parquet'
-        if not p.exists():
-            return None
-        return read_parquet_et(p, self._io_lock)
+        official = self.data_dir / f'official_ohlc_{symbol}_{date_str}.parquet'
+        fallback = self.data_dir / f'ohlc_{symbol}_{date_str}.parquet'
+        p = official if official.exists() else fallback
+        return read_parquet_et(p, self._io_lock) if p.exists() else None
 
     def resample_5min(self, ohlc_df: pd.DataFrame) -> pd.DataFrame | None:
         """将 OHLC 重采样为 5 分钟"""
@@ -340,13 +413,13 @@ class StorageManager:
         """
         if not strikes_data:
             return
-        date_str = et_now().strftime('%Y%m%d')
         try:
-            buf = self._get_buffer(symbol, date_str, 'strikes', ['ts', 'strike', 'right'])
-            buf.append(strikes_data)
-            if buf.should_flush():
-                count = buf.flush()
-                log.debug(f"[{symbol}] Flushed {count} strikes records (direct call)")
+            for date_str, records in _group_records_by_et_date(strikes_data).items():
+                buf = self._get_buffer(symbol, date_str, 'strikes', ['ts', 'strike', 'right'])
+                buf.append(records)
+                if buf.should_flush():
+                    count = buf.flush()
+                    log.debug(f"[{symbol}] Flushed {count} strikes records (direct call)")
         except Exception as e:
             log.error(f"persist strikes failed for {symbol}: {e}")
 
@@ -460,6 +533,48 @@ class StorageManager:
             log.info(f"Flushed {total_flushed} records from {len(buffers)} buffers")
         return total_flushed
 
+    def wait_for_persist(self, symbol: str, timeout: float = 30.0) -> None:
+        """等待指定标的当前异步持久化完成，并传播异常。"""
+        with self._persist_lock:
+            future = self._persist_futures.get(symbol)
+        if future is not None:
+            future.result(timeout=timeout)
+
+    def flush_day_buffers(self, symbol: str, date_str: str) -> int:
+        """只强制落盘某个标的/交易日的缓冲区。"""
+        with self._buffer_lock:
+            buffers = [
+                buf for (buf_symbol, buf_date, _), buf in self._buffers.items()
+                if buf_symbol == symbol and buf_date == date_str
+            ]
+        total = 0
+        for buf in buffers:
+            total += buf.force_flush()
+        return total
+
+    def finalize_day(self, symbol: str, date_str: str):
+        """等待落盘、flush 并生成一个日终质量报告。"""
+        self.wait_for_persist(symbol)
+        self.flush_day_buffers(symbol, date_str)
+        report = audit_daily_data(
+            self.data_dir,
+            symbol,
+            date_str,
+            **self._quality_options,
+        )
+        path = write_quality_report(report, self.data_dir)
+        log.info(
+            "[%s] Daily data quality: status=%s score=%s coverage=%.1f%% "
+            "strike_median=%.0f report=%s",
+            symbol,
+            report.status,
+            report.score,
+            report.gex_coverage * 100,
+            report.median_contracts_per_minute,
+            path,
+        )
+        return report
+
     def get_buffer_stats(self) -> dict:
         """获取缓冲区统计信息"""
         with self._buffer_lock:
@@ -475,20 +590,23 @@ class StorageManager:
 
     def shutdown(self) -> None:
         """关闭存储管理器，flush 缓冲区并等待落盘完成"""
-        # 先 flush 所有缓冲区
-        log.info("Flushing all buffers before shutdown...")
-        self.flush_all_buffers()
-
-        # 等待异步任务完成
+        # 必须先等异步 persist 把数据追加到 buffer，再 flush；旧顺序会让
+        # future 在首次 flush 后追加的最后一批记录随 buffer 清理而丢失。
+        log.info("Waiting for pending persistence before final flush...")
         with self._persist_lock:
-            for symbol, future in self._persist_futures.items():
-                if future is not None and not future.done():
-                    try:
-                        future.result(timeout=5)
-                    except Exception as e:
-                        log.warning(f"Persist for {symbol} did not complete: {e}")
+            futures = list(self._persist_futures.items())
+        for symbol, future in futures:
+            if future is not None:
+                try:
+                    future.result(timeout=30)
+                except Exception as e:
+                    log.warning(f"Persist for {symbol} did not complete: {e}")
+        with self._persist_lock:
             self._persist_futures.clear()
         self._persist_executor.shutdown(wait=True, cancel_futures=False)
+
+        log.info("Flushing all buffers before shutdown...")
+        self.flush_all_buffers()
 
         # 清理缓冲区
         with self._buffer_lock:

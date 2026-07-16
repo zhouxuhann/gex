@@ -71,6 +71,7 @@ def calculate_gex(
     missing_greeks = 0
     invalid_contracts = 0
     total_with_greeks = 0  # 有 Greeks 的合约数
+    total_with_exposure_qty = 0  # 有 OI 或盘中 volume，可用于 GEX 暴露计算
 
     for t in tickers:
         if t is None:
@@ -112,6 +113,9 @@ def calculate_gex(
         else:
             vol_qty = oi_qty  # fallback 到 OI
 
+        if oi_qty > 0 or has_volume:
+            total_with_exposure_qty += 1
+
         # dealer 约定: +1 for calls, -1 for puts
         multiplier = int(c.multiplier) if c.multiplier else 100
         gex_oi = sign * g.gamma * oi_qty * multiplier * spot ** 2 * 0.01    # 用于 Flip
@@ -140,11 +144,12 @@ def calculate_gex(
     if not rows:
         return None
 
-    # 检查 OI 就绪比例
+    # 检查可用于暴露计算的数据比例。IB 有时盘中返回 Greeks/volume，
+    # 但 OI 字段为 NaN；这种情况下仍可用 volume 计算实时 GEX。
     if total_with_greeks > 0:
-        oi_ready_ratio = (total_with_greeks - missing_oi) / total_with_greeks
-        if oi_ready_ratio < oi_ready_threshold:
-            return None  # OI 数据未就绪，等待
+        exposure_ready_ratio = total_with_exposure_qty / total_with_greeks
+        if exposure_ready_ratio < oi_ready_threshold:
+            return None  # OI/volume 数据未就绪，等待
 
     df = pd.DataFrame(rows)
 

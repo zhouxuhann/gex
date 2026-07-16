@@ -8,10 +8,13 @@ import pandas as pd
 import pytest
 
 from gex_monitor.storage import (
-    StorageManager, SegmentStorage, WriteBuffer,
-    _normalize_ts_to_utc, _normalize_ts_to_et,
-    _atomic_write_parquet, read_parquet_et,
-    BUFFER_FLUSH_THRESHOLD, BUFFER_FLUSH_INTERVAL,
+    SegmentStorage,
+    StorageManager,
+    WriteBuffer,
+    _atomic_write_parquet,
+    _normalize_ts_to_et,
+    _normalize_ts_to_utc,
+    find_split_data_dirs,
 )
 
 ET = ZoneInfo('America/New_York')
@@ -78,7 +81,7 @@ class TestTimezoneNormalization:
 
         result = _normalize_ts_to_utc(df)
         # Should return unchanged
-        assert result['ts'].dtype == object
+        pd.testing.assert_series_equal(result['ts'], df['ts'])
 
 
 class TestWriteBuffer:
@@ -186,7 +189,9 @@ class TestStorageManager:
     @pytest.fixture
     def storage(self, temp_dir):
         """Create a StorageManager instance for testing with low buffer threshold."""
-        return StorageManager(temp_dir, buffer_threshold=1, buffer_max_age=0.1)
+        manager = StorageManager(temp_dir, buffer_threshold=1, buffer_max_age=0.1)
+        yield manager
+        manager.shutdown()
 
     def test_init_creates_directory(self, temp_dir):
         """Test that init creates data directory."""
@@ -194,6 +199,7 @@ class TestStorageManager:
         storage = StorageManager(subdir)
 
         assert subdir.exists()
+        storage.shutdown()
 
     def test_persist_sync_gex(self, storage, temp_dir):
         """Test synchronous persistence of GEX data."""
@@ -234,6 +240,18 @@ class TestStorageManager:
         files = list(temp_dir.glob('strikes_QQQ_*.parquet'))
         assert len(files) == 1
 
+    def test_persist_routes_records_by_et_timestamp(self, storage, temp_dir):
+        records = [
+            {'ts': datetime(2026, 1, 15, 15, 59, tzinfo=ET), 'spot': 500.0},
+            {'ts': datetime(2026, 1, 16, 9, 30, tzinfo=ET), 'spot': 501.0},
+        ]
+
+        storage.persist_sync('QQQ', hist=records, ohlc=[], strikes=[])
+        storage.flush_all_buffers()
+
+        assert (temp_dir / 'gex_QQQ_20260115.parquet').is_file()
+        assert (temp_dir / 'gex_QQQ_20260116.parquet').is_file()
+
     def test_buffer_stats(self, storage, temp_dir):
         """Test get_buffer_stats method."""
         now = datetime.now(ET)
@@ -256,7 +274,7 @@ class TestStorageManager:
         storage2.persist_sync('SPY', hist=[{'ts': now, 'spot': 400.0}], ohlc=[], strikes=[])
 
         # Before flush, files might not exist
-        count = storage2.flush_all_buffers()
+        storage2.flush_all_buffers()
 
         # After flush, files should exist
         gex_files = list(temp_dir.glob('gex_*.parquet'))
@@ -354,6 +372,25 @@ class TestStorageManager:
         assert len(result) == 1
         assert result['open'].iloc[0] == 500.0
 
+    def test_load_day_ohlc_prefers_official_bar_file(self, storage, temp_dir):
+        now = datetime.now(ET)
+        columns = {
+            'ts': pd.to_datetime([now]).tz_localize(None).tz_localize(UTC),
+            'open': [500.0], 'high': [502.0], 'low': [499.0], 'close': [501.0],
+            'volume': [1234], 'source': ['ib_historical_trades'],
+        }
+        pd.DataFrame({**columns, 'open': [490.0]}).to_parquet(
+            temp_dir / 'ohlc_QQQ_20240115.parquet'
+        )
+        pd.DataFrame(columns).to_parquet(
+            temp_dir / 'official_ohlc_QQQ_20240115.parquet'
+        )
+
+        result = storage.load_day_ohlc('QQQ', '20240115')
+
+        assert result is not None
+        assert result['open'].iloc[0] == 500.0
+
     def test_load_day_ohlc_nonexistent(self, storage):
         """Test loading OHLC for nonexistent date."""
         result = storage.load_day_ohlc('QQQ', '99990101')
@@ -411,7 +448,19 @@ class TestStorageManager:
         storage.persist_async('QQQ', hist=hist, ohlc=[], strikes=[])
         storage.shutdown()
 
-        # Should complete without error
+        files = list(storage.data_dir.glob('gex_QQQ_*.parquet'))
+        assert len(files) == 1
+
+    def test_find_split_data_dirs(self, temp_dir):
+        primary = temp_dir / 'data'
+        legacy = temp_dir / 'src' / 'data'
+        primary.mkdir()
+        legacy.mkdir(parents=True)
+        (legacy / 'gex_QQQ_20260115.parquet').touch()
+
+        result = find_split_data_dirs(primary, [primary, legacy])
+
+        assert result == [legacy.resolve()]
 
 
 class TestSegmentStorage:

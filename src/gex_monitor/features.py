@@ -25,6 +25,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from .gex_calc import _calculate_gamma_flip
+
 log = logging.getLogger(__name__)
 
 # ============================================================
@@ -58,10 +60,21 @@ def compute_snapshot_features(df: pd.DataFrame, spot: float) -> dict:
     put_abs = abs(put_gex)
     call_gex_ratio = call_abs / (call_abs + put_abs) if (call_abs + put_abs) > 0 else 0.5
 
-    # Flip：累积 GEX 绝对值最小的 strike
-    cum = by_strike.cumsum()
-    flip = float(strikes[np.argmin(np.abs(cum.values))])
-    spot_to_flip_pct = (spot - flip) / spot
+    # Flip 与主 GEX 引擎使用同一数据列和零点插值逻辑。
+    # 没有任何零交叉时不制造假 flip，而是显式返回 no_flip。
+    flip_col = 'gex_flip' if 'gex_flip' in df.columns else 'gex'
+    by_strike_flip = df.groupby('strike')[flip_col].sum().sort_index()
+    cumulative = by_strike_flip.cumsum()
+    cumulative_values = cumulative.to_numpy(dtype=float)
+    exact_zero = np.flatnonzero(np.isclose(cumulative_values, 0.0, atol=1e-12))
+    sign_change = np.flatnonzero(cumulative_values[:-1] * cumulative_values[1:] < 0)
+    if len(exact_zero):
+        flip = float(cumulative.index[exact_zero[0]])
+    elif len(sign_change):
+        flip = float(_calculate_gamma_flip(by_strike_flip, spot))
+    else:
+        flip = np.nan
+    spot_to_flip_pct = (spot - flip) / spot if not np.isnan(flip) else np.nan
 
     # ---- Shape ----
     # Herfindahl 集中度
@@ -417,7 +430,9 @@ def classify_regime(feat: dict, thresholds: dict = None) -> tuple:
 
     # ---- 3. Spot 相对 flip 位置 ----
     d = feat['spot_to_flip_pct']
-    if abs(d) < t['at_flip_tol']:
+    if np.isnan(d):
+        tags['position'] = 'no_flip'
+    elif abs(d) < t['at_flip_tol']:
         tags['position'] = 'at_flip'
     elif d > 0:
         tags['position'] = 'above_flip'
@@ -462,6 +477,7 @@ REGIME_DESCRIPTIONS = {
     'above_flip': '📈 Spot 在稳定区',
     'below_flip': '📉 Spot 在不稳定区',
     'at_flip':    '⚡ 临近 flip（翻转风险）',
+    'no_flip':    '— 当前 strike 窗口内无 flip',
     'concentrated': '🧲 集中（磁铁效应强）',
     'diffuse':    '🌫️  分散（无明显磁铁）',
     'near_call_wall': '🧱 接近 call wall（上方阻力）',

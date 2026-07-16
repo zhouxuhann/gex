@@ -43,6 +43,13 @@ class SkewSnapshot:
     skew_slope: float | None       # OTM skew slope，归一化
     rr_25_zscore: float | None     # RR 的日内 z-score
     signal: str | None             # GEX+skew 联合信号
+    ts: float | None = None        # epoch seconds（用于 dRR 时间窗口）
+    spot: float | None = None
+    drr_25: float | None = None
+    drr_25_zscore: float | None = None
+    alert_level: str | None = None
+    alert_score: float | None = None
+    alert_note: str | None = None
 
 
 def compute_skew(tickers, spot: float) -> SkewSnapshot | None:
@@ -191,14 +198,27 @@ class SkewTracker:
     在 IBWorker 中实例化，每次 tick 调用 update()
     """
 
-    def __init__(self, window: int = 30):
+    def __init__(
+        self,
+        window: int = 30,
+        drr_window_s: float = 60.0,
+        drr_min_samples: int = 20,
+        z_hi: float = 2.0,
+        z_lo: float = -2.0,
+    ):
         """
         Args:
             window: rolling 窗口大小（tick 数），默认 30
                     3s tick 间隔 × 30 ≈ 90s 窗口
         """
         self.window = window
+        self.drr_window_s = max(float(drr_window_s), 0.0)
+        self.drr_min_samples = max(int(drr_min_samples), 2)
+        self.z_hi = float(z_hi)
+        self.z_lo = float(z_lo)
         self._rr_history: deque[float] = deque(maxlen=window)
+        self._timed_rr_history: deque[tuple[float, float]] = deque(maxlen=max(window * 4, 120))
+        self._drr_history: deque[float] = deque(maxlen=window)
 
     def update(
         self, snapshot: SkewSnapshot | None, positive_gamma: bool
@@ -224,6 +244,35 @@ class SkewTracker:
         zscore = self._calc_zscore()
         snapshot.rr_25_zscore = zscore
 
+        # dRR: 当前 RR 减去 drr_window_s 之前最近的 RR。
+        # 用时间而不是固定 tick 个数，使实时 3s 数据和 1min 回放兼容。
+        if snapshot.ts is not None and snapshot.rr_25 is not None:
+            current_ts = float(snapshot.ts)
+            current_rr = float(snapshot.rr_25)
+            target_ts = current_ts - self.drr_window_s
+            baseline = None
+            for ts, rr in reversed(self._timed_rr_history):
+                if ts <= target_ts:
+                    baseline = rr
+                    break
+            if baseline is not None:
+                snapshot.drr_25 = current_rr - baseline
+                self._drr_history.append(snapshot.drr_25)
+                snapshot.drr_25_zscore = self._calc_values_zscore(
+                    self._drr_history, self.drr_min_samples
+                )
+            self._timed_rr_history.append((current_ts, current_rr))
+
+        if not positive_gamma and snapshot.drr_25_zscore is not None:
+            if snapshot.drr_25_zscore >= self.z_hi:
+                snapshot.alert_level = 'HIGH'
+                snapshot.alert_score = float(snapshot.drr_25_zscore)
+                snapshot.alert_note = '负 gamma 环境中 put-call skew 快速上升'
+            elif snapshot.drr_25_zscore <= self.z_lo:
+                snapshot.alert_level = 'LOW'
+                snapshot.alert_score = float(abs(snapshot.drr_25_zscore))
+                snapshot.alert_note = '负 gamma 环境中 skew 快速回落'
+
         # 联合信号
         snapshot.signal = self._classify_signal(zscore, positive_gamma)
 
@@ -231,10 +280,14 @@ class SkewTracker:
 
     def _calc_zscore(self) -> float | None:
         """计算 RR 的 rolling z-score"""
-        if len(self._rr_history) < 10:  # 冷启动：至少 10 个点
+        return self._calc_values_zscore(self._rr_history, 10)
+
+    @staticmethod
+    def _calc_values_zscore(values, min_samples: int) -> float | None:
+        if len(values) < min_samples:
             return None
 
-        arr = np.array(self._rr_history)
+        arr = np.asarray(values, dtype=float)
         mean = arr.mean()
         std = arr.std()
 
@@ -266,3 +319,5 @@ class SkewTracker:
     def reset(self) -> None:
         """重置 rolling 窗口（新交易日调用）"""
         self._rr_history.clear()
+        self._timed_rr_history.clear()
+        self._drr_history.clear()

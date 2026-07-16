@@ -2,7 +2,7 @@
 import logging
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 import pandas as pd
@@ -86,6 +86,8 @@ class StateManager:
         self._skew_slope: float | None = None
         self._rr_25_zscore: float | None = None
         self._skew_signal: str | None = None
+        self._partial: bool = False
+        self._quality_reasons: list[str] = []
 
         # 历史数据
         self._history: deque = deque(maxlen=max_history)
@@ -113,7 +115,9 @@ class StateManager:
                positive_gamma: bool = False, max_pain: float | None = None,
                regime_code: str | None = None, regime_tags: dict | None = None,
                rr_25: float | None = None, skew_slope: float | None = None,
-               rr_25_zscore: float | None = None, skew_signal: str | None = None) -> None:
+               rr_25_zscore: float | None = None, skew_signal: str | None = None,
+               partial: bool = False,
+               quality_reasons: list[str] | None = None) -> None:
         """更新实时状态"""
         now = et_now()
         minute = now.replace(second=0, microsecond=0)
@@ -143,6 +147,8 @@ class StateManager:
             self._skew_slope = skew_slope
             self._rr_25_zscore = rr_25_zscore
             self._skew_signal = skew_signal
+            self._partial = bool(partial)
+            self._quality_reasons = list(quality_reasons or [])
 
             # 追加历史
             self._history.append({
@@ -160,6 +166,8 @@ class StateManager:
                 'rr_25': rr_25,
                 'skew_slope': skew_slope,
                 'rr_25_zscore': rr_25_zscore,
+                'partial': bool(partial),
+                'quality_reasons': ';'.join(quality_reasons or []),
             })
 
             # OHLC
@@ -238,6 +246,8 @@ class StateManager:
                 'skew_slope': self._skew_slope,
                 'rr_25_zscore': self._rr_25_zscore,
                 'skew_signal': self._skew_signal,
+                'partial': self._partial,
+                'quality_reasons': list(self._quality_reasons),
             }
 
     def get_df(self) -> pd.DataFrame:

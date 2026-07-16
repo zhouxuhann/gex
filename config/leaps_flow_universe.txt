@@ -1,0 +1,22 @@
+# One symbol per line. The monitor scans this list in batches.
+# Start small, then add names as needed.
+AMD
+NOK
+ORCL
+NVDA
+AAPL
+LITE
+MRVL
+CRWV
+NBIS
+AVGO
+TSM
+MU
+ARM
+PLTR
+SMCI
+DELL
+HPE
+GOOG
+MSFT
+META

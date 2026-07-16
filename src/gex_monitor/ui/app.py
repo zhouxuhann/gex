@@ -15,6 +15,7 @@ def create_app(
     segments: SegmentStorage,
     symbols: list[str],
     db_storage: GEXDBStorage | None = None,
+    extended_symbols: set[str] | None = None,
 ) -> dash.Dash:
     """
     创建 Dash 应用
@@ -24,6 +25,7 @@ def create_app(
         storage: 存储管理器
         segments: 分段标注存储
         symbols: 已启用的标的列表
+        extended_symbols: 启用了 GTH 延伸时段的标的（决定 UI 闭市后的刷新调度）
 
     Returns:
         配置好的 Dash 应用
@@ -58,6 +60,7 @@ def create_app(
     app.layout = create_layout(symbols)
 
     # 注册回调
-    register_callbacks(app, registry, storage, segments, db_storage=db_storage)
+    register_callbacks(app, registry, storage, segments, db_storage=db_storage,
+                       extended_symbols=extended_symbols)
 
     return app

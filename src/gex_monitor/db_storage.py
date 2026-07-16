@@ -17,9 +17,10 @@ from collections import deque
 from datetime import datetime
 
 import pandas as pd
-warnings.filterwarnings('ignore', message='.*pandas only supports SQLAlchemy.*')
 
 from .config import DatabaseConfig
+
+warnings.filterwarnings('ignore', message='.*pandas only supports SQLAlchemy.*')
 
 log = logging.getLogger(__name__)
 
@@ -73,7 +74,8 @@ ON CONFLICT (symbol, datetime) DO UPDATE SET
 
 # OHLC 查询 SQL
 _OHLC_QUERY = """
-SELECT datetime as ts, open, high, low, close, volume
+SELECT datetime as ts, open, high, low, close, volume,
+       bar_count, average, has_gaps, source
 FROM market_data_bars
 WHERE symbol = %s AND bar_size = %s
   AND datetime::date = %s::date
@@ -81,11 +83,34 @@ ORDER BY datetime
 """
 
 _OHLC_RANGE_QUERY = """
-SELECT datetime as ts, open, high, low, close, volume
+SELECT datetime as ts, open, high, low, close, volume,
+       bar_count, average, has_gaps, source
 FROM market_data_bars
 WHERE symbol = %s AND bar_size = %s
   AND datetime BETWEEN %s AND %s
 ORDER BY datetime
+"""
+
+_MARKET_BAR_UPSERT_SQL = """
+INSERT INTO market_data_bars (
+    symbol, bar_size, datetime, open, high, low, close, volume,
+    bar_count, average, has_gaps, source, created_at
+) VALUES (
+    %(symbol)s, %(bar_size)s, %(datetime)s, %(open)s, %(high)s, %(low)s,
+    %(close)s, %(volume)s, %(bar_count)s, %(average)s, %(has_gaps)s,
+    %(source)s, %(created_at)s
+)
+ON CONFLICT (symbol, bar_size, datetime) DO UPDATE SET
+    open = EXCLUDED.open,
+    high = EXCLUDED.high,
+    low = EXCLUDED.low,
+    close = EXCLUDED.close,
+    volume = EXCLUDED.volume,
+    bar_count = EXCLUDED.bar_count,
+    average = EXCLUDED.average,
+    has_gaps = EXCLUDED.has_gaps,
+    source = EXCLUDED.source,
+    created_at = EXCLUDED.created_at
 """
 
 
@@ -233,6 +258,25 @@ class GEXDBStorage:
     def pending_count(self) -> int:
         return len(self._buffer)
 
+    def upsert_market_data_bars(self, records: list[dict], page_size: int = 500) -> int:
+        """批量写入官方 OHLC Bar。``datetime`` 使用美东 naive 时间。"""
+        if not records or not self._ensure_connection():
+            return 0
+        try:
+            with self._conn.cursor() as cur:
+                psycopg2.extras.execute_batch(
+                    cur, _MARKET_BAR_UPSERT_SQL, records, page_size=page_size
+                )
+            self._conn.commit()
+            return len(records)
+        except Exception as e:
+            log.error(f"Market bar upsert failed: {e}")
+            try:
+                self._conn.rollback()
+            except Exception:
+                self._conn = None
+            return 0
+
     # ==================== 读: OHLC from market_data_bars ====================
 
     def load_ohlc(
@@ -247,7 +291,8 @@ class GEXDBStorage:
             bar_size: K 线周期 (默认 '1 min')
 
         Returns:
-            DataFrame with columns [ts, open, high, low, close, volume]
+            DataFrame with columns [ts, open, high, low, close, volume,
+            bar_count, average, has_gaps, source]
             或 None
         """
         if not self._ensure_connection():

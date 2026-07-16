@@ -108,6 +108,14 @@ def create_layout(symbols: list[str]) -> html.Div:
 
         *symbol_selector,
 
+        html.Div(id='market-countdown', style={
+            'textAlign': 'center',
+            'fontSize': '18px',
+            'margin': '10px auto 6px',
+            'minHeight': '30px',
+            'letterSpacing': '0',
+        }),
+
         html.Div(id='stats', style={
             'textAlign': 'center', 'fontSize': '18px', 'margin': '20px'
         }),
@@ -295,4 +303,5 @@ def create_layout(symbols: list[str]) -> html.Div:
         # Intervals
         dcc.Interval(id='interval', interval=4000, n_intervals=0),
         dcc.Interval(id='slow-interval', interval=30000, n_intervals=0),
+        dcc.Interval(id='countdown-interval', interval=1000, n_intervals=0),
     ])
