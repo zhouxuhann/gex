@@ -387,9 +387,62 @@ class IntradayVRPMonitor:
             })
             rows.append(row)
         self.storage.persist_vrp_observations(self.symbol, date_str, rows)
+        fly_count = self._settle_iron_flies(
+            date_str=date_str,
+            settlement_price=settle,
+            settlement_source=source,
+            rth_bar_count=len(bars),
+        )
         self.audit_date(date_str)
-        log.info("[%s] VRP settled %s: %s observations (%s)",
-                 self.symbol, date_str, len(rows), source)
+        log.info("[%s] VRP settled %s: %s straddles, %s iron flies (%s)",
+                 self.symbol, date_str, len(rows), fly_count, source)
+        return len(rows)
+
+    def _settle_iron_flies(self, *, date_str: str, settlement_price: float,
+                           settlement_source: str, rth_bar_count: int) -> int:
+        """按有限风险到期 payoff 回填所有候选 Iron fly。"""
+        flies = self.storage.load_vrp_iron_flies(self.symbol, date_str)
+        if flies.empty:
+            return 0
+        rows = []
+        for raw in flies.to_dict("records"):
+            row = dict(raw)
+            strike = _finite(row.get("atm_strike"))
+            down_width = _finite(row.get("downside_wing_width"))
+            up_width = _finite(row.get("upside_wing_width"))
+            credit = _finite(row.get("net_credit_after_fees"))
+            max_loss_dollars = _finite(row.get("max_loss_dollars"))
+            if None in (strike, down_width, up_width, credit):
+                continue
+            distance = settlement_price - strike
+            applicable_width = up_width if distance >= 0 else down_width
+            terminal_payoff = min(abs(distance), applicable_width)
+            pnl_points = credit - terminal_payoff
+            pnl_dollars = pnl_points * 100
+            lower_be = _finite(row.get("lower_breakeven"))
+            upper_be = _finite(row.get("upper_breakeven"))
+            row.update({
+                "settled_at": et_now(),
+                "settlement_price": settlement_price,
+                "settlement_source": settlement_source,
+                "settlement_quality": "complete" if rth_bar_count >= 389 else "partial",
+                "rth_bar_count": rth_bar_count,
+                "distance_to_atm": distance,
+                "terminal_fly_payoff": terminal_payoff,
+                "iron_fly_pnl_points": pnl_points,
+                "iron_fly_pnl_dollars": pnl_dollars,
+                "return_on_max_risk": pnl_dollars / max_loss_dollars
+                if max_loss_dollars is not None and max_loss_dollars > 0 else None,
+                "hit_max_loss": bool(abs(distance) >= applicable_width),
+                "expired_inside_breakeven": bool(
+                    lower_be is not None and upper_be is not None
+                    and lower_be <= settlement_price <= upper_be
+                ),
+            })
+            rows.append(row)
+        self.storage.persist_vrp_iron_fly_observations(
+            self.symbol, date_str, rows
+        )
         return len(rows)
 
     def audit_date(self, date_str: str) -> dict:

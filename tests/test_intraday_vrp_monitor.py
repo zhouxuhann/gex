@@ -100,6 +100,17 @@ def test_settlement_uses_actual_strike_and_cleans_cross_day_bars(tmp_path):
         "strike": 725.0, "straddle_mid": 2.0, "sell_credit_bid": 1.8,
         "status": "ok",
     })
+    storage.persist_vrp_iron_flies("QQQ", "20260715", [{
+        "schema_version": 1, "symbol": "QQQ", "trading_date": "20260715",
+        "scheduled_time": "15:00", "observed_at": observed,
+        "target_wing_width": 3.0, "atm_strike": 725.0,
+        "lower_put_strike": 722.0, "upper_call_strike": 728.0,
+        "downside_wing_width": 3.0, "upside_wing_width": 3.0,
+        "net_credit_after_fees": 1.2,
+        "lower_breakeven": 723.8, "upper_breakeven": 726.2,
+        "max_loss_points": 1.8, "max_loss_dollars": 180.0,
+        "status": "ok",
+    }])
     ts = pd.date_range("2026-07-15 09:30", periods=390, freq="min", tz=ET)
     bars = pd.DataFrame({"ts": ts, "open": 724.0, "high": 726.0,
                          "low": 723.0, "close": 724.0})
@@ -113,4 +124,35 @@ def test_settlement_uses_actual_strike_and_cleans_cross_day_bars(tmp_path):
     assert row["terminal_payoff"] == 1.0
     assert abs(row["pnl_executable"] - 0.787) < 1e-9
     assert row["rth_bar_count"] == 390
+    fly = storage.load_vrp_iron_fly_observations("QQQ", "20260715").iloc[0]
+    assert fly["settlement_price"] == 724.0
+    assert fly["terminal_fly_payoff"] == 1.0
+    assert abs(fly["iron_fly_pnl_dollars"] - 20.0) < 1e-9
+    assert abs(fly["return_on_max_risk"] - (20 / 180)) < 1e-9
+    assert not bool(fly["hit_max_loss"])
+    assert bool(fly["expired_inside_breakeven"])
+    storage.shutdown()
+
+
+def test_iron_fly_settlement_caps_payoff_at_wing(tmp_path):
+    storage = StorageManager(tmp_path)
+    monitor = IntradayVRPMonitor("SPY", storage, IntradayVRPConfig(enabled=True))
+    storage.persist_vrp_iron_flies("SPY", "20260715", [{
+        "schema_version": 1, "symbol": "SPY", "trading_date": "20260715",
+        "scheduled_time": "14:00", "target_wing_width": 2.0,
+        "atm_strike": 750.0, "downside_wing_width": 2.0,
+        "upside_wing_width": 2.0, "net_credit_after_fees": 1.25,
+        "lower_breakeven": 748.75, "upper_breakeven": 751.25,
+        "max_loss_points": 0.75, "max_loss_dollars": 75.0,
+    }])
+    assert monitor._settle_iron_flies(
+        date_str="20260715", settlement_price=755.0,
+        settlement_source="test", rth_bar_count=390,
+    ) == 1
+    fly = storage.load_vrp_iron_fly_observations("SPY", "20260715").iloc[0]
+    assert fly["terminal_fly_payoff"] == 2.0
+    assert fly["iron_fly_pnl_dollars"] == -75.0
+    assert fly["return_on_max_risk"] == -1.0
+    assert bool(fly["hit_max_loss"])
+    assert not bool(fly["expired_inside_breakeven"])
     storage.shutdown()
