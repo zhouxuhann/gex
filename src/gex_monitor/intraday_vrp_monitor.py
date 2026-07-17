@@ -84,10 +84,133 @@ class IntradayVRPMonitor:
             ib, contracts, now, target, slot, spot, expiry, is_true_0dte, gex_state
         )
         self.storage.persist_vrp_quote(self.symbol, date_str, row)
+        wing_rows, fly_rows = self._build_wings_and_flies(
+            ib, contracts, now=now, quote_row=row
+        )
+        self.storage.persist_vrp_wing_quotes(self.symbol, date_str, wing_rows)
+        self.storage.persist_vrp_iron_flies(self.symbol, date_str, fly_rows)
         self._recorded.add(slot)
-        log.info("[%s] VRP %s recorded status=%s strike=%s",
-                 self.symbol, slot, row["status"], row.get("strike"))
+        log.info("[%s] VRP %s recorded status=%s strike=%s wings=%s flies=%s",
+                 self.symbol, slot, row["status"], row.get("strike"),
+                 len(wing_rows), len(fly_rows))
         return True
+
+    def _build_wings_and_flies(self, ib, contracts: list, *, now: datetime,
+                               quote_row: dict) -> tuple[list[dict], list[dict]]:
+        """构造标准化保护翼报价及有限风险 iron fly 候选。"""
+        atm_strike = _finite(quote_row.get("strike"))
+        expiry = str(quote_row.get("expiry") or "")
+        if atm_strike is None or quote_row.get("status") in {
+                "missing_pair", "not_true_0dte"}:
+            return [], []
+
+        tickers: dict[tuple[float, str], object] = {}
+        for contract in contracts:
+            if str(getattr(contract, "lastTradeDateOrContractMonth", "")) != expiry:
+                continue
+            strike = _finite(getattr(contract, "strike", None))
+            right = getattr(contract, "right", None)
+            if strike is None or right not in ("C", "P"):
+                continue
+            ticker = ib.ticker(contract)
+            if ticker is not None:
+                tickers[(strike, right)] = ticker
+
+        available = sorted({strike for strike, _ in tickers})
+        if atm_strike not in available:
+            return [], []
+        atm_index = available.index(atm_strike)
+        n = max(0, self.config.wing_strikes_each_side)
+        selected = available[max(0, atm_index - n): atm_index + n + 1]
+        wing_rows = []
+        for strike in selected:
+            for right in ("C", "P"):
+                ticker = tickers.get((strike, right))
+                if ticker is None:
+                    continue
+                bid = _finite(getattr(ticker, "bid", None))
+                ask = _finite(getattr(ticker, "ask", None))
+                quote_ts = _ticker_time(ticker)
+                age = max(0.0, (now - quote_ts).total_seconds()) if quote_ts else None
+                greeks = getattr(ticker, "modelGreeks", None)
+                valid = (bid is not None and ask is not None and bid >= 0
+                         and ask >= bid and age is not None)
+                wing_rows.append({
+                    "schema_version": 1,
+                    "symbol": self.symbol,
+                    "trading_date": quote_row["trading_date"],
+                    "scheduled_time": quote_row["scheduled_time"],
+                    "observed_at": now,
+                    "expiry": expiry,
+                    "spot": quote_row["spot"],
+                    "atm_strike": atm_strike,
+                    "strike": strike,
+                    "right": right,
+                    "distance_from_atm": strike - atm_strike,
+                    "bid": bid,
+                    "ask": ask,
+                    "bid_size": _finite(getattr(ticker, "bidSize", None)),
+                    "ask_size": _finite(getattr(ticker, "askSize", None)),
+                    "delta": _finite(getattr(greeks, "delta", None)),
+                    "quote_ts": quote_ts,
+                    "quote_age_seconds": age,
+                    "status": "ok" if valid else "invalid_nbbo",
+                })
+
+        quote_map = {(r["strike"], r["right"]): r for r in wing_rows}
+        atm_call = quote_map.get((atm_strike, "C"), {})
+        atm_put = quote_map.get((atm_strike, "P"), {})
+        short_credit = None
+        if atm_call.get("status") == "ok" and atm_put.get("status") == "ok":
+            short_credit = atm_call["bid"] + atm_put["bid"]
+
+        fly_rows = []
+        for target_width in self.config.iron_fly_widths:
+            target_width = float(target_width)
+            lower = atm_strike - target_width
+            upper = atm_strike + target_width
+            lower_put = quote_map.get((lower, "P"))
+            upper_call = quote_map.get((upper, "C"))
+            if (short_credit is None or lower_put is None or upper_call is None
+                    or lower_put["status"] != "ok" or upper_call["status"] != "ok"):
+                continue
+            gross_credit = short_credit - lower_put["ask"] - upper_call["ask"]
+            fees_dollars = self.config.commission_per_straddle * 2
+            credit_after_fees = gross_credit - fees_dollars / 100.0
+            downside_width = atm_strike - lower
+            upside_width = upper - atm_strike
+            max_loss_points = max(downside_width, upside_width) - credit_after_fees
+            fly_rows.append({
+                "schema_version": 1,
+                "symbol": self.symbol,
+                "trading_date": quote_row["trading_date"],
+                "scheduled_time": quote_row["scheduled_time"],
+                "observed_at": now,
+                "expiry": expiry,
+                "spot": quote_row["spot"],
+                "atm_strike": atm_strike,
+                "lower_put_strike": lower,
+                "upper_call_strike": upper,
+                "target_wing_width": target_width,
+                "downside_wing_width": downside_width,
+                "upside_wing_width": upside_width,
+                "short_straddle_bid_credit": short_credit,
+                "lower_put_ask": lower_put["ask"],
+                "upper_call_ask": upper_call["ask"],
+                "gross_net_credit": gross_credit,
+                "estimated_fees_dollars": fees_dollars,
+                "net_credit_after_fees": credit_after_fees,
+                "lower_breakeven": atm_strike - credit_after_fees,
+                "upper_breakeven": atm_strike + credit_after_fees,
+                "max_loss_points": max_loss_points,
+                "max_loss_dollars": max_loss_points * 100,
+                "quote_age_seconds": max(
+                    atm_call["quote_age_seconds"], atm_put["quote_age_seconds"],
+                    lower_put["quote_age_seconds"], upper_call["quote_age_seconds"],
+                ),
+                "status": "ok" if credit_after_fees > 0 else "nonpositive_credit",
+            })
+        return wing_rows, fly_rows
 
     def _build_quote_row(self, ib, contracts: list, now: datetime, target: datetime,
                          slot: str, spot: float, expiry: str, is_true_0dte: bool,

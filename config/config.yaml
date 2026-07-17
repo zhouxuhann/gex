@@ -65,6 +65,8 @@ intraday_vrp:
   schedule_et: ["09:35", "10:00", "10:30", "11:00", "12:00", "13:00", "14:00", "14:30", "15:00"]
   sample_window_seconds: 180
   candidate_strikes_each_side: 2
+  wing_strikes_each_side: 5
+  iron_fly_widths: [1, 2, 3, 5]
   max_quote_age_seconds: 10
   max_combined_spread_ratio: 0.10
   commission_per_straddle: 1.30

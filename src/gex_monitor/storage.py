@@ -298,6 +298,30 @@ class StorageManager:
             ['symbol', 'trading_date', 'scheduled_time'], self._io_lock,
         )
 
+    def persist_vrp_wing_quotes(self, symbol: str, date_str: str,
+                                rows: list[dict]) -> None:
+        """保存 ATM 周围保护翼候选的完整分腿报价。"""
+        if not rows:
+            return
+        path = self.data_dir / f'vrp_wing_quotes_{symbol}_{date_str}.parquet'
+        _merge_and_write(
+            path, pd.DataFrame(rows),
+            ['symbol', 'trading_date', 'scheduled_time', 'strike', 'right'],
+            self._io_lock,
+        )
+
+    def persist_vrp_iron_flies(self, symbol: str, date_str: str,
+                               rows: list[dict]) -> None:
+        """保存由实时可成交报价计算的候选 iron fly 结构。"""
+        if not rows:
+            return
+        path = self.data_dir / f'vrp_iron_flies_{symbol}_{date_str}.parquet'
+        _merge_and_write(
+            path, pd.DataFrame(rows),
+            ['symbol', 'trading_date', 'scheduled_time', 'target_wing_width'],
+            self._io_lock,
+        )
+
     def persist_vrp_observations(self, symbol: str, date_str: str,
                                  rows: list[dict]) -> None:
         """写入可由原始报价重新生成的 VRP 结算结果。"""

@@ -55,12 +55,15 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
     monitor = IntradayVRPMonitor("QQQ", storage, config)
     now = datetime(2026, 7, 16, 9, 35, 2, tzinfo=ET)
     contracts = [contract(724, "C"), contract(724, "P"),
-                 contract(725, "C"), contract(725, "P")]
+                 contract(725, "C"), contract(725, "P"),
+                 contract(726, "C"), contract(726, "P")]
     tickers = {
         contracts[0]: ticker(1.9, 2.0, 0.55, now.astimezone(timezone.utc)),
         contracts[1]: ticker(1.7, 1.8, -0.45, now.astimezone(timezone.utc)),
         contracts[2]: ticker(1.4, 1.5, 0.48, now.astimezone(timezone.utc)),
         contracts[3]: ticker(2.1, 2.2, -0.52, now.astimezone(timezone.utc)),
+        contracts[4]: ticker(0.9, 1.0, 0.35, now.astimezone(timezone.utc)),
+        contracts[5]: ticker(2.8, 2.9, -0.65, now.astimezone(timezone.utc)),
     }
     assert monitor.on_gex_update(
         FakeIB(tickers), contracts, now=now, spot=724.6, expiry="20260716",
@@ -72,6 +75,16 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
     assert row["status"] == "ok"
     assert row["strike"] == 725
     assert row["sell_credit_bid"] == 3.5
+    wings = pd.read_parquet(tmp_path / "vrp_wing_quotes_QQQ_20260716.parquet")
+    assert len(wings) == 6
+    assert set(wings["status"]) == {"ok"}
+    flies = pd.read_parquet(tmp_path / "vrp_iron_flies_QQQ_20260716.parquet")
+    assert len(flies) == 1
+    fly = flies.iloc[0]
+    assert fly["target_wing_width"] == 1
+    assert abs(fly["gross_net_credit"] - 0.7) < 1e-9
+    assert abs(fly["net_credit_after_fees"] - 0.674) < 1e-9
+    assert abs(fly["max_loss_dollars"] - 32.6) < 1e-9
     storage.shutdown()
 
 

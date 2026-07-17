@@ -101,6 +101,8 @@ class IntradayVRPConfig(BaseModel):
     ])
     sample_window_seconds: int = 180
     candidate_strikes_each_side: int = 2
+    wing_strikes_each_side: int = 5
+    iron_fly_widths: list[float] = Field(default_factory=lambda: [1, 2, 3, 5])
     max_quote_age_seconds: int = 10
     max_combined_spread_ratio: float = 0.10
     commission_per_straddle: float = 1.30
