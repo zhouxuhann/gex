@@ -33,6 +33,10 @@ log = logging.getLogger(__name__)
 # 分位数阈值
 CHEAP_THRESHOLD = 30   # percentile
 EXPENSIVE_THRESHOLD = 70
+MIN_HISTORY_DAYS = 20
+HEDGE_DTE_MIN = 20
+HEDGE_DTE_MAX = 55
+HISTORY_DTE_TOLERANCE = 5
 
 # urgency 权重
 URGENCY_NEGATIVE_GAMMA = 0.4
@@ -53,6 +57,10 @@ class HedgeSignal:
     recommended_structure: str     # outright_put / put_spread / collar / none
     recommended_tenor: str         # 1W / 2W
     reasoning: str                 # 人类可读解释
+    data_quality: str = 'good'
+    hedge_tenor_dte: int | None = None
+    rr_25_current: float | None = None
+    history_days: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +74,10 @@ class HedgeSignal:
             'recommended_structure': self.recommended_structure,
             'recommended_tenor': self.recommended_tenor,
             'reasoning': self.reasoning,
+            'data_quality': self.data_quality,
+            'hedge_tenor_dte': self.hedge_tenor_dte,
+            'rr_25_current': self.rr_25_current,
+            'history_days': self.history_days,
         }
 
 
@@ -92,17 +104,30 @@ def generate_hedge_signal(
     now = surface.ts
     symbol = surface.symbol
 
-    # 1. Skew cheapness score（RR 25Δ 的分位数）
-    rr_25_current = _get_current_rr25(surface)
-    cheapness = _compute_cheapness(rr_25_current, history_df)
+    # 1. 只允许使用真正可执行的 20-55D tenor，不再 fallback 到 7D/0D。
+    hedge_tenor = _select_hedge_tenor(surface)
+    rr_25_current = hedge_tenor.rr_25 if hedge_tenor is not None else None
+    target_dte = hedge_tenor.dte if hedge_tenor is not None else None
+    cheapness, history_days = _compute_cheapness_details(
+        rr_25_current, history_df, target_dte=target_dte,
+        current_ts=surface.ts,
+    )
+    data_quality = 'good'
+    if hedge_tenor is None:
+        data_quality = 'insufficient_current_tenor'
+    elif history_days < MIN_HISTORY_DAYS:
+        data_quality = 'insufficient_same_tenor_history'
 
     # 2. Term structure 分类
     term_struct = _classify_term_structure(surface.term_spread_rr25, surface.term_spread_iv)
 
-    # 3. 决策
-    action, structure = _decide_action(
-        cheapness, gex_regime, term_struct, last_signal
-    )
+    # 3. 数据不足时只记录 MONITOR，禁止进入下单路径。
+    if data_quality != 'good':
+        action, structure = 'MONITOR', 'none'
+    else:
+        action, structure = _decide_action(
+            cheapness, gex_regime, term_struct, last_signal
+        )
 
     # 4. Urgency 计算（skew + GEX + term structure + 宏观）
     urgency = _compute_urgency(cheapness, gex_regime, term_struct)
@@ -110,11 +135,12 @@ def generate_hedge_signal(
         urgency = min(1.0, max(0.0, urgency + macro.urgency_adjustment))
 
     # 5. Tenor 推荐
-    tenor = _recommend_tenor(surface)
+    tenor = _recommend_tenor(surface, hedge_tenor)
 
     # 6. 生成理由
     reasoning = _build_reasoning(
-        action, cheapness, gex_regime, term_struct, rr_25_current, surface, macro
+        action, cheapness, gex_regime, term_struct, rr_25_current, surface, macro,
+        data_quality=data_quality, history_days=history_days,
     )
 
     return HedgeSignal(
@@ -128,21 +154,36 @@ def generate_hedge_signal(
         recommended_structure=structure,
         recommended_tenor=tenor,
         reasoning=reasoning,
+        data_quality=data_quality,
+        hedge_tenor_dte=target_dte,
+        rr_25_current=rr_25_current,
+        history_days=history_days,
     )
 
 
+def _select_hedge_tenor(surface):
+    """选择有效的 30-45DTE 对冲 tenor；绝不跨期限 fallback。"""
+    candidates = [
+        tenor for tenor in surface.tenors
+        if HEDGE_DTE_MIN <= tenor.dte <= HEDGE_DTE_MAX
+        and tenor.rr_25 is not None
+        and getattr(tenor, 'quality', 'good') != 'bad'
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda tenor: abs(tenor.dte - 45))
+
+
 def _get_current_rr25(surface) -> float | None:
-    """从 surface 获取对冲 tenor 的 RR25（优先 30-45DTE，匹配实际买入期限）"""
-    for target in [30, 45, 14, 7, 0]:
-        tenor = surface.get_tenor(target)
-        if tenor and tenor.rr_25 is not None:
-            return tenor.rr_25
-    return None
+    """向后兼容的 helper，仅返回合格中长期 tenor。"""
+    tenor = _select_hedge_tenor(surface)
+    return tenor.rr_25 if tenor is not None else None
 
 
 def _compute_cheapness(
     rr_25_current: float | None,
     history_df: pd.DataFrame | None,
+    target_dte: int | None = None,
 ) -> float:
     """
     计算 skew cheapness score (0-100)
@@ -153,33 +194,48 @@ def _compute_cheapness(
 
     没有历史数据时返回 50（中性）
     """
-    if rr_25_current is None:
-        return 50.0
+    cheapness, _ = _compute_cheapness_details(
+        rr_25_current, history_df,
+        target_dte=45 if target_dte is None else target_dte,
+    )
+    return cheapness
 
-    if history_df is None or history_df.empty:
-        return 50.0
 
-    # 从历史数据中取 RR25（优先 30-45DTE tenor，匹配实际对冲期限）
-    hist_rr = history_df[
-        (history_df['dte'] >= 20) & (history_df['dte'] <= 55)
-    ]['rr_25'].dropna()
-
-    if len(hist_rr) < 5:
-        # fallback: 所有中长期 tenor
-        hist_rr = history_df[
-            history_df['dte'] >= 5
-        ]['rr_25'].dropna()
-
-    if len(hist_rr) < 5:
-        # 最终 fallback: 所有 tenor
-        hist_rr = history_df['rr_25'].dropna()
-
-    if len(hist_rr) < 5:
-        return 50.0
-
-    # RR25 越大 = put 越贵 = cheapness 越高
-    percentile = float((hist_rr < rr_25_current).mean() * 100)
-    return percentile
+def _compute_cheapness_details(
+    rr_25_current: float | None,
+    history_df: pd.DataFrame | None,
+    *,
+    target_dte: int | None,
+    current_ts=None,
+) -> tuple[float, int]:
+    """仅用同期限历史计算分位数，并返回独立历史日数。"""
+    if rr_25_current is None or target_dte is None:
+        return 50.0, 0
+    if history_df is None or history_df.empty or 'dte' not in history_df:
+        return 50.0, 0
+    hist = history_df[
+        history_df['dte'].between(
+            target_dte - HISTORY_DTE_TOLERANCE,
+            target_dte + HISTORY_DTE_TOLERANCE,
+        )
+    ].copy()
+    hist = hist.dropna(subset=['rr_25'])
+    if 'quality' in hist:
+        hist = hist[hist['quality'] != 'bad']
+    if 'ts' in hist:
+        hist['_date'] = pd.to_datetime(hist['ts'], utc=True).dt.date
+        if current_ts is not None:
+            current_date = pd.Timestamp(current_ts).date()
+            hist = hist[hist['_date'] != current_date]
+        daily = hist.sort_values('ts').drop_duplicates('_date', keep='last')
+        history_days = int(daily['_date'].nunique())
+        hist_rr = daily['rr_25']
+    else:
+        hist_rr = hist['rr_25']
+        history_days = int(len(hist_rr))
+    if history_days < MIN_HISTORY_DAYS:
+        return 50.0, history_days
+    return float((hist_rr < rr_25_current).mean() * 100), history_days
 
 
 def _classify_term_structure(
@@ -194,7 +250,7 @@ def _classify_term_structure(
     - flat: 差异不大
     """
     if term_spread_rr25 is None and term_spread_iv is None:
-        return 'flat'
+        return 'unavailable'
 
     # 优先看 RR25 的 term structure
     spread = term_spread_rr25 if term_spread_rr25 is not None else term_spread_iv
@@ -289,15 +345,21 @@ def _compute_urgency(
     return min(1.0, u)
 
 
-def _recommend_tenor(surface) -> str:
+def _recommend_tenor(surface, selected_tenor=None) -> str:
     """
     推荐对冲 tenor
 
     默认 30-45DTE（theta 效率最优的甜蜜区间）。
     比较两个候选 tenor 的每日 IV 成本，推荐更划算的。
     """
-    t30 = surface.get_tenor(30)
-    t45 = surface.get_tenor(45)
+    if selected_tenor is not None:
+        return f'{selected_tenor.dte}D (exp {selected_tenor.expiry})'
+
+    valid = [t for t in surface.tenors
+             if HEDGE_DTE_MIN <= t.dte <= HEDGE_DTE_MAX
+             and t.atm_iv is not None and t.rr_25 is not None]
+    t30 = min(valid, key=lambda t: abs(t.dte - 30)) if valid else None
+    t45 = min(valid, key=lambda t: abs(t.dte - 45)) if valid else None
 
     # 有 30/45DTE 数据时，比较每日 IV 成本
     if t30 is not None and t45 is not None:
@@ -314,11 +376,7 @@ def _recommend_tenor(surface) -> str:
     if t30 is not None:
         return f'30D (exp {t30.expiry})'
 
-    # fallback: 没有 30/45DTE 数据，用最长可用 tenor
-    t14 = surface.get_tenor(14)
-    if t14 is not None:
-        return f'14D (exp {t14.expiry})'
-    return '30-45D'
+    return 'unavailable'
 
 
 def _build_reasoning(
@@ -329,9 +387,20 @@ def _build_reasoning(
     rr_25: float | None,
     surface,
     macro=None,
+    data_quality: str = 'good',
+    history_days: int = 0,
 ) -> str:
     """生成人类可读的理由"""
     parts = []
+
+    if data_quality != 'good':
+        quality_map = {
+            'insufficient_current_tenor': '20-55DTE RR25 缺失',
+            'insufficient_same_tenor_history': (
+                f'同期限历史仅 {history_days} 天，需要 {MIN_HISTORY_DAYS} 天'
+            ),
+        }
+        parts.append(f"数据质量不足: {quality_map.get(data_quality, data_quality)}")
 
     # Skew 状态
     rr_txt = f"{rr_25*100:.1f}%" if rr_25 is not None else "N/A"
@@ -355,6 +424,7 @@ def _build_reasoning(
         'backwardation': 'Term structure backwardation — 近端紧张',
         'contango': 'Term structure contango — 结构正常',
         'flat': 'Term structure 平坦',
+        'unavailable': 'Term structure 数据不足',
     }
     parts.append(ts_map.get(term_struct, f'Term: {term_struct}'))
 
@@ -402,6 +472,7 @@ def format_recommendation(signal: HedgeSignal) -> str:
         f"  Urgency:    [{urgency_bar}] {signal.urgency:.0%}",
         f"  Structure:  {signal.recommended_structure}",
         f"  Tenor:      {signal.recommended_tenor}",
+        f"  Data:       {signal.data_quality} ({signal.history_days} history days)",
         '',
         f"  Skew:       {signal.skew_cheapness:.0f}th percentile "
         f"({'cheap' if signal.skew_cheapness < 30 else 'expensive' if signal.skew_cheapness > 70 else 'normal'})",

@@ -10,7 +10,7 @@ Multi-tenor Skew Surface 采集模块
   - 输出结构可直接序列化为 parquet
 """
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -25,14 +25,19 @@ log = logging.getLogger(__name__)
 # 0/7/14 = 日内 + 近期监控, 30/45 = 对冲甜蜜区间
 TARGET_DTES = [0, 7, 14, 30, 45]
 
-# strike 范围：spot ±5%
-STRIKE_RANGE_PCT = 0.05
-
-# 数据等待时间（秒）
-DATA_WAIT_SEC = 8
+# 按 DTE 扩展 strike 范围，使 30-45DTE 的 10/25 delta 合约也能被覆盖。
+STRIKE_RANGE_BY_DTE = (
+    (1, 0.06),
+    (8, 0.10),
+    (16, 0.13),
+    (60, 0.20),
+)
+MAX_STRIKES_PER_TENOR = 49
+SNAPSHOT_STRIKES_PER_BATCH = 24
 
 # delta 匹配容差
-DELTA_TOLERANCE = 0.15
+DELTA_TOLERANCE = 0.08
+MIN_GOOD_CONTRACTS = 8
 
 
 @dataclass
@@ -45,6 +50,25 @@ class SkewTenorSnapshot:
     rr_10: float | None      # 10Δ risk reversal（深 OTM）
     skew_slope: float | None  # OTM skew slope（归一化）
     n_contracts: int          # 有效合约数
+    atm_strike: float | None = None
+    put_25_strike: float | None = None
+    put_25_delta: float | None = None
+    put_25_bid: float | None = None
+    put_25_ask: float | None = None
+    call_25_strike: float | None = None
+    call_25_delta: float | None = None
+    call_25_bid: float | None = None
+    call_25_ask: float | None = None
+    put_10_strike: float | None = None
+    put_10_delta: float | None = None
+    put_10_bid: float | None = None
+    put_10_ask: float | None = None
+    call_10_strike: float | None = None
+    call_10_delta: float | None = None
+    call_10_bid: float | None = None
+    call_10_ask: float | None = None
+    quality: str = 'unknown'
+    quality_reasons: str = ''
 
 
 @dataclass
@@ -62,20 +86,15 @@ class SkewSurface:
         """转为 flat records，便于 parquet 存储"""
         rows = []
         for t in self.tenors:
-            rows.append({
+            row = asdict(t)
+            row.update({
                 'ts': self.ts,
                 'symbol': self.symbol,
                 'spot': self.spot,
-                'expiry': t.expiry,
-                'dte': t.dte,
-                'atm_iv': t.atm_iv,
-                'rr_25': t.rr_25,
-                'rr_10': t.rr_10,
-                'skew_slope': t.skew_slope,
-                'n_contracts': t.n_contracts,
                 'term_spread_rr25': self.term_spread_rr25,
                 'term_spread_iv': self.term_spread_iv,
             })
+            rows.append(row)
         return rows
 
     def get_tenor(self, target_dte: int) -> SkewTenorSnapshot | None:
@@ -122,6 +141,8 @@ def collect_skew_surface(
     symbol: str,
     trading_class: str | None = None,
     sec_type: str = 'STK',
+    spot_override: float | None = None,
+    chain_override=None,
 ) -> SkewSurface | None:
     """
     采集多 tenor skew surface
@@ -140,31 +161,36 @@ def collect_skew_surface(
     trading_class = trading_class or symbol
     now = et_now()
 
-    # 1. 获取 underlying 价格
+    # 1. 获取 underlying 价格。Worker 传入 override 时不碰它的实时订阅。
     if sec_type == 'IND':
         underlying = Index(symbol, 'CBOE', 'USD')
     else:
         underlying = Stock(symbol, 'SMART', 'USD')
 
-    ib.qualifyContracts(underlying)
-    ib.reqMktData(underlying, genericTickList='', snapshot=False)
-    ib.sleep(2)
-
-    u_ticker = ib.ticker(underlying)
-    spot = u_ticker.marketPrice() if u_ticker else None
+    spot = spot_override
+    chain = chain_override
+    if spot is None or chain is None:
+        ib.qualifyContracts(underlying)
+    if spot is None:
+        tickers = ib.reqTickers(underlying)
+        u_ticker = tickers[0] if tickers else None
+        spot = u_ticker.marketPrice() if u_ticker else None
     if not spot or np.isnan(spot) or spot <= 0:
         log.error(f"[{symbol}] 无法获取 spot 价格")
-        ib.cancelMktData(underlying)
         return None
 
     # 2. 获取期权链
-    chains = ib.reqSecDefOptParams(
-        underlying.symbol, '', underlying.secType, underlying.conId
-    )
-    chain = next((c for c in chains if c.exchange == 'SMART'), None)
     if chain is None:
-        log.error(f"[{symbol}] 无 SMART 期权链")
-        ib.cancelMktData(underlying)
+        chains = ib.reqSecDefOptParams(
+            underlying.symbol, '', underlying.secType, underlying.conId
+        )
+        chain = (
+            next((c for c in chains if c.exchange == 'SMART'
+                  and c.tradingClass == trading_class), None)
+            or next((c for c in chains if c.tradingClass == trading_class), None)
+        )
+    if chain is None:
+        log.error(f"[{symbol}] 无匹配 tradingClass={trading_class} 的期权链")
         return None
 
     # 3. 选择 tenor expiries
@@ -172,67 +198,49 @@ def collect_skew_surface(
     expiries = pick_tenor_expiries(chain, today_str)
     if not expiries:
         log.error(f"[{symbol}] 无可用 expiry")
-        ib.cancelMktData(underlying)
         return None
 
     log.info(f"[{symbol}] Spot={spot:.2f}, expiries={expiries}")
 
-    # 4. 选择 strikes
-    all_strikes = sorted(s for s in chain.strikes if s == int(s))
-    lo = spot * (1 - STRIKE_RANGE_PCT)
-    hi = spot * (1 + STRIKE_RANGE_PCT)
-    strikes = [s for s in all_strikes if lo <= s <= hi]
-
-    if len(strikes) < 5:
-        log.error(f"[{symbol}] strikes 不足: {len(strikes)}")
-        ib.cancelMktData(underlying)
-        return None
-
-    # 5. 批量创建合约并订阅
-    all_contracts = []
-    expiry_contracts: dict[str, list] = {}  # expiry -> contracts
-
-    for expiry, dte in expiries:
-        contracts = [
-            Option(symbol, expiry, s, r, 'SMART', tradingClass=trading_class)
-            for s in strikes for r in ['C', 'P']
-        ]
-        qualified = ib.qualifyContracts(*contracts)
-        expiry_contracts[expiry] = qualified
-        all_contracts.extend(qualified)
-
-    log.info(f"[{symbol}] 订阅 {len(all_contracts)} 个合约 ({len(expiries)} tenor × {len(strikes)} strikes × 2)")
-
-    # 订阅行情
-    for c in all_contracts:
-        ib.reqMktData(c, genericTickList='100,101,104,106', snapshot=False)
-
-    # 等待数据填充
-    ib.sleep(DATA_WAIT_SEC)
-
-    # 6. 读取数据并计算每个 tenor 的 skew
+    # 4. 按 tenor 顺序请求快照，避免五个期限同时占满 IB 行情额度。
+    all_strikes = sorted({float(s) for s in chain.strikes if float(s) > 0})
     tenors = []
     for expiry, dte in expiries:
-        contracts = expiry_contracts.get(expiry, [])
-        tickers = [ib.ticker(c) for c in contracts]
+        strikes = _select_strikes(all_strikes, spot, dte)
+        if len(strikes) < 5:
+            log.error(f"[{symbol}] {expiry} strikes 不足: {len(strikes)}")
+            tenors.append(_compute_tenor_skew([], spot, expiry, dte))
+            continue
+        tickers = []
+        for start in range(0, len(strikes), SNAPSHOT_STRIKES_PER_BATCH):
+            batch = strikes[start:start + SNAPSHOT_STRIKES_PER_BATCH]
+            contracts = [
+                Option(symbol, expiry, s, r, 'SMART', tradingClass=trading_class)
+                for s in batch for r in ('C', 'P')
+            ]
+            qualified = ib.qualifyContracts(*contracts)
+            if not qualified:
+                continue
+            try:
+                tickers.extend(ib.reqTickers(*qualified))
+            except Exception as exc:
+                log.warning(f"[{symbol}] {expiry} snapshot batch failed: {exc}")
         tenor_snap = _compute_tenor_skew(tickers, spot, expiry, dte)
         tenors.append(tenor_snap)
-
-    # 7. 取消订阅
-    for c in all_contracts:
-        try:
-            ib.cancelMktData(c)
-        except Exception:
-            pass
-    ib.cancelMktData(underlying)
+        log.info(
+            f"[{symbol}] {expiry} ({dte}D) skew quality={tenor_snap.quality} "
+            f"contracts={tenor_snap.n_contracts} rr25={tenor_snap.rr_25}"
+        )
 
     # 8. 计算 term structure spread
     term_spread_rr25 = None
     term_spread_iv = None
 
-    if len(tenors) >= 2:
-        near = tenors[0]  # 最短 tenor
-        far = tenors[-1]  # 最长 tenor
+    near_candidates = [t for t in tenors if t.dte <= 8 and t.quality != 'bad']
+    far_candidates = [t for t in tenors if 20 <= t.dte <= 55 and t.quality != 'bad']
+    if near_candidates and far_candidates:
+        near = min(near_candidates, key=lambda t: t.dte)
+        far = min(far_candidates, key=lambda t: abs(t.dte - 45))
         if near.rr_25 is not None and far.rr_25 is not None:
             term_spread_rr25 = near.rr_25 - far.rr_25
         if near.atm_iv is not None and far.atm_iv is not None:
@@ -257,6 +265,25 @@ def collect_skew_surface(
     return surface
 
 
+def _strike_range_pct(dte: int) -> float:
+    for max_dte, pct in STRIKE_RANGE_BY_DTE:
+        if dte <= max_dte:
+            return pct
+    return STRIKE_RANGE_BY_DTE[-1][1]
+
+
+def _select_strikes(all_strikes: list[float], spot: float, dte: int) -> list[float]:
+    """在动态范围内均匀抽样，同时保留 ATM 和边界。"""
+    pct = _strike_range_pct(dte)
+    selected = [s for s in all_strikes if spot * (1 - pct) <= s <= spot * (1 + pct)]
+    if len(selected) <= MAX_STRIKES_PER_TENOR:
+        return selected
+    indices = np.linspace(0, len(selected) - 1, MAX_STRIKES_PER_TENOR)
+    chosen = {selected[int(round(i))] for i in indices}
+    chosen.add(min(selected, key=lambda s: abs(s - spot)))
+    return sorted(chosen)
+
+
 def _compute_tenor_skew(
     tickers, spot: float, expiry: str, dte: int
 ) -> SkewTenorSnapshot:
@@ -276,13 +303,16 @@ def _compute_tenor_skew(
             'right': c.right,
             'iv': g.impliedVol,
             'delta': g.delta,
+            'bid': _finite_quote(getattr(t, 'bid', None)),
+            'ask': _finite_quote(getattr(t, 'ask', None)),
         })
 
     if len(rows) < 4:
         return SkewTenorSnapshot(
             expiry=expiry, dte=dte,
             atm_iv=None, rr_25=None, rr_10=None,
-            skew_slope=None, n_contracts=len(rows),
+            skew_slope=None, n_contracts=len(rows), quality='bad',
+            quality_reasons='insufficient_contracts',
         )
 
     df = pd.DataFrame(rows)
@@ -299,6 +329,25 @@ def _compute_tenor_skew(
     # Skew slope
     skew_slope = _calc_skew_slope(puts, calls, spot, atm_iv)
 
+    atm_candidates = df.iloc[(df['strike'] - spot).abs().argsort()[:2]]
+    atm_strike = (float(atm_candidates.iloc[0]['strike'])
+                  if not atm_candidates.empty else None)
+    put25 = _row_at_delta(puts, 0.25)
+    call25 = _row_at_delta(calls, 0.25)
+    put10 = _row_at_delta(puts, 0.10)
+    call10 = _row_at_delta(calls, 0.10)
+
+    reasons = []
+    if len(rows) < MIN_GOOD_CONTRACTS:
+        reasons.append('low_contract_count')
+    if atm_iv is None:
+        reasons.append('missing_atm_iv')
+    if rr_25 is None:
+        reasons.append('missing_rr25')
+    if rr_10 is None:
+        reasons.append('missing_rr10')
+    quality = 'good' if not reasons else ('partial' if atm_iv is not None else 'bad')
+
     return SkewTenorSnapshot(
         expiry=expiry,
         dte=dte,
@@ -307,7 +356,56 @@ def _compute_tenor_skew(
         rr_10=rr_10,
         skew_slope=skew_slope,
         n_contracts=len(rows),
+        atm_strike=atm_strike,
+        put_25_strike=_row_value(put25, 'strike'),
+        put_25_delta=_row_value(put25, 'delta'),
+        put_25_bid=_row_value(put25, 'bid'),
+        put_25_ask=_row_value(put25, 'ask'),
+        call_25_strike=_row_value(call25, 'strike'),
+        call_25_delta=_row_value(call25, 'delta'),
+        call_25_bid=_row_value(call25, 'bid'),
+        call_25_ask=_row_value(call25, 'ask'),
+        put_10_strike=_row_value(put10, 'strike'),
+        put_10_delta=_row_value(put10, 'delta'),
+        put_10_bid=_row_value(put10, 'bid'),
+        put_10_ask=_row_value(put10, 'ask'),
+        call_10_strike=_row_value(call10, 'strike'),
+        call_10_delta=_row_value(call10, 'delta'),
+        call_10_bid=_row_value(call10, 'bid'),
+        call_10_ask=_row_value(call10, 'ask'),
+        quality=quality,
+        quality_reasons=';'.join(reasons),
     )
+
+
+def _finite_quote(value) -> float | None:
+    value = _finite_number(value)
+    return value if value is not None and value >= 0 else None
+
+
+def _finite_number(value) -> float | None:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _row_at_delta(side_df: pd.DataFrame, target_delta: float):
+    valid = side_df.dropna(subset=['delta', 'iv'])
+    if valid.empty:
+        return None
+    diffs = (valid['delta'].abs() - target_delta).abs()
+    idx = diffs.idxmin()
+    if diffs.loc[idx] > DELTA_TOLERANCE:
+        return None
+    return valid.loc[idx]
+
+
+def _row_value(row, column: str) -> float | None:
+    if row is None:
+        return None
+    return _finite_number(row.get(column))
 
 
 def _calc_atm_iv(puts: pd.DataFrame, calls: pd.DataFrame, spot: float) -> float | None:
@@ -332,14 +430,8 @@ def _calc_risk_reversal(
 
 
 def _iv_at_delta(side_df: pd.DataFrame, target_delta: float) -> float | None:
-    valid = side_df.dropna(subset=['delta', 'iv'])
-    if valid.empty:
-        return None
-    diffs = (valid['delta'].abs() - target_delta).abs()
-    idx = diffs.idxmin()
-    if diffs.loc[idx] > DELTA_TOLERANCE:
-        return None
-    return float(valid.loc[idx, 'iv'])
+    row = _row_at_delta(side_df, target_delta)
+    return float(row['iv']) if row is not None else None
 
 
 def _calc_skew_slope(

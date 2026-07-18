@@ -113,7 +113,7 @@ def _collect_and_signal(
         skew_store.save_surface(surface.to_records())
 
         # 加载历史
-        history_df = skew_store.load_surface_history(symbol, n_days=20)
+        history_df = skew_store.load_surface_history(symbol, n_days=90)
 
         # GEX regime
         gex_regime = _get_gex_regime(gex_store, symbol)

@@ -216,7 +216,7 @@ class IntradayVRPMonitor:
                          slot: str, spot: float, expiry: str, is_true_0dte: bool,
                          gex: dict) -> dict:
         base = {
-            "schema_version": 1,
+            "schema_version": 2,
             "symbol": self.symbol,
             "trading_date": trading_date_str(now),
             "scheduled_time": slot,
@@ -234,6 +234,15 @@ class IntradayVRPMonitor:
             "max_pain": gex.get("max_pain"),
             "atm_iv_pct": gex.get("atm_iv_pct"),
             "regime_code": gex.get("regime_code"),
+            # 复用 GEX 引擎已计算的 0DTE skew，不增加 IB API 请求。
+            "rr_25": gex.get("rr_25"),
+            "skew_slope": gex.get("skew_slope"),
+            "rr_25_zscore": gex.get("rr_25_zscore"),
+            "skew_signal": gex.get("skew_signal"),
+            "drr_25": gex.get("drr_25"),
+            "drr_25_zscore": gex.get("drr_25_zscore"),
+            "skew_alert_level": gex.get("skew_alert_level"),
+            "skew_alert_score": gex.get("skew_alert_score"),
             "regime_tags_json": json.dumps(gex.get("regime_tags"), ensure_ascii=False,
                                             sort_keys=True, default=str),
             "gex_partial": bool(gex.get("partial", False)),

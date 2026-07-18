@@ -654,6 +654,7 @@ class IBWorker:
 
         # 计算 skew 指标
         rr_25 = skew_slope = rr_25_zscore = skew_signal = None
+        drr_25 = drr_25_zscore = skew_alert_level = skew_alert_score = None
         try:
             skew_snap = compute_skew(tickers, spot)
             skew_snap = self.skew_tracker.update(skew_snap, result.positive_gamma)
@@ -662,6 +663,10 @@ class IBWorker:
                 skew_slope = skew_snap.skew_slope
                 rr_25_zscore = skew_snap.rr_25_zscore
                 skew_signal = skew_snap.signal
+                drr_25 = skew_snap.drr_25
+                drr_25_zscore = skew_snap.drr_25_zscore
+                skew_alert_level = skew_snap.alert_level
+                skew_alert_score = skew_snap.alert_score
         except Exception as e:
             log.debug(f"Skew 计算失败: {e}")
 
@@ -692,6 +697,17 @@ class IBWorker:
 
         if self._vrp_monitor is not None:
             try:
+                vrp_state = dict(self.state.get_snapshot())
+                vrp_state.update({
+                    'rr_25': rr_25,
+                    'skew_slope': skew_slope,
+                    'rr_25_zscore': rr_25_zscore,
+                    'skew_signal': skew_signal,
+                    'drr_25': drr_25,
+                    'drr_25_zscore': drr_25_zscore,
+                    'skew_alert_level': skew_alert_level,
+                    'skew_alert_score': skew_alert_score,
+                })
                 self._vrp_monitor.on_gex_update(
                     self.ib,
                     self.current_contracts,
@@ -699,7 +715,7 @@ class IBWorker:
                     spot=spot,
                     expiry=expiry,
                     is_true_0dte=is_true_0dte,
-                    gex_state=self.state.get_snapshot(),
+                    gex_state=vrp_state,
                 )
             except Exception as e:
                 self._log('warning', f'VRP observation failed: {e}')
@@ -942,7 +958,9 @@ class IBWorker:
         surface = None
         try:
             surface = collect_skew_surface(
-                self.ib, self.symbol, self.trading_class, self.sec_type
+                self.ib, self.symbol, self.trading_class, self.sec_type,
+                spot_override=self.state.get_snapshot().get('spot'),
+                chain_override=self.chain,
             )
             if surface is not None:
                 self._skew_surface_storage.save_surface(surface.to_records())
@@ -960,7 +978,7 @@ class IBWorker:
         # Step 2: 生成 hedge signal
         try:
             history_df = self._skew_surface_storage.load_surface_history(
-                self.symbol, n_days=20
+                self.symbol, n_days=90
             )
 
             # GEX regime from current state

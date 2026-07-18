@@ -10,7 +10,7 @@ from gex_monitor.skew_surface import (
 )
 from gex_monitor.hedge_signal import (
     generate_hedge_signal, _compute_cheapness, _classify_term_structure,
-    _decide_action, HedgeSignal,
+    _decide_action, _get_current_rr25, HedgeSignal,
 )
 
 
@@ -104,6 +104,8 @@ class TestSkewSurface:
         assert records[0]['dte'] == 0
         assert records[1]['dte'] == 7
         assert records[0]['term_spread_rr25'] == 0.02
+        assert 'put_25_strike' in records[0]
+        assert 'quality' in records[0]
 
     def test_get_tenor(self):
         surface = SkewSurface(
@@ -212,7 +214,7 @@ class TestClassifyTermStructure:
         assert _classify_term_structure(0.005, 0.003) == 'flat'
 
     def test_none(self):
-        assert _classify_term_structure(None, None) == 'flat'
+        assert _classify_term_structure(None, None) == 'unavailable'
 
 
 class TestDecideAction:
@@ -274,3 +276,25 @@ class TestGenerateHedgeSignal:
         assert 'action' in d
         assert 'urgency' in d
         assert 'reasoning' in d
+        assert 'data_quality' in d
+
+    def test_short_tenor_never_substitutes_for_hedge_tenor(self):
+        surface = _make_surface()
+        for tenor in surface.tenors:
+            if tenor.dte >= 20:
+                tenor.rr_25 = None
+                tenor.atm_iv = None
+                tenor.quality = 'bad'
+        assert _get_current_rr25(surface) is None
+        signal = generate_hedge_signal(surface, _make_history(), 'negative')
+        assert signal.action == 'MONITOR'
+        assert signal.recommended_structure == 'none'
+        assert signal.data_quality == 'insufficient_current_tenor'
+
+    def test_same_tenor_history_gate_blocks_execution(self):
+        surface = _make_surface()
+        history = _make_history(n_days=10)
+        signal = generate_hedge_signal(surface, history, 'negative')
+        assert signal.action == 'MONITOR'
+        assert signal.data_quality == 'insufficient_same_tenor_history'
+        assert signal.history_days == 10

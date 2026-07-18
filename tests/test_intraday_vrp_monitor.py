@@ -69,12 +69,18 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
         FakeIB(tickers), contracts, now=now, spot=724.6, expiry="20260716",
         is_true_0dte=True,
         gex_state={"total_gex": 1e9, "gamma_flip": 720,
-                   "positive_gamma": True, "regime_tags": {}},
+                   "positive_gamma": True, "regime_tags": {},
+                   "rr_25": 0.04, "skew_slope": 0.2,
+                   "rr_25_zscore": 1.1, "drr_25": 0.005,
+                   "drr_25_zscore": 0.7},
     )
     row = storage.load_vrp_quotes("QQQ", "20260716").iloc[0]
     assert row["status"] == "ok"
     assert row["strike"] == 725
     assert row["sell_credit_bid"] == 3.5
+    assert row["schema_version"] == 2
+    assert row["rr_25"] == 0.04
+    assert row["drr_25"] == 0.005
     wings = pd.read_parquet(tmp_path / "vrp_wing_quotes_QQQ_20260716.parquet")
     assert len(wings) == 6
     assert set(wings["status"]) == {"ok"}

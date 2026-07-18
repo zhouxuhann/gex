@@ -668,12 +668,19 @@ SKEW_SURFACE_COLUMNS = [
     'ts', 'symbol', 'spot', 'expiry', 'dte',
     'atm_iv', 'rr_25', 'rr_10', 'skew_slope', 'n_contracts',
     'term_spread_rr25', 'term_spread_iv',
+    'atm_strike',
+    'put_25_strike', 'put_25_delta', 'put_25_bid', 'put_25_ask',
+    'call_25_strike', 'call_25_delta', 'call_25_bid', 'call_25_ask',
+    'put_10_strike', 'put_10_delta', 'put_10_bid', 'put_10_ask',
+    'call_10_strike', 'call_10_delta', 'call_10_bid', 'call_10_ask',
+    'quality', 'quality_reasons',
 ]
 
 HEDGE_SIGNAL_COLUMNS = [
     'ts', 'symbol', 'action', 'urgency',
     'skew_cheapness', 'gex_regime', 'term_structure',
     'recommended_structure', 'recommended_tenor', 'reasoning',
+    'data_quality', 'hedge_tenor_dte', 'rr_25_current', 'history_days',
 ]
 
 

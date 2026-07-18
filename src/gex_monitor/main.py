@@ -88,8 +88,10 @@ def main():
                         help='覆盖服务器 host')
     parser.add_argument('--port', type=int, default=None,
                         help='覆盖服务器 port')
+    parser.add_argument('--hedge', action='store_true',
+                        help='显式开启自动对冲（默认只采集与生成信号）')
     parser.add_argument('--no-hedge', action='store_true',
-                        help='禁用自动对冲（默认开启）')
+                        help=argparse.SUPPRESS)  # 保留旧启动脚本兼容
     parser.add_argument('--hedge-dry-run', action='store_true',
                         help='对冲信号预览模式（不实际下单）')
     parser.add_argument('--hedge-qty', type=int, default=1,
@@ -147,9 +149,12 @@ def main():
 
     log.info(f"启用标的: {[s.name for s in enabled_symbols]}")
 
-    if not args.no_hedge:
+    hedge_enabled = bool(args.hedge and not args.no_hedge)
+    if hedge_enabled:
         mode = "DRY RUN" if args.hedge_dry_run else f"LIVE (qty={args.hedge_qty})"
         log.info(f"对冲自动执行已启用 [{mode}] — 15:30 ET 自动采集+下单")
+    else:
+        log.info("对冲自动执行已禁用 — 15:30 ET 仅采集 skew 并生成信号")
 
     # 创建 workers
     workers: list[IBWorker] = []
@@ -178,7 +183,7 @@ def main():
             quality_min_contracts=config.monitoring.quality_min_contracts,
             quality_max_missing_ratio=config.monitoring.quality_max_missing_ratio,
             db_storage=db_storage,
-            hedge_enabled=not args.no_hedge,
+            hedge_enabled=hedge_enabled,
             hedge_dry_run=args.hedge_dry_run,
             hedge_qty=args.hedge_qty,
             ib_error_watcher=ib_error_watcher,
