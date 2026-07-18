@@ -10,6 +10,7 @@ Multi-tenor Skew Surface 采集模块
   - 输出结构可直接序列化为 parquet
 """
 import logging
+from types import SimpleNamespace
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 
@@ -38,6 +39,8 @@ SNAPSHOT_STRIKES_PER_BATCH = 24
 # delta 匹配容差
 DELTA_TOLERANCE = 0.08
 MIN_GOOD_CONTRACTS = 8
+SNAPSHOT_BATCH_PAUSE_SEC = 0.35
+SNAPSHOT_TENOR_PAUSE_SEC = 1.0
 
 
 @dataclass
@@ -136,6 +139,30 @@ def pick_tenor_expiries(chain, today_str: str) -> list[tuple[str, int]]:
     return result
 
 
+def merge_option_chains(chains, trading_class: str):
+    """Merge exchange fragments for one trading class into a SMART request universe.
+
+    IB sometimes returns a deceptively sparse SMART fragment (observed on SPY),
+    while other exchange rows contain the missing expiries/strikes.  Options are
+    still requested through SMART; only the definition universe is merged.
+    """
+    matches = [chain for chain in chains
+               if getattr(chain, 'tradingClass', None) == trading_class]
+    if not matches:
+        return None
+    preferred = next((chain for chain in matches
+                      if getattr(chain, 'exchange', None) == 'SMART'), matches[0])
+    return SimpleNamespace(
+        exchange='SMART',
+        tradingClass=trading_class,
+        multiplier=getattr(preferred, 'multiplier', '100'),
+        expirations=sorted({expiry for chain in matches
+                            for expiry in getattr(chain, 'expirations', [])}),
+        strikes=sorted({float(strike) for chain in matches
+                        for strike in getattr(chain, 'strikes', [])}),
+    )
+
+
 def collect_skew_surface(
     ib: IB,
     symbol: str,
@@ -184,11 +211,7 @@ def collect_skew_surface(
         chains = ib.reqSecDefOptParams(
             underlying.symbol, '', underlying.secType, underlying.conId
         )
-        chain = (
-            next((c for c in chains if c.exchange == 'SMART'
-                  and c.tradingClass == trading_class), None)
-            or next((c for c in chains if c.tradingClass == trading_class), None)
-        )
+        chain = merge_option_chains(chains, trading_class)
     if chain is None:
         log.error(f"[{symbol}] 无匹配 tradingClass={trading_class} 的期权链")
         return None
@@ -225,12 +248,16 @@ def collect_skew_surface(
                 tickers.extend(ib.reqTickers(*qualified))
             except Exception as exc:
                 log.warning(f"[{symbol}] {expiry} snapshot batch failed: {exc}")
+            if hasattr(ib, 'sleep'):
+                ib.sleep(SNAPSHOT_BATCH_PAUSE_SEC)
         tenor_snap = _compute_tenor_skew(tickers, spot, expiry, dte)
         tenors.append(tenor_snap)
         log.info(
             f"[{symbol}] {expiry} ({dte}D) skew quality={tenor_snap.quality} "
             f"contracts={tenor_snap.n_contracts} rr25={tenor_snap.rr_25}"
         )
+        if hasattr(ib, 'sleep'):
+            ib.sleep(SNAPSHOT_TENOR_PAUSE_SEC)
 
     # 8. 计算 term structure spread
     term_spread_rr25 = None

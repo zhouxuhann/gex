@@ -62,6 +62,8 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
         "straddle_gamma", "straddle_theta", "straddle_vega",
         "rv_15m", "rv_30m", "trend_efficiency_session",
         "dist_to_flip_im", "weekday", "opex_type", "event_flag",
+        "gap_pct", "session_vwap", "vix", "vix_ma20_ratio",
+        "surface_term_spread_iv", "butterfly_25",
     ]
     feature_coverage = {}
     for column in feature_columns:
@@ -111,6 +113,13 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
         "feature_coverage": feature_coverage,
         "mtm_rows": 0 if mtm is None else len(mtm),
         "iron_fly_mtm_rows": 0 if iron_fly_mtm is None else len(iron_fly_mtm),
+        "mtm_status_counts": {} if mtm is None or "status" not in mtm else
+        dict(sorted(Counter(mtm["status"].fillna("missing_status").astype(str)).items())),
+        "iron_fly_mtm_status_counts": {}
+        if iron_fly_mtm is None or "status" not in iron_fly_mtm else
+        dict(sorted(Counter(
+            iron_fly_mtm["status"].fillna("missing_status").astype(str)
+        ).items())),
         "problems": problems,
     }
 

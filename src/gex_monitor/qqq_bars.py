@@ -1,4 +1,4 @@
-"""IB 官方 QQQ 1 分钟 Bar 回补与实时采集。
+"""IB 官方股票 1 分钟 Bar 回补与实时采集（QQQ/SPY）。
 
 盘中通过 ``reqHistoricalData(..., keepUpToDate=True)`` 接收 IB 更新中的 1m
 TRADES Bar；收盘后再次按交易日请求完整历史 Bar，修正盘中最后一根和断线缺口。
@@ -322,11 +322,12 @@ class OfficialQQQBarCollector:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description='QQQ official IB 1-minute bars')
+    parser = argparse.ArgumentParser(description='Official IB stock 1-minute bars')
     parser.add_argument('--config', '-c', default='config/config.yaml')
     parser.add_argument('--host', default=None)
     parser.add_argument('--port', type=int, default=None)
     parser.add_argument('--client-id', type=int, default=210)
+    parser.add_argument('--symbol', default='QQQ')
     parser.add_argument('--data-dir', default=None)
     parser.add_argument('--start', help='回补起始日期 YYYYMMDD')
     parser.add_argument('--end', help='回补结束日期 YYYYMMDD')
@@ -364,12 +365,14 @@ def main(argv: list[str] | None = None) -> int:
                 if ib.isConnected():
                     ib.disconnect()
                 time.sleep(max(1.0, args.connect_retry_sec))
-        contract = Stock('QQQ', 'SMART', 'USD')
+        symbol = args.symbol.upper()
+        contract = Stock(symbol, 'SMART', 'USD')
         qualified = ib.qualifyContracts(contract)
         if not qualified:
-            raise RuntimeError('QQQ 合约验证失败')
+            raise RuntimeError(f'{symbol} 合约验证失败')
         collector = OfficialQQQBarCollector(
-            ib, db, data_dir, contract=qualified[0], request_pause_sec=args.pause
+            ib, db, data_dir, contract=qualified[0], symbol=symbol,
+            request_pause_sec=args.pause
         )
         if args.date:
             collector.backfill(args.date, args.date)

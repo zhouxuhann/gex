@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import csv
+import threading
+import time
 from calendar import monthcalendar, FRIDAY
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +12,11 @@ import numpy as np
 import pandas as pd
 
 from .time_utils import ET
+
+
+_VIX_LOCK = threading.Lock()
+_VIX_LIVE_CACHE: dict = {}
+_VIX_HISTORY_CACHE: dict = {}
 
 
 def _finite(value) -> float | None:
@@ -78,11 +85,88 @@ class VRPEventCalendar:
                 "event_source": event["source"]}
 
 
-def path_features(bars, now: datetime, spot: float) -> dict:
+def vix_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
+    """Fetch a throttled VIX snapshot and daily context from IB only.
+
+    The module-level cache is shared by QQQ/SPY workers, so nine VRP slots do
+    not turn into duplicate VIX subscriptions or repeated daily-history calls.
+    """
+    empty = {"vix": None, "vix_previous_close": None, "vix_change_pct": None,
+             "vix_ma20": None, "vix_ma20_ratio": None,
+             "vix_20d_percentile": None, "vix_asof": None,
+             "vix_source": "unavailable"}
+    if ib is None or not ib.isConnected():
+        return empty
+    now = now.astimezone(ET)
+    date_str = now.strftime("%Y%m%d")
+    with _VIX_LOCK:
+        cached = _VIX_LIVE_CACHE.get("value")
+        if cached and time.monotonic() - cached[0] <= max(30, cache_seconds):
+            return dict(cached[1])
+        try:
+            from ib_insync import Index
+
+            contract = Index("VIX", "CBOE", "USD")
+            qualified = ib.qualifyContracts(contract)
+            if not qualified:
+                return dict(cached[1]) if cached else empty
+            ticker_rows = ib.reqTickers(qualified[0])
+            ticker = ticker_rows[0] if ticker_rows else None
+            value = _finite(ticker.marketPrice()) if ticker is not None else None
+
+            history = _VIX_HISTORY_CACHE.get(date_str)
+            if history is None:
+                bars = ib.reqHistoricalData(
+                    qualified[0], endDateTime="", durationStr="40 D",
+                    barSizeSetting="1 day", whatToShow="TRADES", useRTH=True,
+                    formatDate=2, keepUpToDate=False, chartOptions=[],
+                )
+                history = []
+                for bar in bars or []:
+                    close = _finite(getattr(bar, "close", None))
+                    try:
+                        bar_date = pd.Timestamp(getattr(bar, "date")).date()
+                    except (TypeError, ValueError):
+                        continue
+                    if close is not None and bar_date < now.date():
+                        history.append((bar_date, close))
+                _VIX_HISTORY_CACHE.clear()
+                _VIX_HISTORY_CACHE[date_str] = history
+            closes = [item[1] for item in history]
+            previous = closes[-1] if closes else None
+            history20 = closes[-20:]
+            ma20 = float(np.mean(history20)) if history20 else None
+            percentile = None
+            if value is not None and history20:
+                percentile = float(np.mean(np.asarray(history20) <= value))
+            result = {
+                "vix": value,
+                "vix_previous_close": previous,
+                "vix_change_pct": (value - previous) / previous
+                if value is not None and previous else None,
+                "vix_ma20": ma20,
+                "vix_ma20_ratio": value / ma20 if value is not None and ma20 else None,
+                "vix_20d_percentile": percentile,
+                "vix_asof": now,
+                "vix_source": "ib_snapshot+daily_history",
+            }
+            _VIX_LIVE_CACHE["value"] = (time.monotonic(), result)
+            return dict(result)
+        except Exception:
+            return dict(cached[1]) if cached else empty
+
+
+def path_features(bars, now: datetime, spot: float,
+                  previous_close: float | None = None) -> dict:
     """Compute only features observable at entry from already-collected 1m bars."""
     empty = {
         "session_open": None, "session_return_pct": None,
-        "twap_distance_pct": None, "rv_5m": None, "rv_15m": None,
+        "twap_distance_pct": None, "session_vwap": None,
+        "vwap_distance_pct": None, "vwap_source": "unavailable",
+        "previous_close": previous_close, "gap_pct": None,
+        "gap_direction": "unknown", "gap_filled_before_entry": None,
+        "minutes_to_gap_fill": None,
+        "rv_5m": None, "rv_15m": None,
         "rv_30m": None, "rv_60m": None, "range_15m_pct": None,
         "range_30m_pct": None, "range_60m_pct": None,
         "trend_efficiency_session": None, "trend_efficiency_30m": None,
@@ -132,11 +216,53 @@ def path_features(bars, now: datetime, spot: float) -> dict:
         return distance / path if path > 0 else 0.0
 
     twap = float(close.mean())
+    vwap = None
+    vwap_source = "unavailable"
+    if "volume" in df:
+        volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+        if volume.sum() > 0:
+            average = pd.to_numeric(df.get("average"), errors="coerce") \
+                if "average" in df else pd.Series(index=df.index, dtype=float)
+            if average.notna().any():
+                price = average.fillna(pd.to_numeric(df["close"], errors="coerce"))
+                vwap_source = "ib_bar_average_volume"
+            else:
+                high = pd.to_numeric(df.get("high", df["close"]), errors="coerce")
+                low = pd.to_numeric(df.get("low", df["close"]), errors="coerce")
+                price = (high + low + pd.to_numeric(df["close"], errors="coerce")) / 3
+                vwap_source = "typical_price_volume"
+            vwap = float((price * volume).sum() / volume.sum())
+
+    gap_pct = None
+    gap_direction = "unknown"
+    gap_filled = None
+    minutes_to_fill = None
+    if previous_close is not None and previous_close > 0 and session_open is not None:
+        gap_pct = (session_open - previous_close) / previous_close
+        gap_direction = "up" if gap_pct > 0 else "down" if gap_pct < 0 else "flat"
+        if gap_direction == "flat":
+            gap_filled, minutes_to_fill = True, 0
+        else:
+            highs = pd.to_numeric(df.get("high", df["close"]), errors="coerce")
+            lows = pd.to_numeric(df.get("low", df["close"]), errors="coerce")
+            hit = lows <= previous_close if gap_direction == "up" else highs >= previous_close
+            gap_filled = bool(hit.any())
+            if gap_filled:
+                first_ts = df.loc[hit, "ts"].iloc[0]
+                minutes_to_fill = int((first_ts - df.iloc[0]["ts"]).total_seconds() // 60)
     result = dict(empty)
     result.update({
         "session_open": session_open,
         "session_return_pct": (spot - session_open) / session_open if session_open else None,
         "twap_distance_pct": (spot - twap) / twap if twap else None,
+        "session_vwap": vwap,
+        "vwap_distance_pct": (spot - vwap) / vwap if vwap else None,
+        "vwap_source": vwap_source,
+        "previous_close": previous_close,
+        "gap_pct": gap_pct,
+        "gap_direction": gap_direction,
+        "gap_filled_before_entry": gap_filled,
+        "minutes_to_gap_fill": minutes_to_fill,
         "entry_bar_count": len(df),
         "trend_efficiency_session": efficiency(close),
         "trend_efficiency_30m": efficiency(close.tail(31)),

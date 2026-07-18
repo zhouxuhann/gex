@@ -108,6 +108,7 @@ class IntradayVRPConfig(BaseModel):
     commission_per_straddle: float = 1.30
     mtm_checkpoints_minutes: list[int] = Field(default_factory=lambda: [5, 15, 30, 60])
     mtm_fixed_times_et: list[str] = Field(default_factory=lambda: ["15:30"])
+    vix_cache_seconds: int = 300
 
 
 class EmailAlertConfig(BaseModel):

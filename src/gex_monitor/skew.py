@@ -50,6 +50,11 @@ class SkewSnapshot:
     alert_level: str | None = None
     alert_score: float | None = None
     alert_note: str | None = None
+    rr_10: float | None = None
+    butterfly_25: float | None = None
+    put_25_richness: float | None = None
+    call_25_richness: float | None = None
+    wing_curvature_asymmetry: float | None = None
 
 
 def compute_skew(tickers, spot: float) -> SkewSnapshot | None:
@@ -101,6 +106,16 @@ def compute_skew(tickers, spot: float) -> SkewSnapshot | None:
     # 2) 25-delta Risk Reversal
     rr_25 = _calc_risk_reversal(puts, calls, TARGET_DELTA_25)
 
+    put_25_iv = _iv_at_delta(puts, TARGET_DELTA_25)
+    call_25_iv = _iv_at_delta(calls, TARGET_DELTA_25)
+    rr_10 = _calc_risk_reversal(puts, calls, 0.10)
+    butterfly_25 = (0.5 * (put_25_iv + call_25_iv) - atm_iv
+                    if None not in (put_25_iv, call_25_iv, atm_iv) else None)
+    put_richness = put_25_iv - atm_iv \
+        if put_25_iv is not None and atm_iv is not None else None
+    call_richness = call_25_iv - atm_iv \
+        if call_25_iv is not None and atm_iv is not None else None
+
     # 3) OTM Skew Slope
     skew_slope = _calc_skew_slope(puts, calls, spot, atm_iv)
 
@@ -110,6 +125,13 @@ def compute_skew(tickers, spot: float) -> SkewSnapshot | None:
         skew_slope=skew_slope,
         rr_25_zscore=None,  # SkewTracker 填充
         signal=None,        # SkewTracker 填充
+        rr_10=rr_10,
+        butterfly_25=butterfly_25,
+        put_25_richness=put_richness,
+        call_25_richness=call_richness,
+        wing_curvature_asymmetry=(put_richness - call_richness
+                                  if put_richness is not None
+                                  and call_richness is not None else None),
     )
 
 

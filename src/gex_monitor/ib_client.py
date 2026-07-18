@@ -32,6 +32,7 @@ from .time_utils import (
     should_connect,
     trading_date_str,
 )
+from .vrp_context import vix_context
 
 log = logging.getLogger(__name__)
 
@@ -149,6 +150,7 @@ class IBWorker:
         self._hedge_qty = hedge_qty
         self._ib_error_watcher = ib_error_watcher
         self._vrp_monitor = None
+        self._intraday_vrp_config = intraday_vrp_config
         if (intraday_vrp_config is not None
                 and intraday_vrp_config.enabled
                 and self.symbol in intraday_vrp_config.symbols):
@@ -655,6 +657,8 @@ class IBWorker:
         # 计算 skew 指标
         rr_25 = skew_slope = rr_25_zscore = skew_signal = None
         drr_25 = drr_25_zscore = skew_alert_level = skew_alert_score = None
+        rr_10 = butterfly_25 = put_25_richness = call_25_richness = None
+        wing_curvature_asymmetry = None
         try:
             skew_snap = compute_skew(tickers, spot)
             skew_snap = self.skew_tracker.update(skew_snap, result.positive_gamma)
@@ -667,6 +671,11 @@ class IBWorker:
                 drr_25_zscore = skew_snap.drr_25_zscore
                 skew_alert_level = skew_snap.alert_level
                 skew_alert_score = skew_snap.alert_score
+                rr_10 = skew_snap.rr_10
+                butterfly_25 = skew_snap.butterfly_25
+                put_25_richness = skew_snap.put_25_richness
+                call_25_richness = skew_snap.call_25_richness
+                wing_curvature_asymmetry = skew_snap.wing_curvature_asymmetry
         except Exception as e:
             log.debug(f"Skew 计算失败: {e}")
 
@@ -707,6 +716,11 @@ class IBWorker:
                     'drr_25_zscore': drr_25_zscore,
                     'skew_alert_level': skew_alert_level,
                     'skew_alert_score': skew_alert_score,
+                    'rr_10': rr_10,
+                    'butterfly_25': butterfly_25,
+                    'put_25_richness': put_25_richness,
+                    'call_25_richness': call_25_richness,
+                    'wing_curvature_asymmetry': wing_curvature_asymmetry,
                 })
                 self._vrp_monitor.on_gex_update(
                     self.ib,
@@ -718,6 +732,9 @@ class IBWorker:
                     gex_state=vrp_state,
                     # 只在固定采样点调用，避免每个 3 秒 tick 都复制状态。
                     intraday_bars_provider=lambda: self.state.get_persist_data()[1],
+                    market_context_provider=lambda: vix_context(
+                        self.ib, et_now(), self._intraday_vrp_config.vix_cache_seconds
+                    ),
                 )
             except Exception as e:
                 self._log('warning', f'VRP observation failed: {e}')
@@ -962,7 +979,9 @@ class IBWorker:
             surface = collect_skew_surface(
                 self.ib, self.symbol, self.trading_class, self.sec_type,
                 spot_override=self.state.get_snapshot().get('spot'),
-                chain_override=self.chain,
+                # Multi-tenor surface must rebuild and merge all exchange chain
+                # fragments; the GEX worker chain can be a sparse SMART subset.
+                chain_override=None,
             )
             if surface is not None:
                 self._skew_surface_storage.save_surface(surface.to_records())

@@ -17,6 +17,7 @@ LOG_DIR="$RUNTIME_DIR/logs"
 PID_FILE="$LOG_DIR/.pids"
 MODE="${1:-dry}"
 QQQ_BAR_CLIENT_ID="${GEX_QQQ_BAR_CLIENT_ID:-210}"
+SPY_BAR_CLIENT_ID="${GEX_SPY_BAR_CLIENT_ID:-211}"
 
 mkdir -p "$LOG_DIR" "$SRC_DIR/data"
 
@@ -141,6 +142,7 @@ GEX_LOG="$LOG_DIR/gex_$(date +%Y%m%d).log"
 KDJ_LOG="$LOG_DIR/kdj_trader_$(date +%Y%m%d).log"
 MACRO_LOG="$LOG_DIR/macro_$(date +%Y%m%d).log"
 QQQ_BAR_LOG="$LOG_DIR/qqq_bars_$(date +%Y%m%d).log"
+SPY_BAR_LOG="$LOG_DIR/spy_bars_$(date +%Y%m%d).log"
 
 log "Starting GEX stack from runtime: $RUNTIME_DIR"
 log "GEX log: $GEX_LOG"
@@ -160,7 +162,7 @@ fi
 log "Starting official QQQ 1m bars (clientId=$QQQ_BAR_CLIENT_ID)"
 nohup "$PYTHON_BIN" -m gex_monitor.qqq_bars \
   -c "$CONFIG_FILE" --live --client-id "$QQQ_BAR_CLIENT_ID" \
-  --data-dir "$DATA_DIR" \
+  --symbol QQQ --data-dir "$DATA_DIR" \
   > "$QQQ_BAR_LOG" 2>&1 &
 QQQ_BAR_PID=$!
 log "QQQ Bar PID=$QQQ_BAR_PID"
@@ -169,6 +171,21 @@ if ! kill -0 "$QQQ_BAR_PID" 2>/dev/null; then
   log "ERROR: QQQ Bar collector exited during startup"
   tail -80 "$QQQ_BAR_LOG" 2>/dev/null || true
   kill "$GEX_PID" 2>/dev/null || true
+  exit 1
+fi
+
+log "Starting official SPY 1m bars (clientId=$SPY_BAR_CLIENT_ID)"
+nohup "$PYTHON_BIN" -m gex_monitor.qqq_bars \
+  -c "$CONFIG_FILE" --live --client-id "$SPY_BAR_CLIENT_ID" \
+  --symbol SPY --data-dir "$DATA_DIR" \
+  > "$SPY_BAR_LOG" 2>&1 &
+SPY_BAR_PID=$!
+log "SPY Bar PID=$SPY_BAR_PID"
+sleep 2
+if ! kill -0 "$SPY_BAR_PID" 2>/dev/null; then
+  log "ERROR: SPY Bar collector exited during startup"
+  tail -80 "$SPY_BAR_LOG" 2>/dev/null || true
+  kill "$GEX_PID" "$QQQ_BAR_PID" 2>/dev/null || true
   exit 1
 fi
 
@@ -184,6 +201,7 @@ if [ "$ENABLE_KDJ" = "1" ]; then
     tail -80 "$KDJ_LOG" 2>/dev/null || true
     kill "$GEX_PID" 2>/dev/null || true
     kill "$QQQ_BAR_PID" 2>/dev/null || true
+    kill "$SPY_BAR_PID" 2>/dev/null || true
     exit 1
   fi
 else
@@ -197,7 +215,7 @@ sleep 1
 if ! kill -0 "$MACRO_PID" 2>/dev/null; then
   log "ERROR: Macro Dashboard exited during startup"
   tail -80 "$MACRO_LOG" 2>/dev/null || true
-  kill "$GEX_PID" "$QQQ_BAR_PID" 2>/dev/null || true
+  kill "$GEX_PID" "$QQQ_BAR_PID" "$SPY_BAR_PID" 2>/dev/null || true
   if [ -n "$KDJ_PID" ]; then
     kill "$KDJ_PID" 2>/dev/null || true
   fi
@@ -205,7 +223,7 @@ if ! kill -0 "$MACRO_PID" 2>/dev/null; then
 fi
 
 {
-  printf '%s\n%s\n' "$GEX_PID" "$QQQ_BAR_PID"
+  printf '%s\n%s\n%s\n' "$GEX_PID" "$QQQ_BAR_PID" "$SPY_BAR_PID"
   if [ -n "$KDJ_PID" ]; then
     printf '%s\n' "$KDJ_PID"
   fi

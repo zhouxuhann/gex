@@ -70,6 +70,9 @@ intraday_vrp:
   max_quote_age_seconds: 10
   max_combined_spread_ratio: 0.10
   commission_per_straddle: 1.30
+  mtm_checkpoints_minutes: [5, 15, 30, 60]
+  mtm_fixed_times_et: ["15:30"]
+  vix_cache_seconds: 300
 
 alerts:
   ib_errors:

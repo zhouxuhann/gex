@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 from gex_monitor.skew_surface import (
     pick_tenor_expiries, _compute_tenor_skew, SkewSurface, SkewTenorSnapshot,
+    merge_option_chains,
 )
 from gex_monitor.hedge_signal import (
     generate_hedge_signal, _compute_cheapness, _classify_term_structure,
@@ -19,6 +20,16 @@ from gex_monitor.hedge_signal import (
 # ============================================================
 
 class TestPickTenorExpiries:
+    def test_merges_sparse_smart_with_exchange_fragments(self):
+        smart = MagicMock(exchange="SMART", tradingClass="SPY", multiplier="100")
+        smart.expirations, smart.strikes = ["20260717"], [743]
+        cboe = MagicMock(exchange="CBOE", tradingClass="SPY", multiplier="100")
+        cboe.expirations, cboe.strikes = ["20260717", "20260724"], [742, 743, 744]
+        merged = merge_option_chains([smart, cboe], "SPY")
+        assert merged.exchange == "SMART"
+        assert merged.expirations == ["20260717", "20260724"]
+        assert merged.strikes == [742.0, 743.0, 744.0]
+
     def test_basic_selection(self):
         """选择 0DTE, ~7DTE, ~14DTE, ~30DTE, ~45DTE"""
         chain = MagicMock()

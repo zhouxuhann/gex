@@ -82,7 +82,7 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
     assert row["status"] == "ok"
     assert row["strike"] == 725
     assert row["sell_credit_bid"] == 3.5
-    assert row["schema_version"] == 3
+    assert row["schema_version"] == 4
     assert row["rr_25"] == 0.04
     assert row["drr_25"] == 0.005
     assert abs(row["straddle_gamma"] - 0.04) < 1e-9
@@ -136,6 +136,19 @@ def test_captures_executable_straddle_and_iron_fly_mtm(tmp_path):
         contracts[4]: ticker(0.4, 0.5, 0.35, mark_time),
         contracts[5]: ticker(2.0, 2.1, -0.65, mark_time),
     }
+    invalid_tickers = dict(mark_tickers)
+    invalid_tickers[contracts[2]] = ticker(1.1, None, 0.48, mark_time)
+    assert not monitor.on_gex_update(
+        FakeIB(invalid_tickers), contracts, now=mark_time, spot=725.0,
+        expiry="20260716", is_true_0dte=True,
+        gex_state={"gamma_flip": 720, "regime_tags": {}},
+    )
+    failed = storage.load_vrp_mtm("QQQ", "20260716").iloc[0]
+    assert failed["status"] == "invalid_nbbo"
+    assert failed["retry_count"] == 1
+    mark_time = datetime(2026, 7, 16, 9, 40, 4, tzinfo=ET)
+    for item in mark_tickers.values():
+        item.time = mark_time
     assert not monitor.on_gex_update(
         FakeIB(mark_tickers), contracts, now=mark_time, spot=725.0,
         expiry="20260716", is_true_0dte=True,
@@ -143,6 +156,8 @@ def test_captures_executable_straddle_and_iron_fly_mtm(tmp_path):
     )
     mtm = storage.load_vrp_mtm("QQQ", "20260716").iloc[0]
     assert mtm["checkpoint"] == "+5m"
+    assert mtm["status"] == "ok"
+    assert mtm["retry_count"] == 2
     assert abs(mtm["close_cost_ask"] - 2.9) < 1e-9
     assert abs(mtm["pnl_executable_roundtrip"] - 0.574) < 1e-9
     fly = storage.load_vrp_iron_fly_mtm("QQQ", "20260716").iloc[0]
@@ -187,6 +202,8 @@ def test_settlement_uses_actual_strike_and_cleans_cross_day_bars(tmp_path):
     assert row["terminal_payoff"] == 1.0
     assert abs(row["pnl_executable"] - 0.787) < 1e-9
     assert row["rth_bar_count"] == 390
+    assert bool(row["breakeven_breached"])
+    assert row["path_high"] == 726.0
     fly = storage.load_vrp_iron_fly_observations("QQQ", "20260715").iloc[0]
     assert fly["settlement_price"] == 724.0
     assert fly["terminal_fly_payoff"] == 1.0
@@ -194,6 +211,9 @@ def test_settlement_uses_actual_strike_and_cleans_cross_day_bars(tmp_path):
     assert abs(fly["return_on_max_risk"] - (20 / 180)) < 1e-9
     assert not bool(fly["hit_max_loss"])
     assert bool(fly["expired_inside_breakeven"])
+    assert bool(fly["breakeven_breached_intraday"])
+    assert not bool(fly["wing_touched_intraday"])
+    assert fly["worst_path_pnl_dollars"] == -80.0
     storage.shutdown()
 
 
