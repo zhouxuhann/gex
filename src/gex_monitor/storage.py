@@ -384,6 +384,36 @@ class StorageManager:
             return pd.DataFrame()
         return read_parquet_et(path, self._io_lock)
 
+    def persist_vrp_paper_order(self, symbol: str, date_str: str, row: dict) -> None:
+        """保存 Paper Iron Fly 意图、订单、成交与结算状态。"""
+        path = self.data_dir / f'vrp_paper_orders_{symbol}_{date_str}.parquet'
+        _merge_and_write(
+            path, pd.DataFrame([row]), ['symbol', 'trading_date', 'order_ref'],
+            self._io_lock,
+        )
+
+    def load_vrp_paper_orders(self, symbol: str, date_str: str) -> "pd.DataFrame":
+        path = self.data_dir / f'vrp_paper_orders_{symbol}_{date_str}.parquet'
+        if not path.exists():
+            return pd.DataFrame()
+        return read_parquet_et(path, self._io_lock)
+
+    def persist_vrp_paper_mtm(self, symbol: str, date_str: str,
+                              rows: list[dict]) -> None:
+        if not rows:
+            return
+        path = self.data_dir / f'vrp_paper_mtm_{symbol}_{date_str}.parquet'
+        _merge_and_write(
+            path, pd.DataFrame(rows), ['symbol', 'trading_date', 'order_ref', 'checkpoint'],
+            self._io_lock,
+        )
+
+    def load_vrp_paper_mtm(self, symbol: str, date_str: str) -> "pd.DataFrame":
+        path = self.data_dir / f'vrp_paper_mtm_{symbol}_{date_str}.parquet'
+        if not path.exists():
+            return pd.DataFrame()
+        return read_parquet_et(path, self._io_lock)
+
     def persist_vrp_observations(self, symbol: str, date_str: str,
                                  rows: list[dict]) -> None:
         """写入可由原始报价重新生成的 VRP 结算结果。"""

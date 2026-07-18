@@ -91,7 +91,7 @@ class MonitoringConfig(BaseModel):
 
 
 class IntradayVRPConfig(BaseModel):
-    """0DTE 日内波动率风险溢价观测器（只采集，不交易）。"""
+    """0DTE VRP 观测器；可显式启用受硬锁保护的 Paper Iron Fly。"""
     enabled: bool = False
     observation_only: bool = True
     symbols: list[str] = Field(default_factory=lambda: ["QQQ"])
@@ -109,6 +109,12 @@ class IntradayVRPConfig(BaseModel):
     mtm_checkpoints_minutes: list[int] = Field(default_factory=lambda: [5, 15, 30, 60])
     mtm_fixed_times_et: list[str] = Field(default_factory=lambda: ["15:30"])
     vix_cache_seconds: int = 300
+    paper_execution_enabled: bool = False
+    paper_required_port: int = 4002
+    paper_entry_slots: list[str] = Field(default_factory=lambda: ["10:00", "14:00"])
+    paper_iron_fly_width: float = 3.0
+    paper_quantity: int = 1
+    paper_order_timeout_seconds: int = 30
 
 
 class EmailAlertConfig(BaseModel):
@@ -185,7 +191,9 @@ class AppConfig(BaseModel):
 
     def resolve_storage_path(self, config_path: str | Path | None = None) -> Path:
         """把 storage.data_dir 解析成绝对路径并写回配置。"""
-        raw = Path(self.storage.data_dir).expanduser()
+        # Runtime launcher exports the one canonical data directory.  Honouring
+        # it here keeps GEX, official bars and Paper order records together.
+        raw = Path(os.environ.get("GEX_DATA_DIR", self.storage.data_dir)).expanduser()
         if raw.is_absolute():
             resolved = raw.resolve()
         else:

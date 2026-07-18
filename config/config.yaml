@@ -73,6 +73,13 @@ intraday_vrp:
   mtm_checkpoints_minutes: [5, 15, 30, 60]
   mtm_fixed_times_et: ["15:30"]
   vix_cache_seconds: 300
+  # Paper-only Iron Fly experiment. Hard-blocked unless IB port=4002 and account starts DU.
+  paper_execution_enabled: true
+  paper_required_port: 4002
+  paper_entry_slots: ["10:00", "14:00"]
+  paper_iron_fly_width: 3
+  paper_quantity: 1
+  paper_order_timeout_seconds: 30
 
 alerts:
   ib_errors:

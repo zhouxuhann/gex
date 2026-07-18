@@ -157,7 +157,10 @@ class IBWorker:
             self._vrp_monitor = IntradayVRPMonitor(
                 self.symbol, self.storage, intraday_vrp_config
             )
-            self._log('info', 'Intraday VRP observation enabled (no order execution)')
+            mode = ('observation + PAPER Iron Fly execution'
+                    if intraday_vrp_config.paper_execution_enabled else
+                    'observation only')
+            self._log('info', f'Intraday VRP enabled ({mode})')
 
     def _load_prev_oi(self) -> None:
         """加载前一交易日的 OI 快照"""
@@ -735,6 +738,7 @@ class IBWorker:
                     market_context_provider=lambda: vix_context(
                         self.ib, et_now(), self._intraday_vrp_config.vix_cache_seconds
                     ),
+                    ib_port=self.ib_port,
                 )
             except Exception as e:
                 self._log('warning', f'VRP observation failed: {e}')

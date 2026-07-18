@@ -208,6 +208,16 @@ class TestAppConfig:
 
         assert Path(config.storage.data_dir) == (config_dir / "archive").resolve()
 
+    def test_runtime_data_dir_environment_override(self, temp_dir, monkeypatch):
+        yaml_file = temp_dir / "config.yaml"
+        yaml_file.write_text("storage:\n  data_dir: ./wrong\n")
+        canonical = temp_dir / "canonical"
+        monkeypatch.setenv("GEX_DATA_DIR", str(canonical))
+
+        config = AppConfig.from_yaml(yaml_file)
+
+        assert Path(config.storage.data_dir) == canonical.resolve()
+
     def test_get_enabled_symbols(self):
         """Test getting enabled symbols."""
         config = AppConfig(

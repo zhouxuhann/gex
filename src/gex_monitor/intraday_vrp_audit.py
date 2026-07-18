@@ -33,6 +33,8 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
                           quotes: pd.DataFrame, observations: pd.DataFrame,
                           mtm: pd.DataFrame | None = None,
                           iron_fly_mtm: pd.DataFrame | None = None,
+                          paper_orders: pd.DataFrame | None = None,
+                          paper_mtm: pd.DataFrame | None = None,
                           min_rth_bars: int = 389) -> dict:
     """生成一份可机器读取的 VRP 日终审计报告。"""
     expected_slots = list(schedule)
@@ -120,6 +122,13 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
         dict(sorted(Counter(
             iron_fly_mtm["status"].fillna("missing_status").astype(str)
         ).items())),
+        "paper_order_rows": 0 if paper_orders is None else len(paper_orders),
+        "paper_order_status_counts": {}
+        if paper_orders is None or "status" not in paper_orders else
+        dict(sorted(Counter(
+            paper_orders["status"].fillna("missing_status").astype(str)
+        ).items())),
+        "paper_mtm_rows": 0 if paper_mtm is None else len(paper_mtm),
         "problems": problems,
     }
 
