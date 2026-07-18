@@ -2,6 +2,7 @@
 import json
 import pytest
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from gex_monitor.hedge_signal import HedgeSignal
@@ -153,6 +154,118 @@ class TestDryRun:
         assert record.legs[1]['strike'] == 465
 
 
+class TestSafeLiveOrders:
+    @staticmethod
+    def _contract(strike, con_id):
+        return SimpleNamespace(strike=strike, conId=con_id)
+
+    @staticmethod
+    def _ticker(contract, bid, ask):
+        return SimpleNamespace(contract=contract, bid=bid, ask=ask)
+
+    def test_put_spread_uses_single_day_bag_limit(
+        self, mock_ib, signal_hedge_spread,
+    ):
+        executor = HedgeExecutor(ib=mock_ib, dry_run=False)
+        long_contract = self._contract(475, 101)
+        short_contract = self._contract(465, 102)
+        quotes = {
+            101: self._ticker(long_contract, 5.00, 5.20),
+            102: self._ticker(short_contract, 2.00, 2.20),
+        }
+        mock_ib.reqTickers.side_effect = lambda *contracts: [
+            quotes[c.conId] for c in contracts
+        ]
+
+        def place_order(contract, order):
+            trade = MagicMock()
+            trade.order = order
+            trade.orderStatus.status = 'Filled'
+            trade.orderStatus.filled = 1
+            trade.orderStatus.avgFillPrice = 3.10
+            trade.fills = []
+            return trade
+
+        mock_ib.placeOrder.side_effect = place_order
+        with patch.object(
+            executor, '_find_contract_by_delta',
+            side_effect=[
+                (long_contract, -0.25, 0.22),
+                (short_contract, -0.10, 0.20),
+            ],
+        ):
+            record = executor.execute(signal_hedge_spread, 480.0)
+
+        assert record is not None
+        assert record.status == 'OPEN'
+        assert record.entry_cost == 310.0
+        placed_contract, placed_order = mock_ib.placeOrder.call_args.args
+        assert placed_contract.secType == 'BAG'
+        assert [leg.action for leg in placed_contract.comboLegs] == ['BUY', 'SELL']
+        assert [leg.conId for leg in placed_contract.comboLegs] == [101, 102]
+        assert placed_order.orderType == 'LMT'
+        assert placed_order.action == 'BUY'
+        assert placed_order.tif == 'DAY'
+
+    def test_outright_put_explicit_day_limit(self, mock_ib, signal_hedge_now):
+        executor = HedgeExecutor(ib=mock_ib, dry_run=False)
+        contract = self._contract(470, 201)
+        mock_ib.reqTickers.return_value = [self._ticker(contract, 3.40, 3.55)]
+
+        def place_order(placed_contract, order):
+            trade = MagicMock()
+            trade.order = order
+            trade.orderStatus.status = 'Filled'
+            trade.orderStatus.filled = 1
+            trade.orderStatus.avgFillPrice = 3.55
+            trade.fills = []
+            return trade
+
+        mock_ib.placeOrder.side_effect = place_order
+        with patch.object(
+            executor, '_find_contract_by_delta',
+            return_value=(contract, -0.25, 0.22),
+        ):
+            record = executor.execute(signal_hedge_now, 480.0)
+
+        assert record is not None
+        _, order = mock_ib.placeOrder.call_args.args
+        assert order.orderType == 'LMT'
+        assert order.lmtPrice == 3.55
+        assert order.tif == 'DAY'
+
+    def test_10349_local_cancel_does_not_end_wait(self, mock_ib):
+        executor = HedgeExecutor(ib=mock_ib, dry_run=False)
+        trade = SimpleNamespace(
+            order=SimpleNamespace(totalQuantity=1),
+            orderStatus=SimpleNamespace(status='Cancelled', filled=0),
+            log=[SimpleNamespace(errorCode=10349)],
+        )
+
+        def deliver_late_fill(_seconds):
+            trade.orderStatus.status = 'Filled'
+            trade.orderStatus.filled = 1
+
+        mock_ib.sleep.side_effect = deliver_late_fill
+        assert executor._wait_fill(trade, timeout=1)
+
+    def test_hard_cancel_still_ends_wait(self, mock_ib):
+        executor = HedgeExecutor(ib=mock_ib, dry_run=False)
+        trade = SimpleNamespace(
+            order=SimpleNamespace(totalQuantity=1),
+            orderStatus=SimpleNamespace(status='Cancelled', filled=0),
+            log=[SimpleNamespace(errorCode=201)],
+        )
+        assert not executor._wait_fill(trade, timeout=1)
+
+    def test_spread_limit_stays_inside_nbbo(self, mock_ib):
+        executor = HedgeExecutor(ib=mock_ib, dry_run=False)
+        long_ticker = SimpleNamespace(bid=5.00, ask=5.20)
+        short_ticker = SimpleNamespace(bid=2.00, ask=2.20)
+        # midpoint=3.00, natural debit=3.20; 25% concession => 3.05
+        assert executor._spread_limit_debit(long_ticker, short_ticker) == 3.05
+
+
 class TestTradeRecord:
     def test_to_db_dict(self, signal_hedge_now):
         record = TradeRecord(
@@ -196,3 +309,8 @@ class TestMaxPositions:
             # max_positions=0 means no positions allowed
             result = executor.execute(signal_hedge_now, 480.0)
         assert result is None
+
+    def test_live_qty_above_one_is_blocked(self, mock_ib, signal_hedge_now):
+        executor = HedgeExecutor(ib=mock_ib, dry_run=False, qty=2)
+        assert executor.execute(signal_hedge_now, 480.0) is None
+        mock_ib.placeOrder.assert_not_called()

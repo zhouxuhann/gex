@@ -14,12 +14,13 @@
 """
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
-from ib_insync import IB, Stock, Index, Option, LimitOrder, MarketOrder
+from ib_insync import ComboLeg, Contract, IB, LimitOrder, Option, Stock
 
 from .config import DatabaseConfig
 from .hedge_signal import HedgeSignal
@@ -33,6 +34,12 @@ SPREAD_SHORT_DELTA = 0.10         # -0.10Δ put (short leg)
 DEFAULT_QTY = 1                   # 1 合约
 MAX_OPEN_POSITIONS = 5            # 最大同时持有的对冲头寸
 ORDER_TIMEOUT_SEC = 30            # 订单超时
+ORDER_RECONCILE_SEC = 5           # 取消后继续等待服务器成交回报
+TIF_PRESET_WARNING_CODE = 10349
+MAX_DELTA_ERROR = 0.06
+CONTRACT_SEARCH_RANGE_PCT = 0.20
+MAX_CONTRACT_CANDIDATES = 61
+QUOTE_BATCH_SIZE = 30
 
 
 @dataclass
@@ -146,6 +153,9 @@ class HedgeExecutor:
         if not self.dry_run and not self.verify_paper_account():
             log.error("BLOCKED: Not a paper account")
             return None
+        if not self.dry_run and self.qty != 1:
+            log.error("BLOCKED: atomic hedge executor currently supports qty=1 only")
+            return None
 
         # 持仓上限检查
         open_count = self.get_open_positions(signal.symbol)
@@ -220,7 +230,8 @@ class HedgeExecutor:
         return None
 
     def _find_contract_by_delta(
-        self, symbol: str, expiry: str, target_delta: float, right: str = 'P'
+        self, symbol: str, expiry: str, target_delta: float, right: str = 'P',
+        spot_override: float | None = None,
     ) -> tuple | None:
         """
         找到最接近目标 delta 的合约
@@ -236,24 +247,32 @@ class HedgeExecutor:
         chains = self.ib.reqSecDefOptParams(
             underlying.symbol, '', underlying.secType, underlying.conId
         )
-        chain = next((c for c in chains if c.exchange == 'SMART'), None)
+        chain = (
+            next((c for c in chains if c.exchange == 'SMART'
+                  and c.tradingClass == symbol), None)
+            or next((c for c in chains if c.tradingClass == symbol), None)
+        )
         if not chain:
             return None
 
         # 获取 spot
-        self.ib.reqMktData(underlying, genericTickList='', snapshot=False)
-        self.ib.sleep(2)
-        u_ticker = self.ib.ticker(underlying)
-        spot = u_ticker.marketPrice() if u_ticker else None
-        self.ib.cancelMktData(underlying)
+        spot = spot_override
+        if spot is None:
+            snapshots = self.ib.reqTickers(underlying)
+            u_ticker = snapshots[0] if snapshots else None
+            spot = u_ticker.marketPrice() if u_ticker else None
 
         if not spot or np.isnan(spot):
             return None
 
         # 选 strikes
-        all_strikes = sorted(s for s in chain.strikes if s == int(s))
-        lo, hi = spot * 0.90, spot * 1.10
+        all_strikes = sorted({float(s) for s in chain.strikes if float(s) > 0})
+        lo = spot * (1 - CONTRACT_SEARCH_RANGE_PCT)
+        hi = spot * (1 + CONTRACT_SEARCH_RANGE_PCT)
         strikes = [s for s in all_strikes if lo <= s <= hi]
+        if len(strikes) > MAX_CONTRACT_CANDIDATES:
+            indices = np.linspace(0, len(strikes) - 1, MAX_CONTRACT_CANDIDATES)
+            strikes = sorted({strikes[int(round(i))] for i in indices})
 
         # 创建合约并请求数据
         contracts = [
@@ -261,17 +280,17 @@ class HedgeExecutor:
             for s in strikes
         ]
         qualified = self.ib.qualifyContracts(*contracts)
-        for c in qualified:
-            self.ib.reqMktData(c, genericTickList='106', snapshot=False)
-        self.ib.sleep(5)
+        tickers = []
+        for start in range(0, len(qualified), QUOTE_BATCH_SIZE):
+            tickers.extend(self.ib.reqTickers(*qualified[start:start + QUOTE_BATCH_SIZE]))
 
         # 找最接近 target_delta 的
         best = None
         best_diff = float('inf')
-        for c in qualified:
-            t = self.ib.ticker(c)
+        for t in tickers:
             if t is None or t.modelGreeks is None:
                 continue
+            c = t.contract
             delta = t.modelGreeks.delta
             iv = t.modelGreeks.impliedVol
             if delta is None:
@@ -281,14 +300,7 @@ class HedgeExecutor:
                 best_diff = diff
                 best = (c, delta, iv)
 
-        # 清理
-        for c in qualified:
-            try:
-                self.ib.cancelMktData(c)
-            except Exception:
-                pass
-
-        if best and best_diff < 0.15:
+        if best and best_diff <= MAX_DELTA_ERROR:
             return best
         return None
 
@@ -299,7 +311,9 @@ class HedgeExecutor:
         symbol = signal.symbol
         log.info(f"[{symbol}] Finding -0.25Δ put, expiry={expiry}...")
 
-        result = self._find_contract_by_delta(symbol, expiry, DEFAULT_TARGET_DELTA, 'P')
+        result = self._find_contract_by_delta(
+            symbol, expiry, DEFAULT_TARGET_DELTA, 'P', spot_override=spot
+        )
         if result is None:
             log.error(f"[{symbol}] Cannot find suitable put contract")
             return None
@@ -320,16 +334,23 @@ class HedgeExecutor:
             self._save_trade(record)
             return record
 
-        # 下单
-        order = MarketOrder('BUY', self.qty)
+        # 显式 DAY + 限价，避免 IB Gateway preset 10349 和市价滑点。
+        ticker = self._snapshot_quotes(contract)[0]
+        limit_price = self._single_leg_limit(ticker, 'BUY')
+        if limit_price is None:
+            log.error(f"[{symbol}] Cannot build safe limit price for {contract.strike}P")
+            return None
+        order = LimitOrder('BUY', self.qty, limit_price, tif='DAY')
         trade = self.ib.placeOrder(contract, order)
-        log.info(f"[{symbol}] Order placed, waiting for fill...")
+        log.info(f"[{symbol}] DAY limit order placed @ ${limit_price:.2f}, waiting for fill...")
 
         # 等待成交
         filled = self._wait_fill(trade)
         if not filled:
-            log.error(f"[{symbol}] Order not filled within timeout")
-            self.ib.cancelOrder(order)
+            log.error(f"[{symbol}] Order not filled; cancelling and reconciling")
+            if not self._cancel_and_reconcile(trade):
+                return None
+        if not self._is_fully_filled(trade):
             return None
 
         fill_price = trade.orderStatus.avgFillPrice
@@ -355,14 +376,18 @@ class HedgeExecutor:
         log.info(f"[{symbol}] Finding put spread, expiry={expiry}...")
 
         # 长腿: -0.25Δ
-        long_result = self._find_contract_by_delta(symbol, expiry, DEFAULT_TARGET_DELTA, 'P')
+        long_result = self._find_contract_by_delta(
+            symbol, expiry, DEFAULT_TARGET_DELTA, 'P', spot_override=spot
+        )
         if long_result is None:
             log.error(f"[{symbol}] Cannot find long put")
             return None
         long_contract, long_delta, long_iv = long_result
 
         # 短腿: -0.10Δ
-        short_result = self._find_contract_by_delta(symbol, expiry, SPREAD_SHORT_DELTA, 'P')
+        short_result = self._find_contract_by_delta(
+            symbol, expiry, SPREAD_SHORT_DELTA, 'P', spot_override=spot
+        )
         if short_result is None:
             log.error(f"[{symbol}] Cannot find short put")
             return None
@@ -392,30 +417,31 @@ class HedgeExecutor:
             self._save_trade(record)
             return record
 
-        # 分别下单（简单实现，combo order 更优但更复杂）
-        long_order = MarketOrder('BUY', self.qty)
-        short_order = MarketOrder('SELL', self.qty)
+        # 单个 SMART BAG 限价单：两条腿原子化，不会留下裸露单腿。
+        quotes = self._snapshot_quotes(long_contract, short_contract)
+        limit_debit = self._spread_limit_debit(quotes[0], quotes[1])
+        if limit_debit is None:
+            log.error(f"[{symbol}] Cannot build safe spread limit from NBBO")
+            return None
+        bag = self._build_bag(symbol, long_contract, short_contract)
+        order = LimitOrder('BUY', self.qty, limit_debit, tif='DAY')
+        trade = self.ib.placeOrder(bag, order)
+        log.info(
+            f"[{symbol}] BAG DAY limit placed @ ${limit_debit:.2f} debit, "
+            "waiting for atomic fill..."
+        )
 
-        long_trade = self.ib.placeOrder(long_contract, long_order)
-        short_trade = self.ib.placeOrder(short_contract, short_order)
-
-        log.info(f"[{symbol}] Spread orders placed, waiting for fills...")
-
-        long_filled = self._wait_fill(long_trade)
-        short_filled = self._wait_fill(short_trade)
-
-        if not long_filled or not short_filled:
-            log.error(f"[{symbol}] Spread not fully filled")
-            # 尝试取消未成交的
-            if not long_filled:
-                self.ib.cancelOrder(long_order)
-            if not short_filled:
-                self.ib.cancelOrder(short_order)
+        if not self._wait_fill(trade):
+            log.warning(f"[{symbol}] BAG not filled; cancelling and reconciling")
+            if not self._cancel_and_reconcile(trade):
+                return None
+        if not self._is_fully_filled(trade):
             return None
 
-        long_price = long_trade.orderStatus.avgFillPrice
-        short_price = short_trade.orderStatus.avgFillPrice
-        net_debit = (long_price - short_price) * self.qty * 100
+        combo_fill = float(trade.orderStatus.avgFillPrice)
+        net_debit = combo_fill * self.qty * 100
+        long_price = self._leg_fill_price(trade, long_contract.conId)
+        short_price = self._leg_fill_price(trade, short_contract.conId)
 
         record.entry_cost = net_debit
         record.legs = [
@@ -428,10 +454,10 @@ class HedgeExecutor:
         ]
         record.status = 'OPEN'
 
-        log.info(f"[{symbol}] SPREAD FILLED: "
-                 f"BUY {long_contract.strike}P @ ${long_price:.2f} / "
-                 f"SELL {short_contract.strike}P @ ${short_price:.2f} "
-                 f"(net debit=${net_debit:.2f})")
+        log.info(
+            f"[{symbol}] BAG FILLED: {long_contract.strike}/{short_contract.strike}P "
+            f"@ ${combo_fill:.2f} debit (total=${net_debit:.2f})"
+        )
 
         self._save_trade(record)
         return record
@@ -445,32 +471,189 @@ class HedgeExecutor:
                          f"{symbol} {leg['strike']}{leg['right']} exp={leg['expiry']}")
             return True
 
-        for leg in legs:
-            close_side = 'SELL' if leg['side'] == 'BUY' else 'BUY'
-            contract = Option(symbol, leg['expiry'], leg['strike'],
-                              leg['right'], 'SMART', tradingClass=symbol)
-            self.ib.qualifyContracts(contract)
-            order = MarketOrder(close_side, leg['qty'])
-            trade = self.ib.placeOrder(contract, order)
-            filled = self._wait_fill(trade)
-            if filled:
-                price = trade.orderStatus.avgFillPrice
-                log.info(f"[{symbol}] Closed: {close_side} {leg['strike']}{leg['right']} @ ${price:.2f}")
-            else:
-                log.error(f"[{symbol}] Failed to close {leg['strike']}{leg['right']}")
+        # 垂直价差必须作为一个 BAG 整体平仓。
+        if len(legs) == 2:
+            long_leg = next((leg for leg in legs if leg.get('side') == 'BUY'), None)
+            short_leg = next((leg for leg in legs if leg.get('side') == 'SELL'), None)
+            if long_leg is None or short_leg is None:
+                log.error(f"[{symbol}] Cannot identify spread legs for atomic close")
                 return False
-        return True
+            contracts = [
+                Option(symbol, long_leg['expiry'], long_leg['strike'], long_leg['right'],
+                       'SMART', tradingClass=symbol),
+                Option(symbol, short_leg['expiry'], short_leg['strike'], short_leg['right'],
+                       'SMART', tradingClass=symbol),
+            ]
+            qualified = self.ib.qualifyContracts(*contracts)
+            if len(qualified) != 2:
+                return False
+            long_contract, short_contract = qualified
+            quotes = self._snapshot_quotes(long_contract, short_contract)
+            limit_credit = self._spread_limit_credit(quotes[0], quotes[1])
+            if limit_credit is None:
+                log.error(f"[{symbol}] Cannot build safe close credit from NBBO")
+                return False
+            bag = self._build_bag(symbol, long_contract, short_contract)
+            qty = min(int(long_leg.get('qty', 1)), int(short_leg.get('qty', 1)))
+            order = LimitOrder('SELL', qty, limit_credit, tif='DAY')
+            trade = self.ib.placeOrder(bag, order)
+            if not self._wait_fill(trade) and not self._cancel_and_reconcile(trade):
+                return False
+            return self._is_fully_filled(trade)
+
+        if len(legs) != 1:
+            log.error(f"[{symbol}] Unsupported close structure with {len(legs)} legs")
+            return False
+        leg = legs[0]
+        close_side = 'SELL' if leg['side'] == 'BUY' else 'BUY'
+        contract = Option(symbol, leg['expiry'], leg['strike'], leg['right'],
+                          'SMART', tradingClass=symbol)
+        qualified = self.ib.qualifyContracts(contract)
+        if not qualified:
+            return False
+        contract = qualified[0]
+        ticker = self._snapshot_quotes(contract)[0]
+        limit_price = self._single_leg_limit(ticker, close_side)
+        if limit_price is None:
+            return False
+        order = LimitOrder(close_side, leg['qty'], limit_price, tif='DAY')
+        trade = self.ib.placeOrder(contract, order)
+        if not self._wait_fill(trade) and not self._cancel_and_reconcile(trade):
+            return False
+        return self._is_fully_filled(trade)
+
+    @staticmethod
+    def _build_bag(symbol: str, long_contract, short_contract) -> Contract:
+        return Contract(
+            secType='BAG', symbol=symbol, exchange='SMART', currency='USD',
+            comboLegs=[
+                ComboLeg(conId=long_contract.conId, ratio=1,
+                         action='BUY', exchange='SMART'),
+                ComboLeg(conId=short_contract.conId, ratio=1,
+                         action='SELL', exchange='SMART'),
+            ],
+        )
+
+    def _snapshot_quotes(self, *contracts):
+        tickers = self.ib.reqTickers(*contracts)
+        by_con_id = {ticker.contract.conId: ticker for ticker in tickers}
+        result = []
+        for contract in contracts:
+            ticker = by_con_id.get(contract.conId)
+            if ticker is None:
+                raise RuntimeError(f'No snapshot quote for conId={contract.conId}')
+            result.append(ticker)
+        return result
+
+    @staticmethod
+    def _valid_price(value, *, allow_zero: bool = False) -> float | None:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+            return None
+        return value
+
+    @classmethod
+    def _single_leg_limit(cls, ticker, action: str) -> float | None:
+        value = ticker.ask if action == 'BUY' else ticker.bid
+        price = cls._valid_price(value)
+        return math.ceil(price * 100) / 100 if price is not None else None
+
+    @classmethod
+    def _spread_limit_debit(cls, long_ticker, short_ticker) -> float | None:
+        long_bid = cls._valid_price(long_ticker.bid, allow_zero=True)
+        long_ask = cls._valid_price(long_ticker.ask)
+        short_bid = cls._valid_price(short_ticker.bid, allow_zero=True)
+        short_ask = cls._valid_price(short_ticker.ask)
+        if None in (long_bid, long_ask, short_bid, short_ask):
+            return None
+        natural = long_ask - short_bid
+        midpoint = ((long_bid + long_ask) - (short_bid + short_ask)) / 2
+        if natural <= 0:
+            return None
+        # 从 midpoint 向 natural 让价 25%，不超过当时最差可接受 debit。
+        price = midpoint + 0.25 * (natural - midpoint)
+        price = min(max(price, 0.01), natural)
+        return math.ceil(price * 100) / 100
+
+    @classmethod
+    def _spread_limit_credit(cls, long_ticker, short_ticker) -> float | None:
+        long_bid = cls._valid_price(long_ticker.bid, allow_zero=True)
+        long_ask = cls._valid_price(long_ticker.ask)
+        short_bid = cls._valid_price(short_ticker.bid, allow_zero=True)
+        short_ask = cls._valid_price(short_ticker.ask)
+        if None in (long_bid, long_ask, short_bid, short_ask):
+            return None
+        natural = long_bid - short_ask
+        midpoint = ((long_bid + long_ask) - (short_bid + short_ask)) / 2
+        if natural <= 0:
+            return None
+        price = midpoint - 0.25 * (midpoint - natural)
+        price = max(min(price, midpoint), natural)
+        return max(0.01, math.floor(price * 100) / 100)
+
+    @staticmethod
+    def _leg_fill_price(trade, con_id: int) -> float | None:
+        fills = [fill for fill in getattr(trade, 'fills', [])
+                 if getattr(fill.contract, 'conId', None) == con_id]
+        quantities = [float(fill.execution.shares) for fill in fills]
+        total = sum(quantities)
+        if total <= 0:
+            return None
+        return sum(float(fill.execution.price) * qty
+                   for fill, qty in zip(fills, quantities)) / total
+
+    @staticmethod
+    def _has_tif_preset_warning(trade) -> bool:
+        return any(getattr(entry, 'errorCode', None) == TIF_PRESET_WARNING_CODE
+                   for entry in getattr(trade, 'log', []))
+
+    @staticmethod
+    def _is_fully_filled(trade) -> bool:
+        status = getattr(trade.orderStatus, 'status', '')
+        if status == 'Filled':
+            return True
+        try:
+            filled = float(getattr(trade.orderStatus, 'filled', 0) or 0)
+            quantity = float(getattr(trade.order, 'totalQuantity', 0) or 0)
+            return quantity > 0 and filled >= quantity
+        except (TypeError, ValueError):
+            return False
 
     def _wait_fill(self, trade, timeout: int = ORDER_TIMEOUT_SEC) -> bool:
-        """等待订单成交"""
+        """等待订单成交；10349 是 preset 通知，不视为服务器拒单。"""
         start = time.time()
         while time.time() - start < timeout:
             self.ib.sleep(0.5)
-            if trade.orderStatus.status == 'Filled':
+            if self._is_fully_filled(trade):
                 return True
             if trade.orderStatus.status in ('Cancelled', 'ApiCancelled'):
+                if self._has_tif_preset_warning(trade):
+                    continue
                 return False
         return False
+
+    def _cancel_and_reconcile(self, trade) -> bool:
+        """取消后继续消化成交回报，防止把延迟 fill 误判为未成交。"""
+        if self._is_fully_filled(trade):
+            return True
+        try:
+            self.ib.cancelOrder(trade.order)
+        except Exception as exc:
+            log.warning(f"Cancel request failed: {exc}")
+        try:
+            self.ib.reqOpenOrders()
+        except Exception:
+            pass
+        deadline = time.time() + ORDER_RECONCILE_SEC
+        while time.time() < deadline:
+            self.ib.sleep(0.25)
+            if self._is_fully_filled(trade):
+                log.warning("Order filled during cancel reconciliation")
+                return True
+        return self._is_fully_filled(trade)
 
     def _save_trade(self, record: TradeRecord) -> None:
         """保存交易记录到 DB"""
