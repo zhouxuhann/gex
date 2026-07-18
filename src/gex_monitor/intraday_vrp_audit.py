@@ -31,6 +31,8 @@ def _json_default(value):
 
 def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | tuple[str, ...],
                           quotes: pd.DataFrame, observations: pd.DataFrame,
+                          mtm: pd.DataFrame | None = None,
+                          iron_fly_mtm: pd.DataFrame | None = None,
                           min_rth_bars: int = 389) -> dict:
     """生成一份可机器读取的 VRP 日终审计报告。"""
     expected_slots = list(schedule)
@@ -56,6 +58,16 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
     missing_slots = [slot for slot in expected_slots if slot not in actual_slots]
     unsettled_slots = sorted(actual_slots - settled_slots)
     problems = []
+    feature_columns = [
+        "straddle_gamma", "straddle_theta", "straddle_vega",
+        "rv_15m", "rv_30m", "trend_efficiency_session",
+        "dist_to_flip_im", "weekday", "opex_type", "event_flag",
+    ]
+    feature_coverage = {}
+    for column in feature_columns:
+        feature_coverage[column] = (
+            float(quotes[column].notna().mean()) if column in quotes and not quotes.empty else 0.0
+        )
     if missing_slots:
         problems.append(f"missing_slots={','.join(missing_slots)}")
     if unsettled_slots:
@@ -75,7 +87,7 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
         quality = "bad"
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "symbol": symbol,
         "trading_date": date_str,
         "generated_at": datetime.now(ET),
@@ -96,6 +108,9 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
         "mean_execution_haircut_pct": _mean(quotes, "execution_haircut_pct"),
         "rth_bar_count": rth_bars,
         "ohlc_complete": rth_bars >= min_rth_bars,
+        "feature_coverage": feature_coverage,
+        "mtm_rows": 0 if mtm is None else len(mtm),
+        "iron_fly_mtm_rows": 0 if iron_fly_mtm is None else len(iron_fly_mtm),
         "problems": problems,
     }
 

@@ -106,6 +106,8 @@ class IntradayVRPConfig(BaseModel):
     max_quote_age_seconds: int = 10
     max_combined_spread_ratio: float = 0.10
     commission_per_straddle: float = 1.30
+    mtm_checkpoints_minutes: list[int] = Field(default_factory=lambda: [5, 15, 30, 60])
+    mtm_fixed_times_et: list[str] = Field(default_factory=lambda: ["15:30"])
 
 
 class EmailAlertConfig(BaseModel):

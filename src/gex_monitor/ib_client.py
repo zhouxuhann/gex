@@ -716,6 +716,8 @@ class IBWorker:
                     expiry=expiry,
                     is_true_0dte=is_true_0dte,
                     gex_state=vrp_state,
+                    # 只在固定采样点调用，避免每个 3 秒 tick 都复制状态。
+                    intraday_bars_provider=lambda: self.state.get_persist_data()[1],
                 )
             except Exception as e:
                 self._log('warning', f'VRP observation failed: {e}')

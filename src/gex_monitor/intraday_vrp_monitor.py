@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +17,7 @@ from .config import IntradayVRPConfig
 from .intraday_vrp_audit import build_vrp_daily_audit, write_vrp_daily_audit
 from .storage import StorageManager, read_parquet_et
 from .time_utils import ET, et_now, trading_date_str
+from .vrp_context import VRPEventCalendar, opex_context, path_features
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,11 @@ def _ticker_time(ticker) -> datetime | None:
     return value.astimezone(ET)
 
 
+def _sum_optional(*values) -> float | None:
+    finite = [value for value in values if value is not None]
+    return sum(finite) if finite else None
+
+
 class IntradayVRPMonitor:
     """由 IBWorker 驱动的固定时点 0DTE straddle 观测器。"""
 
@@ -51,6 +57,12 @@ class IntradayVRPMonitor:
         self._schedule = tuple(config.schedule_et)
         self._recorded_date: str | None = None
         self._recorded: set[str] = set()
+        self._event_calendar = VRPEventCalendar(storage.data_dir)
+        self._mtm_date: str | None = None
+        self._mtm_recorded: set[tuple[str, str]] = set()
+        self._fly_mtm_recorded: set[tuple[str, float, str]] = set()
+        self._mtm_quotes: list[dict] = []
+        self._mtm_flies: list[dict] = []
 
     def _load_recorded(self, date_str: str) -> None:
         if self._recorded_date == date_str:
@@ -74,7 +86,9 @@ class IntradayVRPMonitor:
         return None
 
     def on_gex_update(self, ib, contracts: list, *, now: datetime, spot: float,
-                      expiry: str, is_true_0dte: bool, gex_state: dict) -> bool:
+                      expiry: str, is_true_0dte: bool, gex_state: dict,
+                      intraday_bars_provider=None) -> bool:
+        self._capture_mtm_checkpoints(ib, contracts, now=now, expiry=expiry)
         due = self.due_slot(now)
         if due is None:
             return False
@@ -83,17 +97,189 @@ class IntradayVRPMonitor:
         row = self._build_quote_row(
             ib, contracts, now, target, slot, spot, expiry, is_true_0dte, gex_state
         )
+        bars = intraday_bars_provider() if intraday_bars_provider is not None else None
+        row.update(path_features(bars, now, spot))
         self.storage.persist_vrp_quote(self.symbol, date_str, row)
         wing_rows, fly_rows = self._build_wings_and_flies(
             ib, contracts, now=now, quote_row=row
         )
         self.storage.persist_vrp_wing_quotes(self.symbol, date_str, wing_rows)
         self.storage.persist_vrp_iron_flies(self.symbol, date_str, fly_rows)
+        self._ensure_mtm_state(date_str)
+        self._mtm_quotes.append(dict(row))
+        self._mtm_flies.extend(dict(item) for item in fly_rows)
         self._recorded.add(slot)
         log.info("[%s] VRP %s recorded status=%s strike=%s wings=%s flies=%s",
                  self.symbol, slot, row["status"], row.get("strike"),
                  len(wing_rows), len(fly_rows))
         return True
+
+    def _ensure_mtm_state(self, date_str: str) -> None:
+        if self._mtm_date == date_str:
+            return
+        quotes = self.storage.load_vrp_quotes(self.symbol, date_str)
+        flies = self.storage.load_vrp_iron_flies(self.symbol, date_str)
+        mtm = self.storage.load_vrp_mtm(self.symbol, date_str)
+        fly_mtm = self.storage.load_vrp_iron_fly_mtm(self.symbol, date_str)
+        self._mtm_quotes = quotes.to_dict("records")
+        self._mtm_flies = flies.to_dict("records")
+        self._mtm_recorded = set(zip(
+            mtm.get("scheduled_time", pd.Series(dtype=str)).astype(str),
+            mtm.get("checkpoint", pd.Series(dtype=str)).astype(str),
+        ))
+        self._fly_mtm_recorded = set(zip(
+            fly_mtm.get("scheduled_time", pd.Series(dtype=str)).astype(str),
+            pd.to_numeric(fly_mtm.get("target_wing_width", pd.Series(dtype=float)),
+                          errors="coerce").fillna(-1.0),
+            fly_mtm.get("checkpoint", pd.Series(dtype=str)).astype(str),
+        ))
+        self._mtm_date = date_str
+
+    @staticmethod
+    def _as_et(value) -> datetime | None:
+        try:
+            ts = pd.Timestamp(value)
+        except (TypeError, ValueError):
+            return None
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(ET)
+        else:
+            ts = ts.tz_convert(ET)
+        return ts.to_pydatetime()
+
+    def _checkpoint_targets(self, row: dict) -> list[tuple[str, datetime]]:
+        observed = self._as_et(row.get("observed_at"))
+        if observed is None:
+            return []
+        targets = [(f"+{minutes}m", observed + timedelta(minutes=minutes))
+                   for minutes in self.config.mtm_checkpoints_minutes]
+        for clock in self.config.mtm_fixed_times_et:
+            hour, minute = (int(value) for value in clock.split(":"))
+            target = observed.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target > observed:
+                targets.append((clock, target))
+        return [(name, target) for name, target in targets
+                if target.time() < datetime.strptime("15:59", "%H:%M").time()]
+
+    def _capture_mtm_checkpoints(self, ib, contracts: list, *, now: datetime,
+                                 expiry: str) -> int:
+        """Mark original structures at elapsed/fixed checkpoints using executable NBBO."""
+        now = now.astimezone(ET)
+        date_str = trading_date_str(now)
+        self._ensure_mtm_state(date_str)
+        due: list[tuple[dict, str, datetime]] = []
+        for row in self._mtm_quotes:
+            if row.get("status") != "ok" or str(row.get("expiry")) != str(expiry):
+                continue
+            slot = str(row.get("scheduled_time"))
+            for checkpoint, target in self._checkpoint_targets(row):
+                delay = (now - target).total_seconds()
+                quote_missing = (slot, checkpoint) not in self._mtm_recorded
+                fly_missing = any(
+                    (slot, _finite(fly.get("target_wing_width")) or -1.0, checkpoint)
+                    not in self._fly_mtm_recorded
+                    for fly in self._mtm_flies
+                    if str(fly.get("scheduled_time")) == slot
+                )
+                if ((quote_missing or fly_missing)
+                        and 0 <= delay <= self.config.sample_window_seconds):
+                    due.append((row, checkpoint, target))
+        if not due:
+            return 0
+
+        tickers: dict[tuple[float, str], object] = {}
+        for contract in contracts:
+            if str(getattr(contract, "lastTradeDateOrContractMonth", "")) != str(expiry):
+                continue
+            strike = _finite(getattr(contract, "strike", None))
+            right = getattr(contract, "right", None)
+            if strike is not None and right in ("C", "P"):
+                ticker = ib.ticker(contract)
+                if ticker is not None:
+                    tickers[(strike, right)] = ticker
+
+        def leg(strike: float, right: str) -> dict | None:
+            ticker = tickers.get((strike, right))
+            if ticker is None:
+                return None
+            bid = _finite(getattr(ticker, "bid", None))
+            ask = _finite(getattr(ticker, "ask", None))
+            ts = _ticker_time(ticker)
+            age = max(0.0, (now - ts).total_seconds()) if ts else None
+            if (bid is None or ask is None or bid < 0 or ask < bid or age is None
+                    or age > self.config.max_quote_age_seconds):
+                return None
+            return {"bid": bid, "ask": ask, "mid": (bid + ask) / 2, "age": age}
+
+        rows, fly_rows = [], []
+        for entry, checkpoint, target in due:
+            slot = str(entry["scheduled_time"])
+            strike = _finite(entry.get("strike"))
+            if strike is None:
+                continue
+            call, put = leg(strike, "C"), leg(strike, "P")
+            if call is None or put is None:
+                continue
+            entry_credit = _finite(entry.get("sell_credit_bid"))
+            entry_mid = _finite(entry.get("straddle_mid"))
+            close_ask = call["ask"] + put["ask"]
+            close_mid = call["mid"] + put["mid"]
+            fees = 2 * self.config.commission_per_straddle / 100.0
+            if (slot, checkpoint) not in self._mtm_recorded:
+                rows.append({
+                    "schema_version": 1, "symbol": self.symbol,
+                    "trading_date": date_str, "scheduled_time": slot,
+                    "checkpoint": checkpoint, "checkpoint_at": target,
+                    "observed_at": now, "delay_seconds": (now - target).total_seconds(),
+                    "expiry": expiry, "strike": strike,
+                    "entry_credit_bid": entry_credit, "entry_mid": entry_mid,
+                    "close_cost_ask": close_ask, "close_mark_mid": close_mid,
+                    "pnl_executable_roundtrip": entry_credit - close_ask - fees
+                    if entry_credit is not None else None,
+                    "pnl_mid_mark": entry_mid - close_mid if entry_mid is not None else None,
+                    "estimated_roundtrip_fees_dollars": fees * 100,
+                    "quote_age_seconds": max(call["age"], put["age"]), "status": "ok",
+                })
+                self._mtm_recorded.add((slot, checkpoint))
+
+            matching = [fly for fly in self._mtm_flies
+                        if str(fly.get("scheduled_time")) == slot]
+            for fly in matching:
+                width = _finite(fly.get("target_wing_width"))
+                key = (slot, width if width is not None else -1.0, checkpoint)
+                if width is None or key in self._fly_mtm_recorded:
+                    continue
+                lower = _finite(fly.get("lower_put_strike"))
+                upper = _finite(fly.get("upper_call_strike"))
+                lower_put = leg(lower, "P") if lower is not None else None
+                upper_call = leg(upper, "C") if upper is not None else None
+                if lower_put is None or upper_call is None:
+                    continue
+                close_debit = close_ask - lower_put["bid"] - upper_call["bid"]
+                entry_net = _finite(fly.get("net_credit_after_fees"))
+                exit_fees = self.config.commission_per_straddle * 2 / 100.0
+                fly_rows.append({
+                    "schema_version": 1, "symbol": self.symbol,
+                    "trading_date": date_str, "scheduled_time": slot,
+                    "target_wing_width": width, "checkpoint": checkpoint,
+                    "checkpoint_at": target, "observed_at": now,
+                    "delay_seconds": (now - target).total_seconds(), "expiry": expiry,
+                    "atm_strike": strike, "entry_net_credit_after_fees": entry_net,
+                    "close_debit_executable": close_debit,
+                    "pnl_executable_roundtrip": entry_net - close_debit - exit_fees
+                    if entry_net is not None else None,
+                    "estimated_exit_fees_dollars": exit_fees * 100,
+                    "quote_age_seconds": max(call["age"], put["age"],
+                                             lower_put["age"], upper_call["age"]),
+                    "status": "ok",
+                })
+                self._fly_mtm_recorded.add(key)
+        self.storage.persist_vrp_mtm(self.symbol, date_str, rows)
+        self.storage.persist_vrp_iron_fly_mtm(self.symbol, date_str, fly_rows)
+        if rows:
+            log.info("[%s] VRP MTM captured: straddles=%s iron_flies=%s",
+                     self.symbol, len(rows), len(fly_rows))
+        return len(rows)
 
     def _build_wings_and_flies(self, ib, contracts: list, *, now: datetime,
                                quote_row: dict) -> tuple[list[dict], list[dict]]:
@@ -136,7 +322,7 @@ class IntradayVRPMonitor:
                 valid = (bid is not None and ask is not None and bid >= 0
                          and ask >= bid and age is not None)
                 wing_rows.append({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "symbol": self.symbol,
                     "trading_date": quote_row["trading_date"],
                     "scheduled_time": quote_row["scheduled_time"],
@@ -152,6 +338,10 @@ class IntradayVRPMonitor:
                     "bid_size": _finite(getattr(ticker, "bidSize", None)),
                     "ask_size": _finite(getattr(ticker, "askSize", None)),
                     "delta": _finite(getattr(greeks, "delta", None)),
+                    "gamma": _finite(getattr(greeks, "gamma", None)),
+                    "theta": _finite(getattr(greeks, "theta", None)),
+                    "vega": _finite(getattr(greeks, "vega", None)),
+                    "implied_vol": _finite(getattr(greeks, "impliedVol", None)),
                     "quote_ts": quote_ts,
                     "quote_age_seconds": age,
                     "status": "ok" if valid else "invalid_nbbo",
@@ -216,7 +406,7 @@ class IntradayVRPMonitor:
                          slot: str, spot: float, expiry: str, is_true_0dte: bool,
                          gex: dict) -> dict:
         base = {
-            "schema_version": 2,
+            "schema_version": 3,
             "symbol": self.symbol,
             "trading_date": trading_date_str(now),
             "scheduled_time": slot,
@@ -250,6 +440,8 @@ class IntradayVRPMonitor:
         }
         flip = _finite(gex.get("gamma_flip"))
         base["dist_to_flip_pct"] = ((spot - flip) / spot) if flip is not None else None
+        base.update(opex_context(now))
+        base.update(self._event_calendar.context(now))
         if not is_true_0dte:
             base["status"] = "not_true_0dte"
             return base
@@ -299,10 +491,17 @@ class IntradayVRPMonitor:
         max_age = 0.0
         for right, prefix in (("C", "call"), ("P", "put")):
             ticker = legs[right][1]
+            greeks = getattr(ticker, "modelGreeks", None)
             values[f"{prefix}_bid"] = _finite(getattr(ticker, "bid", None))
             values[f"{prefix}_ask"] = _finite(getattr(ticker, "ask", None))
             values[f"{prefix}_bid_size"] = _finite(getattr(ticker, "bidSize", None))
             values[f"{prefix}_ask_size"] = _finite(getattr(ticker, "askSize", None))
+            values[f"{prefix}_gamma"] = _finite(getattr(greeks, "gamma", None))
+            values[f"{prefix}_theta"] = _finite(getattr(greeks, "theta", None))
+            values[f"{prefix}_vega"] = _finite(getattr(greeks, "vega", None))
+            values[f"{prefix}_implied_vol"] = _finite(
+                getattr(greeks, "impliedVol", None)
+            )
             values[f"{prefix}_quote_ts"] = _ticker_time(ticker)
             quote_ts = values[f"{prefix}_quote_ts"]
             if quote_ts is not None:
@@ -317,6 +516,14 @@ class IntradayVRPMonitor:
             "strike_distance_pct": (strike - spot) / spot,
             "atm_method": method,
             "quote_age_seconds": max_age if np.isfinite(max_age) else None,
+            "straddle_net_delta": call_delta + put_delta
+            if call_delta is not None and put_delta is not None else None,
+            "straddle_gamma": _sum_optional(values.get("call_gamma"),
+                                              values.get("put_gamma")),
+            "straddle_theta": _sum_optional(values.get("call_theta"),
+                                              values.get("put_theta")),
+            "straddle_vega": _sum_optional(values.get("call_vega"),
+                                             values.get("put_vega")),
         })
 
         cb, ca, pb, pa = (values.get(k) for k in
@@ -341,6 +548,15 @@ class IntradayVRPMonitor:
             "execution_haircut_pct": (1 - sell_credit / straddle_mid)
             if straddle_mid > 0 else None,
         })
+        for field, level in (
+            ("flip", flip), ("call_wall", _finite(gex.get("call_wall"))),
+            ("put_wall", _finite(gex.get("put_wall"))),
+            ("max_pain", _finite(gex.get("max_pain"))),
+        ):
+            base[f"dist_to_{field}_im"] = (
+                (spot - level) / straddle_mid
+                if level is not None and straddle_mid > 0 else None
+            )
         if (base["quote_age_seconds"] is None
                 or base["quote_age_seconds"] > self.config.max_quote_age_seconds):
             base["status"] = "stale_quote"
@@ -374,11 +590,39 @@ class IntradayVRPMonitor:
             else:
                 observed = observed.tz_convert(ET)
             path_mask = bars["ts"] >= observed.floor("min")
+            path = bars[path_mask].copy()
             rv = float(np.sqrt(np.nansum(np.square(returns[path_mask]))))
             strike = _finite(row.get("strike"))
             mid = _finite(row.get("straddle_mid"))
             credit = _finite(row.get("sell_credit_bid"))
             payoff = abs(settle - strike) if strike is not None else None
+            highs = pd.to_numeric(path.get("high", path.get("close")), errors="coerce")
+            lows = pd.to_numeric(path.get("low", path.get("close")), errors="coerce")
+            closes = pd.to_numeric(path.get("close"), errors="coerce").dropna()
+            path_high = _finite(highs.max())
+            path_low = _finite(lows.min())
+            net_credit = (credit - self.config.commission_per_straddle / 100.0
+                          if credit is not None else None)
+            lower_be = strike - net_credit if strike is not None and net_credit is not None else None
+            upper_be = strike + net_credit if strike is not None and net_credit is not None else None
+            breached = path.iloc[0:0]
+            if lower_be is not None and upper_be is not None:
+                breached = path[(highs > upper_be) | (lows < lower_be)]
+            first_breach = breached.iloc[0]["ts"] if not breached.empty else None
+            minutes_outside = None
+            if lower_be is not None and upper_be is not None and not closes.empty:
+                minutes_outside = int(((closes < lower_be) | (closes > upper_be)).sum())
+            path_efficiency = None
+            if len(closes) >= 2:
+                travelled = float(closes.diff().abs().sum())
+                path_efficiency = abs(float(closes.iloc[-1] - closes.iloc[0])) / travelled \
+                    if travelled > 0 else 0.0
+            close_location = None
+            if path_high is not None and path_low is not None and path_high > path_low:
+                close_location = (settle - path_low) / (path_high - path_low)
+            max_distance = None
+            if strike is not None and path_high is not None and path_low is not None:
+                max_distance = max(abs(path_high - strike), abs(path_low - strike))
             row.update({
                 "settled_at": et_now(),
                 "settlement_price": settle,
@@ -389,6 +633,24 @@ class IntradayVRPMonitor:
                 "terminal_payoff_pct": payoff / row["spot"] if payoff is not None else None,
                 "spot_move_pct": abs(settle - row["spot"]) / row["spot"],
                 "rv_1m": rv,
+                "path_high": path_high,
+                "path_low": path_low,
+                "max_up_move_pct": (path_high - row["spot"]) / row["spot"]
+                if path_high is not None else None,
+                "max_down_move_pct": (path_low - row["spot"]) / row["spot"]
+                if path_low is not None else None,
+                "max_distance_to_strike": max_distance,
+                "max_distance_to_strike_pct": max_distance / row["spot"]
+                if max_distance is not None else None,
+                "executable_lower_breakeven": lower_be,
+                "executable_upper_breakeven": upper_be,
+                "first_breakeven_breach_at": first_breach,
+                "minutes_close_outside_breakeven": minutes_outside,
+                "breakeven_breached": first_breach is not None,
+                "worst_intrinsic_pnl_executable": net_credit - max_distance
+                if net_credit is not None and max_distance is not None else None,
+                "path_trend_efficiency": path_efficiency,
+                "close_location_in_path_range": close_location,
                 "pnl_mid": mid - payoff if mid is not None and payoff is not None else None,
                 # 期权报价单位是每股；配置佣金是每套 straddle 的美元金额。
                 "pnl_executable": credit - payoff - self.config.commission_per_straddle / 100.0
@@ -458,12 +720,16 @@ class IntradayVRPMonitor:
         """审计指定日期并写入 vrp_quality_<symbol>_<date>.json。"""
         quotes = self.storage.load_vrp_quotes(self.symbol, date_str)
         observations = self.storage.load_vrp_observations(self.symbol, date_str)
+        mtm = self.storage.load_vrp_mtm(self.symbol, date_str)
+        iron_fly_mtm = self.storage.load_vrp_iron_fly_mtm(self.symbol, date_str)
         report = build_vrp_daily_audit(
             symbol=self.symbol,
             date_str=date_str,
             schedule=self._schedule,
             quotes=quotes,
             observations=observations,
+            mtm=mtm,
+            iron_fly_mtm=iron_fly_mtm,
         )
         path = write_vrp_daily_audit(report, self.storage.data_dir)
         level = logging.INFO if report["quality"] == "good" else logging.WARNING

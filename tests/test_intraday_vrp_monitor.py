@@ -28,10 +28,11 @@ def contract(strike, right):
     return FakeContract(strike, right)
 
 
-def ticker(bid, ask, delta, ts):
+def ticker(bid, ask, delta, ts, gamma=0.02, theta=-0.08, vega=0.03, iv=0.25):
     return SimpleNamespace(
         bid=bid, ask=ask, bidSize=10, askSize=12, time=ts,
-        modelGreeks=SimpleNamespace(delta=delta),
+        modelGreeks=SimpleNamespace(delta=delta, gamma=gamma, theta=theta,
+                                    vega=vega, impliedVol=iv),
     )
 
 
@@ -65,6 +66,8 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
         contracts[4]: ticker(0.9, 1.0, 0.35, now.astimezone(timezone.utc)),
         contracts[5]: ticker(2.8, 2.9, -0.65, now.astimezone(timezone.utc)),
     }
+    bars = [{"ts": datetime(2026, 7, 16, 9, 34, tzinfo=ET),
+             "open": 724.0, "high": 724.7, "low": 723.9, "close": 724.5}]
     assert monitor.on_gex_update(
         FakeIB(tickers), contracts, now=now, spot=724.6, expiry="20260716",
         is_true_0dte=True,
@@ -73,14 +76,22 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
                    "rr_25": 0.04, "skew_slope": 0.2,
                    "rr_25_zscore": 1.1, "drr_25": 0.005,
                    "drr_25_zscore": 0.7},
+        intraday_bars_provider=lambda: bars,
     )
     row = storage.load_vrp_quotes("QQQ", "20260716").iloc[0]
     assert row["status"] == "ok"
     assert row["strike"] == 725
     assert row["sell_credit_bid"] == 3.5
-    assert row["schema_version"] == 2
+    assert row["schema_version"] == 3
     assert row["rr_25"] == 0.04
     assert row["drr_25"] == 0.005
+    assert abs(row["straddle_gamma"] - 0.04) < 1e-9
+    assert abs(row["straddle_theta"] + 0.16) < 1e-9
+    assert row["entry_bar_count"] == 1
+    assert row["weekday"] == "Thursday"
+    assert row["opex_type"] == "none"
+    assert row["event_flag"] == "none"
+    assert abs(row["dist_to_flip_im"] - (724.6 - 720) / 3.6) < 1e-9
     wings = pd.read_parquet(tmp_path / "vrp_wing_quotes_QQQ_20260716.parquet")
     assert len(wings) == 6
     assert set(wings["status"]) == {"ok"}
@@ -91,6 +102,52 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
     assert abs(fly["gross_net_credit"] - 0.7) < 1e-9
     assert abs(fly["net_credit_after_fees"] - 0.674) < 1e-9
     assert abs(fly["max_loss_dollars"] - 32.6) < 1e-9
+    storage.shutdown()
+
+
+def test_captures_executable_straddle_and_iron_fly_mtm(tmp_path):
+    storage = StorageManager(tmp_path)
+    config = IntradayVRPConfig(enabled=True, mtm_checkpoints_minutes=[5],
+                               mtm_fixed_times_et=[])
+    monitor = IntradayVRPMonitor("QQQ", storage, config)
+    entry_time = datetime(2026, 7, 16, 9, 35, 2, tzinfo=ET)
+    contracts = [contract(724, "C"), contract(724, "P"),
+                 contract(725, "C"), contract(725, "P"),
+                 contract(726, "C"), contract(726, "P")]
+    entry_tickers = {
+        contracts[0]: ticker(1.9, 2.0, 0.55, entry_time),
+        contracts[1]: ticker(1.7, 1.8, -0.45, entry_time),
+        contracts[2]: ticker(1.4, 1.5, 0.48, entry_time),
+        contracts[3]: ticker(2.1, 2.2, -0.52, entry_time),
+        contracts[4]: ticker(0.9, 1.0, 0.35, entry_time),
+        contracts[5]: ticker(2.8, 2.9, -0.65, entry_time),
+    }
+    assert monitor.on_gex_update(
+        FakeIB(entry_tickers), contracts, now=entry_time, spot=724.6,
+        expiry="20260716", is_true_0dte=True,
+        gex_state={"gamma_flip": 720, "regime_tags": {}},
+    )
+    mark_time = datetime(2026, 7, 16, 9, 40, 3, tzinfo=ET)
+    mark_tickers = {
+        contracts[0]: ticker(1.0, 1.1, 0.55, mark_time),
+        contracts[1]: ticker(0.5, 0.6, -0.45, mark_time),
+        contracts[2]: ticker(1.1, 1.2, 0.48, mark_time),
+        contracts[3]: ticker(1.6, 1.7, -0.52, mark_time),
+        contracts[4]: ticker(0.4, 0.5, 0.35, mark_time),
+        contracts[5]: ticker(2.0, 2.1, -0.65, mark_time),
+    }
+    assert not monitor.on_gex_update(
+        FakeIB(mark_tickers), contracts, now=mark_time, spot=725.0,
+        expiry="20260716", is_true_0dte=True,
+        gex_state={"gamma_flip": 720, "regime_tags": {}},
+    )
+    mtm = storage.load_vrp_mtm("QQQ", "20260716").iloc[0]
+    assert mtm["checkpoint"] == "+5m"
+    assert abs(mtm["close_cost_ask"] - 2.9) < 1e-9
+    assert abs(mtm["pnl_executable_roundtrip"] - 0.574) < 1e-9
+    fly = storage.load_vrp_iron_fly_mtm("QQQ", "20260716").iloc[0]
+    assert fly["checkpoint"] == "+5m"
+    assert abs(fly["close_debit_executable"] - 2.0) < 1e-9
     storage.shutdown()
 
 
