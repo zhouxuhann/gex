@@ -263,7 +263,9 @@ class VRPPaperIronFlyExecutor:
             execution = getattr(fill, "execution", None)
             report = getattr(fill, "commissionReport", None)
             value = _finite(getattr(report, "commission", None))
-            if value is not None:
+            # IB often returns a zero placeholder before the actual option
+            # commission report arrives; do not count that as complete.
+            if value is not None and value > 0:
                 commission += value
                 reports += 1
             rows.append({
@@ -326,6 +328,9 @@ class VRPPaperIronFlyExecutor:
         avg_price = _finite(getattr(trade.orderStatus, "avgFillPrice", None))
         actual_credit = -avg_price if filled > 0 and avg_price is not None else None
         fills_json, commission, commission_reports = self._fills_json(trade)
+        if commission_reports == 0:
+            commission = _finite(row.get("actual_commission_dollars")) or 0.0
+            commission_reports = int(row.get("commission_report_count") or 0)
         row.update({
             "status": status, "updated_at": now, "filled_quantity": filled,
             "avg_combo_fill_price": avg_price,
@@ -389,6 +394,9 @@ class VRPPaperIronFlyExecutor:
             avg_price = _finite(getattr(trade.orderStatus, "avgFillPrice", None))
             actual_credit = -avg_price if filled > 0 and avg_price is not None else None
             fills_json, commission, commission_reports = self._fills_json(trade)
+            if commission_reports == 0:
+                commission = _finite(row.get("actual_commission_dollars")) or 0.0
+                commission_reports = int(row.get("commission_report_count") or 0)
             row.update({
                 "status": ib_status, "updated_at": now, "filled_quantity": filled,
                 "avg_combo_fill_price": avg_price,

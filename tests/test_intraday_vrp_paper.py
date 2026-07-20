@@ -364,3 +364,32 @@ def test_restart_recovers_completed_fill_from_ib(tmp_path):
     assert recovered["actual_gross_credit"] == 0.66
     assert recovered["actual_commission_dollars"] == 2.6
     storage.shutdown()
+
+
+def test_zero_placeholder_commission_does_not_erase_confirmed_value(tmp_path):
+    storage = StorageManager(tmp_path)
+    config = IntradayVRPConfig(enabled=True, paper_execution_enabled=True)
+    executor = VRPPaperIronFlyExecutor("QQQ", storage, config)
+    row = {
+        "symbol": "QQQ", "trading_date": "20260720",
+        "order_ref": "VRP_QQQ_20260720_1000_W3", "status": "Filled",
+        "intended_gross_credit": 2.36, "actual_commission_dollars": 2.49,
+        "commission_report_count": 4,
+    }
+    executor._orders[row["order_ref"]] = row
+    trade = SimpleNamespace(
+        order=SimpleNamespace(orderId=1, permId=2),
+        orderStatus=SimpleNamespace(status="Filled", filled=1, avgFillPrice=-2.36),
+        fills=[SimpleNamespace(
+            time=datetime.now(ET), contract=SimpleNamespace(conId=0),
+            execution=SimpleNamespace(side="BOT", shares=1, price=-2.36, execId="bag"),
+            commissionReport=SimpleNamespace(commission=0.0),
+        )],
+    )
+    executor._sync_trade_state(
+        row["order_ref"], trade, now=datetime.now(ET)
+    )
+    saved = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]
+    assert saved["actual_commission_dollars"] == 2.49
+    assert saved["commission_report_count"] == 4
+    storage.shutdown()
