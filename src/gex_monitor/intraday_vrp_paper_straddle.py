@@ -233,7 +233,10 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
                 if key in existing_keys:
                     continue
                 close_cost = _finite(mark.get("close_cost_ask"))
-                exit_fees = _finite(mark.get("estimated_roundtrip_fees_dollars")) or 0.0
+                # The theoretical mark stores round-trip fees (entry + exit).
+                # Paper entry commission is already known and deducted separately,
+                # so only add one configured closing commission here.
+                exit_fees = float(self.config.commission_per_straddle)
                 rows.append({
                     "schema_version": 1, "symbol": self.symbol,
                     "trading_date": date_str, "order_ref": order_ref,

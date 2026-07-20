@@ -210,12 +210,15 @@ def test_paper_short_straddle_fill_mtm_and_expiry_are_separate(tmp_path):
         "symbol": "QQQ", "trading_date": "20260720",
         "scheduled_time": "10:00", "checkpoint": "+5m",
         "checkpoint_at": now + timedelta(minutes=5),
-        "close_cost_ask": 2.00, "estimated_roundtrip_fees_dollars": 1.3,
+        # The source mark contains theoretical entry + exit fees.  The paper MTM
+        # must not add that whole amount after deducting actual entry commission.
+        "close_cost_ask": 2.00, "estimated_roundtrip_fees_dollars": 2.6,
         "status": "ok",
     }])
     executor.poll(ib, now=now + timedelta(minutes=5), ib_port=4002)
     mark = storage.load_vrp_paper_straddle_mtm("QQQ", "20260720").iloc[0]
     assert abs(mark["paper_pnl_dollars"] - 30.4) < 1e-9
+    assert mark["estimated_exit_fees_dollars"] == 1.3
 
     observations = pd.DataFrame([{
         "scheduled_time": "10:00", "terminal_payoff": 1.50,
