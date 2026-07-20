@@ -7,7 +7,7 @@ import math
 from datetime import datetime
 
 import pandas as pd
-from ib_insync import ComboLeg, Contract, LimitOrder
+from ib_insync import ComboLeg, Contract, ExecutionFilter, LimitOrder
 
 from .config import IntradayVRPConfig
 from .storage import StorageManager
@@ -15,7 +15,9 @@ from .time_utils import ET, et_now, trading_date_str
 
 log = logging.getLogger(__name__)
 
-PENDING_STATUSES = {"PendingSubmit", "PreSubmitted", "Submitted", "ApiPending"}
+PENDING_STATUSES = {
+    "PendingSubmit", "PreSubmitted", "Submitted", "ApiPending", "PendingCancel",
+}
 CANCELLED_STATUSES = {"Cancelled", "ApiCancelled", "Inactive"}
 
 
@@ -280,7 +282,29 @@ class VRPPaperIronFlyExecutor:
         for trade in list(ib.openTrades()) + list(ib.trades()):
             if str(getattr(trade.order, "orderRef", "")) == order_ref:
                 return trade
-        return None
+        try:
+            completed = ib.reqCompletedOrders(False)
+        except Exception:
+            completed = []
+        trade = next((item for item in completed
+                      if str(getattr(item.order, "orderRef", "")) == order_ref), None)
+        if trade is None:
+            return None
+        try:
+            fills = [
+                fill for fill in ib.reqExecutions(ExecutionFilter())
+                if str(getattr(fill.execution, "orderRef", "")) == order_ref
+            ]
+        except Exception:
+            fills = []
+        if fills:
+            trade.fills = fills
+            bag_fill = next((fill for fill in fills
+                             if getattr(fill.contract, "secType", "") == "BAG"), None)
+            if bag_fill is not None:
+                trade.orderStatus.filled = _finite(bag_fill.execution.shares) or 0.0
+                trade.orderStatus.avgFillPrice = _finite(bag_fill.execution.avgPrice)
+        return trade
 
     def _sync_trade_state(self, order_ref: str, trade, *, now: datetime) -> None:
         """Persist asynchronous IB order/fill/commission callbacks immediately."""

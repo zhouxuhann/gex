@@ -69,6 +69,12 @@ class FakeIB:
     def cancelOrder(self, order):
         self.trade.orderStatus.status = "Cancelled"
 
+    def reqCompletedOrders(self, api_only):
+        return []
+
+    def reqExecutions(self, execution_filter):
+        return []
+
 
 def _inputs():
     quote = {
@@ -287,4 +293,72 @@ def test_paper_short_straddle_hard_blocks_wrong_port(tmp_path):
     row = storage.load_vrp_paper_straddle_orders("QQQ", "20260720").iloc[0]
     assert row["status"] == "BLOCKED_SAFETY"
     assert not ib.placed
+    storage.shutdown()
+
+
+def test_restart_recovers_completed_fill_from_ib(tmp_path):
+    storage = StorageManager(tmp_path)
+    config = IntradayVRPConfig(
+        enabled=True, paper_execution_enabled=True,
+        paper_entry_slots=["10:00"], paper_iron_fly_width=3,
+    )
+    quote, flies, contracts = _inputs()
+    ib = FakeIB(["DU12345"])
+    first = VRPPaperIronFlyExecutor("QQQ", storage, config)
+    assert first.maybe_submit(
+        ib, contracts, now=quote["observed_at"], ib_port=4002,
+        quote_row=quote, fly_rows=flies,
+    )
+    row = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0].to_dict()
+    row["status"] = "PendingCancel"
+    storage.persist_vrp_paper_order("QQQ", "20260720", row)
+
+    completed = SimpleNamespace(
+        order=ib.trade.order,
+        orderStatus=SimpleNamespace(status="Filled", filled=0, avgFillPrice=0),
+        fills=[],
+    )
+    bag_fill = SimpleNamespace(
+        time=quote["observed_at"], contract=SimpleNamespace(conId=0, secType="BAG"),
+        execution=SimpleNamespace(
+            orderRef=row["order_ref"], side="BOT", shares=1,
+            avgPrice=-0.66, price=-0.66, execId="bag",
+        ),
+        commissionReport=SimpleNamespace(commission=0.0),
+    )
+    leg_fills = [
+        SimpleNamespace(
+            time=quote["observed_at"],
+            contract=SimpleNamespace(conId=index, secType="OPT"),
+            execution=SimpleNamespace(
+                orderRef=row["order_ref"], side="BOT", shares=1,
+                avgPrice=1.0, price=1.0, execId=str(index),
+            ),
+            commissionReport=SimpleNamespace(commission=0.65),
+        ) for index in range(1, 5)
+    ]
+
+    class ReconnectedIB(FakeIB):
+        def openTrades(self):
+            return []
+
+        def trades(self):
+            return []
+
+        def reqCompletedOrders(self, api_only):
+            return [completed]
+
+        def reqExecutions(self, execution_filter):
+            return [bag_fill, *leg_fills]
+
+    second = VRPPaperIronFlyExecutor("QQQ", storage, config)
+    second.poll(
+        ReconnectedIB(["DU12345"]),
+        now=quote["observed_at"] + timedelta(minutes=1), ib_port=4002,
+    )
+    recovered = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]
+    assert recovered["status"] == "Filled"
+    assert recovered["filled_quantity"] == 1
+    assert recovered["actual_gross_credit"] == 0.66
+    assert recovered["actual_commission_dollars"] == 2.6
     storage.shutdown()
