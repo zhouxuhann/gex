@@ -57,7 +57,7 @@ monitoring:
   quality_max_gap_seconds: 60
   quality_max_derived_null_ratio: 0.10
 
-# 0DTE ATM straddle 观测器：只记录报价并在收盘结算，永不下单。
+# 0DTE ATM straddle 观测器与受模拟账户硬锁保护的 Paper 策略。
 intraday_vrp:
   enabled: true
   observation_only: true
@@ -73,8 +73,9 @@ intraday_vrp:
   mtm_checkpoints_minutes: [5, 15, 30, 60]
   mtm_fixed_times_et: ["15:30"]
   vix_cache_seconds: 300
-  # Paper-only Iron Fly experiment. Hard-blocked unless IB port=4002 and account starts DU.
+  # Paper-only experiments. Hard-blocked unless IB port=4002 and account starts DU.
   paper_execution_enabled: true
+  paper_straddle_execution_enabled: true
   paper_required_port: 4002
   paper_entry_slots: ["10:00", "14:00"]
   paper_iron_fly_width: 3

@@ -5,6 +5,7 @@ import pandas as pd
 
 from gex_monitor.config import IntradayVRPConfig
 from gex_monitor.intraday_vrp_paper import VRPPaperIronFlyExecutor
+from gex_monitor.intraday_vrp_paper_straddle import VRPPaperStraddleExecutor
 from gex_monitor.intraday_vrp_report import generate_vrp_report
 from gex_monitor.storage import StorageManager
 from gex_monitor.time_utils import ET
@@ -166,4 +167,89 @@ def test_unfilled_order_is_cancelled_without_chasing(tmp_path):
     cancelled = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]
     assert cancelled["status"] == "Cancelled"
     assert cancelled["filled_quantity"] == 0
+    storage.shutdown()
+
+
+def test_paper_short_straddle_fill_mtm_and_expiry_are_separate(tmp_path):
+    storage = StorageManager(tmp_path)
+    config = IntradayVRPConfig(
+        enabled=True, paper_straddle_execution_enabled=True,
+        paper_entry_slots=["10:00"], paper_order_timeout_seconds=30,
+    )
+    executor = VRPPaperStraddleExecutor("QQQ", storage, config)
+    quote, _, contracts = _inputs()
+    quote.update({"sell_credit_bid": 2.345, "status": "ok"})
+    now = quote["observed_at"]
+    ib = FakeIB(["DU12345"])
+    assert executor.maybe_submit(
+        ib, contracts, now=now, ib_port=4002, quote_row=quote,
+    )
+    bag, order = ib.placed[0]
+    assert order.action == "BUY"
+    assert order.lmtPrice == -2.34
+    assert [leg.action for leg in bag.comboLegs] == ["SELL", "SELL"]
+
+    ib.trade.orderStatus.status = "Filled"
+    ib.trade.orderStatus.filled = 1
+    ib.trade.orderStatus.avgFillPrice = -2.33
+    ib.trade.fills = [
+        SimpleNamespace(
+            time=now, contract=SimpleNamespace(conId=index),
+            execution=SimpleNamespace(side="SLD", shares=1, price=1, execId=str(index)),
+            commissionReport=SimpleNamespace(commission=0.65),
+        ) for index in range(1, 3)
+    ]
+    executor.poll(ib, now=now + timedelta(seconds=3), ib_port=4002)
+    order_row = storage.load_vrp_paper_straddle_orders("QQQ", "20260720").iloc[0]
+    assert order_row["status"] == "Filled"
+    assert order_row["actual_gross_credit"] == 2.33
+    assert order_row["actual_commission_dollars"] == 1.3
+    assert storage.load_vrp_paper_orders("QQQ", "20260720").empty
+
+    storage.persist_vrp_mtm("QQQ", "20260720", [{
+        "symbol": "QQQ", "trading_date": "20260720",
+        "scheduled_time": "10:00", "checkpoint": "+5m",
+        "checkpoint_at": now + timedelta(minutes=5),
+        "close_cost_ask": 2.00, "estimated_roundtrip_fees_dollars": 1.3,
+        "status": "ok",
+    }])
+    executor.poll(ib, now=now + timedelta(minutes=5), ib_port=4002)
+    mark = storage.load_vrp_paper_straddle_mtm("QQQ", "20260720").iloc[0]
+    assert abs(mark["paper_pnl_dollars"] - 30.4) < 1e-9
+
+    observations = pd.DataFrame([{
+        "scheduled_time": "10:00", "terminal_payoff": 1.50,
+        "settled_at": now + timedelta(hours=6), "settlement_price": 726.5,
+    }])
+    assert executor.settle("20260720", observations) == 1
+    settled = storage.load_vrp_paper_straddle_orders("QQQ", "20260720").iloc[0]
+    assert settled["status"] == "EXPIRED"
+    assert abs(settled["paper_realized_pnl_dollars"] - 81.7) < 1e-9
+    assert bool(settled["commission_complete"])
+    report = generate_vrp_report(tmp_path, "QQQ")
+    assert "paper_short_straddle" in set(report["strategy"])
+    overall = report[
+        (report["strategy"] == "paper_short_straddle") &
+        (report["dimension"] == "overall")
+    ].iloc[0]
+    assert overall["sizing_reason"] == "unbounded_strategy"
+    storage.shutdown()
+
+
+def test_paper_short_straddle_hard_blocks_wrong_port(tmp_path):
+    storage = StorageManager(tmp_path)
+    config = IntradayVRPConfig(
+        enabled=True, paper_straddle_execution_enabled=True,
+        paper_entry_slots=["10:00"],
+    )
+    executor = VRPPaperStraddleExecutor("QQQ", storage, config)
+    quote, _, contracts = _inputs()
+    quote.update({"sell_credit_bid": 2.30, "status": "ok"})
+    ib = FakeIB(["DU12345"])
+    assert not executor.maybe_submit(
+        ib, contracts, now=quote["observed_at"], ib_port=4001, quote_row=quote,
+    )
+    row = storage.load_vrp_paper_straddle_orders("QQQ", "20260720").iloc[0]
+    assert row["status"] == "BLOCKED_SAFETY"
+    assert not ib.placed
     storage.shutdown()

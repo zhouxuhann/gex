@@ -157,9 +157,13 @@ class IBWorker:
             self._vrp_monitor = IntradayVRPMonitor(
                 self.symbol, self.storage, intraday_vrp_config
             )
-            mode = ('observation + PAPER Iron Fly execution'
-                    if intraday_vrp_config.paper_execution_enabled else
-                    'observation only')
+            paper_modes = []
+            if intraday_vrp_config.paper_execution_enabled:
+                paper_modes.append('Iron Fly')
+            if intraday_vrp_config.paper_straddle_execution_enabled:
+                paper_modes.append('short Straddle')
+            mode = ('observation + PAPER ' + ' + '.join(paper_modes) + ' execution'
+                    if paper_modes else 'observation only')
             self._log('info', f'Intraday VRP enabled ({mode})')
 
     def _load_prev_oi(self) -> None:

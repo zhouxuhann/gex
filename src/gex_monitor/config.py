@@ -91,7 +91,7 @@ class MonitoringConfig(BaseModel):
 
 
 class IntradayVRPConfig(BaseModel):
-    """0DTE VRP 观测器；可显式启用受硬锁保护的 Paper Iron Fly。"""
+    """0DTE VRP 观测器；可显式启用受硬锁保护的 Paper 策略。"""
     enabled: bool = False
     observation_only: bool = True
     symbols: list[str] = Field(default_factory=lambda: ["QQQ"])
@@ -110,6 +110,7 @@ class IntradayVRPConfig(BaseModel):
     mtm_fixed_times_et: list[str] = Field(default_factory=lambda: ["15:30"])
     vix_cache_seconds: int = 300
     paper_execution_enabled: bool = False
+    paper_straddle_execution_enabled: bool = False
     paper_required_port: int = 4002
     paper_entry_slots: list[str] = Field(default_factory=lambda: ["10:00", "14:00"])
     paper_iron_fly_width: float = 3.0

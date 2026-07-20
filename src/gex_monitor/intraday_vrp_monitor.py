@@ -1,6 +1,6 @@
 """0DTE ATM straddle 日内观测器。
 
-本模块以测量为主；可选的执行路径仅允许严格校验后的 IB Paper Iron Fly。
+本模块以测量为主；可选执行路径仅允许严格校验后的 IB Paper 策略。
 原始报价与结算结果分开保存，方便以后修改公式后重建 observations。
 """
 from __future__ import annotations
@@ -17,6 +17,7 @@ from .config import IntradayVRPConfig
 from .intraday_vrp_audit import build_vrp_daily_audit, write_vrp_daily_audit
 from .intraday_vrp_report import generate_vrp_report
 from .intraday_vrp_paper import VRPPaperIronFlyExecutor
+from .intraday_vrp_paper_straddle import VRPPaperStraddleExecutor
 from .storage import StorageManager, read_parquet_et
 from .time_utils import ET, et_now, trading_date_str
 from .vrp_context import VRPEventCalendar, opex_context, path_features
@@ -76,6 +77,7 @@ class IntradayVRPMonitor:
         self._previous_close_cache: dict[str, float | None] = {}
         self._surface_context_cache: dict[str, dict] = {}
         self._paper_executor = VRPPaperIronFlyExecutor(symbol, storage, config)
+        self._paper_straddle_executor = VRPPaperStraddleExecutor(symbol, storage, config)
 
     def _load_recorded(self, date_str: str) -> None:
         if self._recorded_date == date_str:
@@ -104,6 +106,7 @@ class IntradayVRPMonitor:
                       ib_port: int | None = None) -> bool:
         self._capture_mtm_checkpoints(ib, contracts, now=now, expiry=expiry)
         self._paper_executor.poll(ib, now=now, ib_port=ib_port)
+        self._paper_straddle_executor.poll(ib, now=now, ib_port=ib_port)
         due = self.due_slot(now)
         if due is None:
             return False
@@ -132,6 +135,9 @@ class IntradayVRPMonitor:
         self._paper_executor.maybe_submit(
             ib, contracts, now=now, ib_port=ib_port,
             quote_row=row, fly_rows=fly_rows,
+        )
+        self._paper_straddle_executor.maybe_submit(
+            ib, contracts, now=now, ib_port=ib_port, quote_row=row,
         )
         self._recorded.add(slot)
         log.info("[%s] VRP %s recorded status=%s strike=%s wings=%s flies=%s",
@@ -871,13 +877,18 @@ class IntradayVRPMonitor:
             self.symbol, date_str
         )
         paper_count = self._paper_executor.settle(date_str, fly_observations)
+        paper_straddle_count = self._paper_straddle_executor.settle(
+            date_str, self.storage.load_vrp_observations(self.symbol, date_str)
+        )
         self.audit_date(date_str)
         try:
             generate_vrp_report(self.storage.data_dir, self.symbol)
         except Exception as exc:
             log.warning("[%s] VRP cross-day report failed: %s", self.symbol, exc)
-        log.info("[%s] VRP settled %s: %s straddles, %s iron flies, %s paper (%s)",
-                 self.symbol, date_str, len(rows), fly_count, paper_count, source)
+        log.info("[%s] VRP settled %s: %s straddles, %s iron flies, "
+                 "%s paper flies, %s paper straddles (%s)",
+                 self.symbol, date_str, len(rows), fly_count, paper_count,
+                 paper_straddle_count, source)
         return len(rows)
 
     def _settle_iron_flies(self, *, date_str: str, settlement_price: float,
@@ -983,6 +994,12 @@ class IntradayVRPMonitor:
         iron_fly_mtm = self.storage.load_vrp_iron_fly_mtm(self.symbol, date_str)
         paper_orders = self.storage.load_vrp_paper_orders(self.symbol, date_str)
         paper_mtm = self.storage.load_vrp_paper_mtm(self.symbol, date_str)
+        paper_straddle_orders = self.storage.load_vrp_paper_straddle_orders(
+            self.symbol, date_str
+        )
+        paper_straddle_mtm = self.storage.load_vrp_paper_straddle_mtm(
+            self.symbol, date_str
+        )
         report = build_vrp_daily_audit(
             symbol=self.symbol,
             date_str=date_str,
@@ -993,6 +1010,8 @@ class IntradayVRPMonitor:
             iron_fly_mtm=iron_fly_mtm,
             paper_orders=paper_orders,
             paper_mtm=paper_mtm,
+            paper_straddle_orders=paper_straddle_orders,
+            paper_straddle_mtm=paper_straddle_mtm,
         )
         path = write_vrp_daily_audit(report, self.storage.data_dir)
         level = logging.INFO if report["quality"] == "good" else logging.WARNING

@@ -124,6 +124,9 @@ def generate_vrp_report(data_dir: Path | str, symbol: str) -> pd.DataFrame:
     straddles = _load_many(data_dir, f"vrp_observations_{symbol}_*.parquet")
     flies = _load_many(data_dir, f"vrp_iron_fly_observations_{symbol}_*.parquet")
     paper = _load_many(data_dir, f"vrp_paper_orders_{symbol}_*.parquet")
+    paper_straddles = _load_many(
+        data_dir, f"vrp_paper_straddle_orders_{symbol}_*.parquet"
+    )
     rows = []
     if not straddles.empty and "pnl_executable" in straddles:
         if "status" in straddles:
@@ -148,6 +151,16 @@ def generate_vrp_report(data_dir: Path | str, symbol: str) -> pd.DataFrame:
             paper.get("paper_return_on_max_risk"), errors="coerce"
         )
         rows.extend(_group_rows(paper, "paper_iron_fly", bounded=True))
+    if not paper_straddles.empty and "paper_realized_pnl_dollars" in paper_straddles:
+        paper_straddles = paper_straddles[
+            paper_straddles["status"] == "EXPIRED"
+        ].copy()
+        paper_straddles["pnl_dollars"] = pd.to_numeric(
+            paper_straddles["paper_realized_pnl_dollars"], errors="coerce"
+        )
+        rows.extend(_group_rows(
+            paper_straddles, "paper_short_straddle", bounded=False
+        ))
     report = pd.DataFrame(rows)
     if report.empty:
         return report
