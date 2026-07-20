@@ -343,7 +343,9 @@ def test_restart_recovers_completed_fill_from_ib(tmp_path):
             return []
 
         def trades(self):
-            return []
+            # IB may expose a CompletedOrder in trades() with status Filled but
+            # zero quantity/price; the executor must hydrate it from Executions.
+            return [completed]
 
         def reqCompletedOrders(self, api_only):
             return [completed]

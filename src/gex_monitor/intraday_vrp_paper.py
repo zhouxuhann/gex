@@ -281,7 +281,7 @@ class VRPPaperIronFlyExecutor:
         order_ref = str(row["order_ref"])
         for trade in list(ib.openTrades()) + list(ib.trades()):
             if str(getattr(trade.order, "orderRef", "")) == order_ref:
-                return trade
+                return self._hydrate_completed_fill(ib, trade, order_ref)
         try:
             completed = ib.reqCompletedOrders(False)
         except Exception:
@@ -290,6 +290,16 @@ class VRPPaperIronFlyExecutor:
                       if str(getattr(item.order, "orderRef", "")) == order_ref), None)
         if trade is None:
             return None
+        return self._hydrate_completed_fill(ib, trade, order_ref)
+
+    @staticmethod
+    def _hydrate_completed_fill(ib, trade, order_ref: str):
+        """Merge CompletedOrder metadata with Executions quantity and price."""
+        status = str(getattr(trade.orderStatus, "status", ""))
+        filled = _finite(getattr(trade.orderStatus, "filled", 0)) or 0.0
+        existing_fills = list(getattr(trade, "fills", []) or [])
+        if status != "Filled" or (filled > 0 and existing_fills):
+            return trade
         try:
             fills = [
                 fill for fill in ib.reqExecutions(ExecutionFilter())
