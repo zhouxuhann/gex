@@ -38,6 +38,7 @@ class VRPPaperIronFlyExecutor:
         self._date: str | None = None
         self._orders: dict[str, dict] = {}
         self._active: dict[str, object] = {}
+        self._attached_events: set[str] = set()
 
     @staticmethod
     def _order_ref(symbol: str, date_str: str, slot: str, width: float) -> str:
@@ -52,6 +53,7 @@ class VRPPaperIronFlyExecutor:
             for row in frame.to_dict("records") if row.get("order_ref")
         }
         self._active = {}
+        self._attached_events = set()
         self._date = date_str
 
     def _save(self, row: dict) -> None:
@@ -82,6 +84,26 @@ class VRPPaperIronFlyExecutor:
             if strike is not None and right in {"C", "P"} and con_id > 0:
                 result[(strike, right)] = contract
         return result
+
+    def _fresh_quote(self, ib, contract, *, now: datetime) -> dict:
+        """Read the latest subscribed NBBO immediately before order submission."""
+        ticker = ib.ticker(contract)
+        bid = _finite(getattr(ticker, "bid", None)) if ticker is not None else None
+        ask = _finite(getattr(ticker, "ask", None)) if ticker is not None else None
+        timestamp = getattr(ticker, "time", None) if ticker is not None else None
+        age = None
+        if isinstance(timestamp, datetime):
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=ET)
+            age = max(0.0, (now - timestamp.astimezone(ET)).total_seconds())
+        if bid is None or ask is None or bid < 0 or ask < bid:
+            status = "invalid_nbbo"
+        elif age is None or age > self.config.max_quote_age_seconds:
+            status = "stale_quote"
+        else:
+            status = "ok"
+        return {"bid": bid, "ask": ask, "timestamp": timestamp,
+                "age_seconds": age, "status": status}
 
     def maybe_submit(self, ib, contracts: list, *, now: datetime, ib_port: int | None,
                      quote_row: dict, fly_rows: list[dict]) -> bool:
@@ -128,6 +150,7 @@ class VRPPaperIronFlyExecutor:
             "intended_gross_credit": fly["gross_net_credit"],
             "intended_net_credit_after_fees": fly["net_credit_after_fees"],
             "max_loss_dollars_at_intent": fly["max_loss_dollars"],
+            "snapshot_gross_credit": fly["gross_net_credit"],
         })
         account, reason = self._paper_account(ib, ib_port)
         if reason:
@@ -149,6 +172,36 @@ class VRPPaperIronFlyExecutor:
             self._save(row)
             return False
         atm_call, atm_put, lower_put, upper_call = legs
+        priced_at = et_now()
+        fresh = {
+            "atm_call": self._fresh_quote(ib, atm_call, now=priced_at),
+            "atm_put": self._fresh_quote(ib, atm_put, now=priced_at),
+            "lower_put": self._fresh_quote(ib, lower_put, now=priced_at),
+            "upper_call": self._fresh_quote(ib, upper_call, now=priced_at),
+        }
+        bad = {name: value["status"] for name, value in fresh.items()
+               if value["status"] != "ok"}
+        if bad:
+            row.update({"status": "SKIPPED_STALE_SUBMIT_QUOTE",
+                        "failure_reason": json.dumps(bad, sort_keys=True),
+                        "submit_quote_at": priced_at})
+            self._save(row)
+            return False
+        credit = (
+            fresh["atm_call"]["bid"] + fresh["atm_put"]["bid"]
+            - fresh["lower_put"]["ask"] - fresh["upper_call"]["ask"]
+        )
+        row.update({
+            "submit_quote_at": priced_at,
+            "submit_quote_json": json.dumps(fresh, sort_keys=True, default=str),
+            "intended_gross_credit": credit,
+            "intended_net_credit_after_fees": (
+                credit - self.config.commission_per_straddle * 2 / 100.0
+            ),
+            "max_loss_dollars_at_intent": (
+                width - credit + self.config.commission_per_straddle * 2 / 100.0
+            ) * 100,
+        })
         bag = Contract(
             secType="BAG", symbol=self.symbol, currency="USD", exchange="SMART",
             comboLegs=[
@@ -158,7 +211,6 @@ class VRPPaperIronFlyExecutor:
                 ComboLeg(conId=upper_call.conId, ratio=1, action="BUY", exchange="SMART"),
             ],
         )
-        credit = _finite(fly.get("gross_net_credit"))
         if credit is None or credit <= 0:
             row.update({"status": "SKIPPED_NONPOSITIVE_CREDIT",
                         "failure_reason": f"credit={credit}"})
@@ -181,6 +233,7 @@ class VRPPaperIronFlyExecutor:
             ], sort_keys=True),
         })
         self._save(row)
+        submitted_at = et_now()
         try:
             trade = ib.placeOrder(bag, order)
         except Exception as exc:
@@ -190,12 +243,13 @@ class VRPPaperIronFlyExecutor:
             return False
         row.update({
             "status": str(getattr(trade.orderStatus, "status", "PendingSubmit")),
-            "submitted_at": now, "updated_at": now,
+            "submitted_at": submitted_at, "updated_at": submitted_at,
             "order_id": getattr(trade.order, "orderId", None),
             "perm_id": getattr(trade.order, "permId", None),
         })
         self._active[order_ref] = trade
         self._save(row)
+        self._attach_trade_events(order_ref, trade)
         log.warning("[%s] PAPER Iron Fly submitted %s limit_credit=%.2f",
                     self.symbol, order_ref, -limit_price)
         return True
@@ -228,6 +282,56 @@ class VRPPaperIronFlyExecutor:
                 return trade
         return None
 
+    def _sync_trade_state(self, order_ref: str, trade, *, now: datetime) -> None:
+        """Persist asynchronous IB order/fill/commission callbacks immediately."""
+        row = self._orders.get(order_ref)
+        if row is None:
+            return
+        status = str(getattr(trade.orderStatus, "status", row.get("status", "")))
+        filled = _finite(getattr(trade.orderStatus, "filled", 0)) or 0.0
+        avg_price = _finite(getattr(trade.orderStatus, "avgFillPrice", None))
+        actual_credit = -avg_price if filled > 0 and avg_price is not None else None
+        fills_json, commission, commission_reports = self._fills_json(trade)
+        row.update({
+            "status": status, "updated_at": now, "filled_quantity": filled,
+            "avg_combo_fill_price": avg_price,
+            "actual_gross_credit": actual_credit,
+            "actual_commission_dollars": commission,
+            "commission_report_count": commission_reports,
+            "fills_json": fills_json,
+            "order_id": getattr(trade.order, "orderId", row.get("order_id")),
+            "perm_id": getattr(trade.order, "permId", row.get("perm_id")),
+        })
+        actual = actual_credit
+        intended = _finite(row.get("intended_gross_credit"))
+        row["credit_slippage"] = (
+            actual - intended if actual is not None and intended is not None else None
+        )
+        if status == "Filled" and filled >= self.config.paper_quantity:
+            row.setdefault("filled_at", now)
+        self._save(row)
+
+    def _attach_trade_events(self, order_ref: str, trade) -> None:
+        if order_ref in self._attached_events:
+            return
+
+        def persist(*_args) -> None:
+            try:
+                self._sync_trade_state(order_ref, trade, now=et_now())
+            except Exception:
+                log.exception("[%s] Failed to persist paper order event %s",
+                              self.symbol, order_ref)
+
+        attached = False
+        for name in ("statusEvent", "fillEvent", "commissionReportEvent"):
+            event = getattr(trade, name, None)
+            if event is None:
+                continue
+            event += persist
+            attached = True
+        if attached:
+            self._attached_events.add(order_ref)
+
     def poll(self, ib, *, now: datetime, ib_port: int | None) -> None:
         if not self.config.paper_execution_enabled:
             return
@@ -245,21 +349,22 @@ class VRPPaperIronFlyExecutor:
                     self._save(row)
                 continue
             self._active[order_ref] = trade
+            self._attach_trade_events(order_ref, trade)
             ib_status = str(getattr(trade.orderStatus, "status", status))
             filled = _finite(getattr(trade.orderStatus, "filled", 0)) or 0.0
             avg_price = _finite(getattr(trade.orderStatus, "avgFillPrice", None))
+            actual_credit = -avg_price if filled > 0 and avg_price is not None else None
             fills_json, commission, commission_reports = self._fills_json(trade)
             row.update({
                 "status": ib_status, "updated_at": now, "filled_quantity": filled,
                 "avg_combo_fill_price": avg_price,
-                "actual_gross_credit": -avg_price if avg_price is not None else None,
+                "actual_gross_credit": actual_credit,
                 "actual_commission_dollars": commission,
                 "commission_report_count": commission_reports,
                 "fills_json": fills_json,
                 "order_id": getattr(trade.order, "orderId", row.get("order_id")),
                 "perm_id": getattr(trade.order, "permId", row.get("perm_id")),
             })
-            actual_credit = row.get("actual_gross_credit")
             intended = _finite(row.get("intended_gross_credit"))
             row["credit_slippage"] = (actual_credit - intended
                                       if actual_credit is not None and intended is not None

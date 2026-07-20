@@ -27,7 +27,27 @@ class FakeIB:
     def managedAccounts(self):
         return self.accounts
 
+    def ticker(self, contract):
+        quotes = {
+            1: (1.172, 1.18), 2: (1.173, 1.18),
+            3: (0.79, 0.80), 4: (0.86, 0.871),
+        }
+        bid, ask = quotes[contract.conId]
+        return SimpleNamespace(bid=bid, ask=ask, time=datetime.now(ET))
+
     def placeOrder(self, bag, order):
+        class FakeEvent:
+            def __init__(self):
+                self.handlers = []
+
+            def __iadd__(self, handler):
+                self.handlers.append(handler)
+                return self
+
+            def emit(self, *args):
+                for handler in list(self.handlers):
+                    handler(*args)
+
         self.placed.append((bag, order))
         self.trade = SimpleNamespace(
             contract=bag, order=order,
@@ -35,6 +55,8 @@ class FakeIB:
                 status="Submitted", filled=0, avgFillPrice=0,
             ),
             fills=[],
+            statusEvent=FakeEvent(), fillEvent=FakeEvent(),
+            commissionReportEvent=FakeEvent(),
         )
         return self.trade
 
@@ -114,7 +136,7 @@ def test_paper_combo_fill_mtm_and_expiry_are_recorded(tmp_path):
             commissionReport=SimpleNamespace(commission=0.65),
         ) for index in range(1, 5)
     ]
-    executor.poll(ib, now=now + timedelta(seconds=3), ib_port=4002)
+    ib.trade.statusEvent.emit(ib.trade)
     order_row = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]
     assert order_row["status"] == "Filled"
     assert order_row["actual_gross_credit"] == 0.66
@@ -160,10 +182,16 @@ def test_unfilled_order_is_cancelled_without_chasing(tmp_path):
     assert executor.maybe_submit(
         ib, contracts, now=now, ib_port=4002, quote_row=quote, fly_rows=flies,
     )
-    executor.poll(ib, now=now + timedelta(seconds=31), ib_port=4002)
+    submitted = pd.Timestamp(
+        storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]["submitted_at"]
+    ).to_pydatetime()
+    executor.poll(ib, now=submitted + timedelta(seconds=29), ib_port=4002)
+    waiting = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]
+    assert waiting["status"] == "Submitted"
+    executor.poll(ib, now=submitted + timedelta(seconds=31), ib_port=4002)
     requested = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]
     assert requested["status"] == "CancelRequested"
-    executor.poll(ib, now=now + timedelta(seconds=34), ib_port=4002)
+    executor.poll(ib, now=submitted + timedelta(seconds=34), ib_port=4002)
     cancelled = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]
     assert cancelled["status"] == "Cancelled"
     assert cancelled["filled_quantity"] == 0
@@ -178,7 +206,8 @@ def test_paper_short_straddle_fill_mtm_and_expiry_are_separate(tmp_path):
     )
     executor = VRPPaperStraddleExecutor("QQQ", storage, config)
     quote, _, contracts = _inputs()
-    quote.update({"sell_credit_bid": 2.345, "status": "ok"})
+    # Persisted snapshot is deliberately stale; submit-time NBBO is 2.345.
+    quote.update({"sell_credit_bid": 2.50, "status": "ok"})
     now = quote["observed_at"]
     ib = FakeIB(["DU12345"])
     assert executor.maybe_submit(
@@ -188,6 +217,9 @@ def test_paper_short_straddle_fill_mtm_and_expiry_are_separate(tmp_path):
     assert order.action == "BUY"
     assert order.lmtPrice == -2.34
     assert [leg.action for leg in bag.comboLegs] == ["SELL", "SELL"]
+    intent = storage.load_vrp_paper_straddle_orders("QQQ", "20260720").iloc[0]
+    assert intent["snapshot_gross_credit"] == 2.50
+    assert abs(intent["intended_gross_credit"] - 2.345) < 1e-9
 
     ib.trade.orderStatus.status = "Filled"
     ib.trade.orderStatus.filled = 1

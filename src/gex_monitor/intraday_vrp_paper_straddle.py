@@ -42,6 +42,7 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
             for row in frame.to_dict("records") if row.get("order_ref")
         }
         self._active = {}
+        self._attached_events = set()
         self._date = date_str
 
     def _save(self, row: dict) -> None:
@@ -93,6 +94,7 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
             self._save(row)
             return False
         row["intended_gross_credit"] = credit
+        row["snapshot_gross_credit"] = credit
         row["intended_net_credit_after_fees"] = (
             credit - self.config.commission_per_straddle / 100.0
         )
@@ -113,6 +115,30 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
                         "failure_reason": f"missing_atm_contracts:{atm}"})
             self._save(row)
             return False
+        priced_at = et_now()
+        fresh_call = self._fresh_quote(ib, atm_call, now=priced_at)
+        fresh_put = self._fresh_quote(ib, atm_put, now=priced_at)
+        bad = {name: value["status"] for name, value in {
+            "atm_call": fresh_call, "atm_put": fresh_put
+        }.items() if value["status"] != "ok"}
+        if bad:
+            row.update({"status": "SKIPPED_STALE_SUBMIT_QUOTE",
+                        "failure_reason": json.dumps(bad, sort_keys=True),
+                        "submit_quote_at": priced_at})
+            self._save(row)
+            return False
+        credit = fresh_call["bid"] + fresh_put["bid"]
+        row.update({
+            "submit_quote_at": priced_at,
+            "submit_quote_json": json.dumps(
+                {"atm_call": fresh_call, "atm_put": fresh_put},
+                sort_keys=True, default=str,
+            ),
+            "intended_gross_credit": credit,
+            "intended_net_credit_after_fees": (
+                credit - self.config.commission_per_straddle / 100.0
+            ),
+        })
         bag = Contract(
             secType="BAG", symbol=self.symbol, currency="USD", exchange="SMART",
             comboLegs=[
@@ -134,6 +160,7 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
             ], sort_keys=True),
         })
         self._save(row)
+        submitted_at = et_now()
         try:
             trade = ib.placeOrder(bag, order)
         except Exception as exc:
@@ -143,12 +170,13 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
             return False
         row.update({
             "status": str(getattr(trade.orderStatus, "status", "PendingSubmit")),
-            "submitted_at": now, "updated_at": now,
+            "submitted_at": submitted_at, "updated_at": submitted_at,
             "order_id": getattr(trade.order, "orderId", None),
             "perm_id": getattr(trade.order, "permId", None),
         })
         self._active[order_ref] = trade
         self._save(row)
+        self._attach_trade_events(order_ref, trade)
         log.warning("[%s] PAPER short Straddle submitted %s limit_credit=%.2f",
                     self.symbol, order_ref, -limit_price)
         return True
@@ -170,21 +198,23 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
                     self._save(row)
                 continue
             self._active[order_ref] = trade
+            self._attach_trade_events(order_ref, trade)
             ib_status = str(getattr(trade.orderStatus, "status", status))
             filled = _finite(getattr(trade.orderStatus, "filled", 0)) or 0.0
             avg_price = _finite(getattr(trade.orderStatus, "avgFillPrice", None))
+            actual_credit = -avg_price if filled > 0 and avg_price is not None else None
             fills_json, commission, commission_reports = self._fills_json(trade)
             row.update({
                 "status": ib_status, "updated_at": now, "filled_quantity": filled,
                 "avg_combo_fill_price": avg_price,
-                "actual_gross_credit": -avg_price if avg_price is not None else None,
+                "actual_gross_credit": actual_credit,
                 "actual_commission_dollars": commission,
                 "commission_report_count": commission_reports,
                 "fills_json": fills_json,
                 "order_id": getattr(trade.order, "orderId", row.get("order_id")),
                 "perm_id": getattr(trade.order, "permId", row.get("perm_id")),
             })
-            actual = row.get("actual_gross_credit")
+            actual = actual_credit
             intended = _finite(row.get("intended_gross_credit"))
             row["credit_slippage"] = (
                 actual - intended if actual is not None and intended is not None else None
