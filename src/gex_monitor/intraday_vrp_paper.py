@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import time
 from datetime import datetime
 
 import pandas as pd
@@ -107,6 +108,34 @@ class VRPPaperIronFlyExecutor:
         return {"bid": bid, "ask": ask, "timestamp": timestamp,
                 "age_seconds": age, "status": status}
 
+    def _refresh_submit_quotes(self, ib, contracts: dict[str, object]
+                               ) -> tuple[datetime, dict[str, dict], float]:
+        """Give already-subscribed legs a short grace period to publish fresh NBBO."""
+        started = time.monotonic()
+        priced_at = et_now()
+        quotes = {name: self._fresh_quote(ib, contract, now=priced_at)
+                  for name, contract in contracts.items()}
+        wait_budget = max(0.0, float(self.config.paper_quote_refresh_seconds))
+        if all(item["status"] == "ok" for item in quotes.values()) or wait_budget == 0:
+            return priced_at, quotes, 0.0
+        for contract in contracts.values():
+            try:
+                ib.reqMktData(contract, genericTickList="", snapshot=False)
+            except Exception:
+                pass
+        deadline = started + wait_budget
+        while time.monotonic() < deadline:
+            try:
+                ib.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+            except Exception:
+                break
+            priced_at = et_now()
+            quotes = {name: self._fresh_quote(ib, contract, now=priced_at)
+                      for name, contract in contracts.items()}
+            if all(item["status"] == "ok" for item in quotes.values()):
+                break
+        return priced_at, quotes, max(0.0, time.monotonic() - started)
+
     def maybe_submit(self, ib, contracts: list, *, now: datetime, ib_port: int | None,
                      quote_row: dict, fly_rows: list[dict]) -> bool:
         if not self.config.paper_execution_enabled:
@@ -174,19 +203,17 @@ class VRPPaperIronFlyExecutor:
             self._save(row)
             return False
         atm_call, atm_put, lower_put, upper_call = legs
-        priced_at = et_now()
-        fresh = {
-            "atm_call": self._fresh_quote(ib, atm_call, now=priced_at),
-            "atm_put": self._fresh_quote(ib, atm_put, now=priced_at),
-            "lower_put": self._fresh_quote(ib, lower_put, now=priced_at),
-            "upper_call": self._fresh_quote(ib, upper_call, now=priced_at),
-        }
+        priced_at, fresh, refresh_wait = self._refresh_submit_quotes(ib, {
+            "atm_call": atm_call, "atm_put": atm_put,
+            "lower_put": lower_put, "upper_call": upper_call,
+        })
         bad = {name: value["status"] for name, value in fresh.items()
                if value["status"] != "ok"}
         if bad:
             row.update({"status": "SKIPPED_STALE_SUBMIT_QUOTE",
                         "failure_reason": json.dumps(bad, sort_keys=True),
-                        "submit_quote_at": priced_at})
+                        "submit_quote_at": priced_at,
+                        "submit_quote_refresh_seconds": refresh_wait})
             self._save(row)
             return False
         credit = (
@@ -195,6 +222,7 @@ class VRPPaperIronFlyExecutor:
         )
         row.update({
             "submit_quote_at": priced_at,
+            "submit_quote_refresh_seconds": refresh_wait,
             "submit_quote_json": json.dumps(fresh, sort_keys=True, default=str),
             "intended_gross_credit": credit,
             "intended_net_credit_after_fees": (
@@ -433,10 +461,10 @@ class VRPPaperIronFlyExecutor:
         if marks.empty:
             return
         existing = self.storage.load_vrp_paper_mtm(self.symbol, date_str)
-        existing_keys = set(zip(
-            existing.get("order_ref", pd.Series(dtype=str)).astype(str),
-            existing.get("checkpoint", pd.Series(dtype=str)).astype(str),
-        ))
+        existing_by_key = {
+            (str(row.get("order_ref")), str(row.get("checkpoint"))): row
+            for row in existing.to_dict("records")
+        }
         rows = []
         for order_ref, order in self._orders.items():
             if str(order.get("status")) not in {"Filled", "EXPIRED"}:
@@ -453,7 +481,11 @@ class VRPPaperIronFlyExecutor:
             ]
             for mark in matching.to_dict("records"):
                 key = (order_ref, str(mark["checkpoint"]))
-                if key in existing_keys:
+                old = existing_by_key.get(key)
+                if (old is not None
+                        and _finite(old.get("actual_entry_credit")) == credit
+                        and (_finite(old.get("actual_entry_commission_dollars")) or 0.0)
+                        == commission):
                     continue
                 close_debit = _finite(mark.get("close_debit_executable"))
                 exit_fees = _finite(mark.get("estimated_exit_fees_dollars")) or 0.0
@@ -472,8 +504,104 @@ class VRPPaperIronFlyExecutor:
                     if close_debit is not None else None,
                     "status": "ok",
                 })
-                existing_keys.add(key)
+                existing_by_key[key] = rows[-1]
         self.storage.persist_vrp_paper_mtm(self.symbol, date_str, rows)
+        self._update_mtm_risk_metrics(
+            self.storage.load_vrp_paper_mtm(self.symbol, date_str)
+        )
+
+    @staticmethod
+    def _risk_metrics(marks: pd.DataFrame, credit: float) -> dict:
+        """Summarize the observed path and measurement-only exit scenarios."""
+        if marks.empty:
+            return {"paper_mtm_points": 0}
+        frame = marks.copy()
+        frame["paper_pnl_dollars"] = pd.to_numeric(
+            frame.get("paper_pnl_dollars"), errors="coerce"
+        )
+        frame["checkpoint_at"] = pd.to_datetime(
+            frame.get("checkpoint_at"), errors="coerce", utc=True
+        )
+        frame = frame.dropna(subset=["paper_pnl_dollars"]).sort_values("checkpoint_at")
+        if frame.empty:
+            return {"paper_mtm_points": 0}
+        pnl = frame["paper_pnl_dollars"]
+        mfe = frame.loc[pnl.idxmax()]
+        mae = frame.loc[pnl.idxmin()]
+        drawdown = pnl.cummax() - pnl
+        result = {
+            "paper_mtm_points": int(len(frame)),
+            "paper_max_favorable_pnl_dollars": float(mfe["paper_pnl_dollars"]),
+            "paper_max_favorable_at": mfe.get("checkpoint_at"),
+            "paper_max_adverse_pnl_dollars": float(mae["paper_pnl_dollars"]),
+            "paper_max_adverse_at": mae.get("checkpoint_at"),
+            "paper_max_drawdown_dollars": float(drawdown.max()),
+        }
+        thresholds = {
+            "tp25": (pnl >= credit * 25.0),
+            "tp50": (pnl >= credit * 50.0),
+            "stop_1x_credit": (pnl <= -credit * 100.0),
+            "stop_2x_credit": (pnl <= -credit * 200.0),
+        }
+        for name, hit in thresholds.items():
+            if bool(hit.any()):
+                first = frame.loc[hit].iloc[0]
+                result[f"hypothetical_{name}_at"] = first.get("checkpoint_at")
+                result[f"hypothetical_{name}_pnl_dollars"] = float(
+                    first["paper_pnl_dollars"]
+                )
+        close_mark = frame[frame["checkpoint"].astype(str) == "15:30"]
+        if not close_mark.empty:
+            first = close_mark.iloc[0]
+            result["hypothetical_1530_exit_at"] = first.get("checkpoint_at")
+            result["hypothetical_1530_exit_pnl_dollars"] = float(
+                first["paper_pnl_dollars"]
+            )
+        return result
+
+    def _update_mtm_risk_metrics(self, all_marks: pd.DataFrame) -> None:
+        if all_marks.empty:
+            return
+        for order_ref, order in list(self._orders.items()):
+            if str(order.get("status")) not in {"Filled", "EXPIRED"}:
+                continue
+            credit = _finite(order.get("actual_gross_credit"))
+            if credit is None:
+                continue
+            matching = all_marks[all_marks["order_ref"].astype(str) == order_ref]
+            order.update(self._risk_metrics(matching, credit))
+            self._save(order)
+
+    @staticmethod
+    def _apply_observation_path_fields(row: dict, observation: pd.Series,
+                                       marks: pd.DataFrame) -> None:
+        for field in (
+            "first_breakeven_breach_at", "first_wing_touch_at",
+            "worst_path_pnl_dollars", "worst_path_at",
+        ):
+            value = observation.get(field)
+            if value is not None and not pd.isna(value):
+                row[field] = value
+        breach = observation.get("first_breakeven_breach_at")
+        if breach is None or pd.isna(breach) or marks.empty:
+            return
+        breach_at = pd.to_datetime(breach, errors="coerce", utc=True)
+        if pd.isna(breach_at):
+            return
+        frame = marks.copy()
+        frame["checkpoint_at"] = pd.to_datetime(
+            frame.get("checkpoint_at"), errors="coerce", utc=True
+        )
+        frame = frame[
+            (frame["order_ref"].astype(str) == str(row["order_ref"])) &
+            (frame["checkpoint_at"] >= breach_at)
+        ].sort_values("checkpoint_at")
+        if not frame.empty:
+            first = frame.iloc[0]
+            row["hypothetical_breakeven_exit_at"] = first.get("checkpoint_at")
+            row["hypothetical_breakeven_exit_pnl_dollars"] = _finite(
+                first.get("paper_pnl_dollars")
+            )
 
     def settle(self, date_str: str, fly_observations: pd.DataFrame) -> int:
         self._load_date(date_str)
@@ -506,6 +634,10 @@ class VRPPaperIronFlyExecutor:
                 ) * 100 + commission,
                 "commission_complete": int(row.get("commission_report_count") or 0) >= 4,
             })
+            self._apply_observation_path_fields(
+                row, observation,
+                self.storage.load_vrp_paper_mtm(self.symbol, date_str),
+            )
             max_loss = _finite(row.get("paper_max_loss_dollars"))
             row["paper_return_on_max_risk"] = (
                 row["paper_realized_pnl_dollars"] / max_loss

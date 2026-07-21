@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import threading
 import time
 from calendar import monthcalendar, FRIDAY
@@ -12,6 +13,9 @@ import numpy as np
 import pandas as pd
 
 from .time_utils import ET
+
+
+log = logging.getLogger(__name__)
 
 
 _VIX_LOCK = threading.Lock()
@@ -110,9 +114,15 @@ def vix_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
             qualified = ib.qualifyContracts(contract)
             if not qualified:
                 return dict(cached[1]) if cached else empty
-            ticker_rows = ib.reqTickers(qualified[0])
-            ticker = ticker_rows[0] if ticker_rows else None
+            live_contract = qualified[0]
+            ib.reqMktData(live_contract, genericTickList="", snapshot=False)
+            ib.sleep(1.0)
+            ticker = ib.ticker(live_contract)
             value = _finite(ticker.marketPrice()) if ticker is not None else None
+            try:
+                ib.cancelMktData(live_contract)
+            except Exception:
+                pass
 
             history = _VIX_HISTORY_CACHE.get(date_str)
             if history is None:
@@ -139,6 +149,11 @@ def vix_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
             percentile = None
             if value is not None and history20:
                 percentile = float(np.mean(np.asarray(history20) <= value))
+            if value is None:
+                value = previous
+                source = "ib_daily_history_fallback"
+            else:
+                source = "ib_streaming+daily_history"
             result = {
                 "vix": value,
                 "vix_previous_close": previous,
@@ -148,11 +163,12 @@ def vix_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
                 "vix_ma20_ratio": value / ma20 if value is not None and ma20 else None,
                 "vix_20d_percentile": percentile,
                 "vix_asof": now,
-                "vix_source": "ib_snapshot+daily_history",
+                "vix_source": source,
             }
             _VIX_LIVE_CACHE["value"] = (time.monotonic(), result)
             return dict(result)
-        except Exception:
+        except Exception as exc:
+            log.warning("VRP VIX context unavailable: %s", exc)
             return dict(cached[1]) if cached else empty
 
 

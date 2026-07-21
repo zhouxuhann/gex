@@ -35,6 +35,12 @@ class FakeIB:
         bid, ask = quotes[contract.conId]
         return SimpleNamespace(bid=bid, ask=ask, time=datetime.now(ET))
 
+    def reqMktData(self, contract, genericTickList="", snapshot=False):
+        return self.ticker(contract)
+
+    def sleep(self, seconds):
+        return None
+
     def placeOrder(self, bag, order):
         class FakeEvent:
             def __init__(self):
@@ -158,6 +164,10 @@ def test_paper_combo_fill_mtm_and_expiry_are_recorded(tmp_path):
     executor.poll(ib, now=now + timedelta(minutes=5), ib_port=4002)
     mark = storage.load_vrp_paper_mtm("QQQ", "20260720").iloc[0]
     assert abs(mark["paper_pnl_dollars"] - 20.8) < 1e-9
+    with_metrics = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]
+    assert with_metrics["paper_mtm_points"] == 1
+    assert abs(with_metrics["paper_max_favorable_pnl_dollars"] - 20.8) < 1e-9
+    assert pd.notna(with_metrics["hypothetical_tp25_at"])
 
     observations = pd.DataFrame([{
         "scheduled_time": "10:00", "target_wing_width": 3.0,
@@ -171,6 +181,76 @@ def test_paper_combo_fill_mtm_and_expiry_are_recorded(tmp_path):
     assert bool(settled["commission_complete"])
     report = generate_vrp_report(tmp_path, "QQQ")
     assert "paper_iron_fly" in set(report["strategy"])
+    storage.shutdown()
+
+
+def test_mtm_is_repriced_when_final_commission_arrives(tmp_path):
+    storage = StorageManager(tmp_path)
+    config = IntradayVRPConfig(enabled=True, paper_execution_enabled=True)
+    executor = VRPPaperIronFlyExecutor("QQQ", storage, config)
+    now = datetime(2026, 7, 20, 10, 0, tzinfo=ET)
+    order_ref = "VRP_QQQ_20260720_1000_W3"
+    row = {
+        "symbol": "QQQ", "trading_date": "20260720", "order_ref": order_ref,
+        "scheduled_time": "10:00", "target_wing_width": 3.0,
+        "status": "Filled", "actual_gross_credit": 1.0,
+        "actual_commission_dollars": 0.0,
+    }
+    executor._date = "20260720"
+    executor._orders = {order_ref: row}
+    storage.persist_vrp_iron_fly_mtm("QQQ", "20260720", [{
+        "symbol": "QQQ", "trading_date": "20260720",
+        "scheduled_time": "10:00", "target_wing_width": 3.0,
+        "checkpoint": "+5m", "checkpoint_at": now + timedelta(minutes=5),
+        "close_debit_executable": 0.50, "estimated_exit_fees_dollars": 1.0,
+        "status": "ok",
+    }])
+    executor._persist_mtm("20260720")
+    first = storage.load_vrp_paper_mtm("QQQ", "20260720").iloc[0]
+    assert first["paper_pnl_dollars"] == 49.0
+
+    executor._orders[order_ref]["actual_commission_dollars"] = 2.5
+    executor._persist_mtm("20260720")
+    updated = storage.load_vrp_paper_mtm("QQQ", "20260720").iloc[0]
+    assert updated["actual_entry_commission_dollars"] == 2.5
+    assert updated["paper_pnl_dollars"] == 46.5
+    storage.shutdown()
+
+
+def test_submit_waits_briefly_for_fresh_quote_without_chasing(tmp_path):
+    class RefreshingIB(FakeIB):
+        def __init__(self):
+            super().__init__(["DU12345"])
+            self.refreshed = False
+            self.requests = 0
+
+        def ticker(self, contract):
+            ticker = super().ticker(contract)
+            ticker.time = datetime.now(ET) if self.refreshed else datetime.now(ET) - timedelta(minutes=1)
+            return ticker
+
+        def reqMktData(self, contract, genericTickList="", snapshot=False):
+            self.requests += 1
+
+        def sleep(self, seconds):
+            self.refreshed = True
+
+    storage = StorageManager(tmp_path)
+    config = IntradayVRPConfig(
+        enabled=True, paper_execution_enabled=True,
+        paper_entry_slots=["10:00"], paper_quote_refresh_seconds=0.1,
+    )
+    executor = VRPPaperIronFlyExecutor("QQQ", storage, config)
+    quote, flies, contracts = _inputs()
+    ib = RefreshingIB()
+    assert executor.maybe_submit(
+        ib, contracts, now=quote["observed_at"], ib_port=4002,
+        quote_row=quote, fly_rows=flies,
+    )
+    saved = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]
+    assert ib.requests == 4
+    assert saved["status"] == "Submitted"
+    assert saved["submit_quote_refresh_seconds"] >= 0
     storage.shutdown()
 
 
@@ -188,9 +268,11 @@ def test_unfilled_order_is_cancelled_without_chasing(tmp_path):
     assert executor.maybe_submit(
         ib, contracts, now=now, ib_port=4002, quote_row=quote, fly_rows=flies,
     )
-    submitted = pd.Timestamp(
-        storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]["submitted_at"]
-    ).to_pydatetime()
+    # Keep the synthetic order and poll clock on the same historical trade date.
+    order_ref = next(iter(executor._orders))
+    executor._orders[order_ref]["submitted_at"] = now
+    executor._save(executor._orders[order_ref])
+    submitted = now
     executor.poll(ib, now=submitted + timedelta(seconds=29), ib_port=4002)
     waiting = storage.load_vrp_paper_orders("QQQ", "20260720").iloc[0]
     assert waiting["status"] == "Submitted"

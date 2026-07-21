@@ -107,6 +107,7 @@ class IntradayVRPConfig(BaseModel):
     max_combined_spread_ratio: float = 0.10
     commission_per_straddle: float = 1.30
     mtm_checkpoints_minutes: list[int] = Field(default_factory=lambda: [5, 15, 30, 60])
+    mtm_interval_minutes: int = 5
     mtm_fixed_times_et: list[str] = Field(default_factory=lambda: ["15:30"])
     vix_cache_seconds: int = 300
     paper_execution_enabled: bool = False
@@ -116,6 +117,7 @@ class IntradayVRPConfig(BaseModel):
     paper_iron_fly_width: float = 3.0
     paper_quantity: int = 1
     paper_order_timeout_seconds: int = 30
+    paper_quote_refresh_seconds: float = 2.0
 
 
 class EmailAlertConfig(BaseModel):

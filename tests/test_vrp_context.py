@@ -50,7 +50,8 @@ def test_path_features_exclude_premarket_and_use_only_past_bars():
 def test_vix_context_uses_prior_daily_history_and_shared_cache():
     class FakeIB:
         def __init__(self):
-            self.snapshots = 0
+            self.subscriptions = 0
+            self.contract = None
 
         def isConnected(self):
             return True
@@ -58,9 +59,18 @@ def test_vix_context_uses_prior_daily_history_and_shared_cache():
         def qualifyContracts(self, contract):
             return [contract]
 
-        def reqTickers(self, contract):
-            self.snapshots += 1
-            return [SimpleNamespace(marketPrice=lambda: 22.0)]
+        def reqMktData(self, contract, genericTickList="", snapshot=False):
+            self.subscriptions += 1
+            self.contract = contract
+
+        def sleep(self, seconds):
+            return None
+
+        def ticker(self, contract):
+            return SimpleNamespace(marketPrice=lambda: 22.0)
+
+        def cancelMktData(self, contract):
+            return None
 
         def reqHistoricalData(self, *args, **kwargs):
             return [SimpleNamespace(date=f"2026-06-{day:02d}", close=float(day))
@@ -76,4 +86,4 @@ def test_vix_context_uses_prior_daily_history_and_shared_cache():
     assert first["vix_previous_close"] == 20.0
     assert first["vix_ma20"] == 10.5
     assert second == first
-    assert ib.snapshots == 1
+    assert ib.subscriptions == 1

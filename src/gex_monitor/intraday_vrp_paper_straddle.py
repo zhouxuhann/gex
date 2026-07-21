@@ -115,21 +115,24 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
                         "failure_reason": f"missing_atm_contracts:{atm}"})
             self._save(row)
             return False
-        priced_at = et_now()
-        fresh_call = self._fresh_quote(ib, atm_call, now=priced_at)
-        fresh_put = self._fresh_quote(ib, atm_put, now=priced_at)
+        priced_at, fresh, refresh_wait = self._refresh_submit_quotes(ib, {
+            "atm_call": atm_call, "atm_put": atm_put,
+        })
+        fresh_call, fresh_put = fresh["atm_call"], fresh["atm_put"]
         bad = {name: value["status"] for name, value in {
             "atm_call": fresh_call, "atm_put": fresh_put
         }.items() if value["status"] != "ok"}
         if bad:
             row.update({"status": "SKIPPED_STALE_SUBMIT_QUOTE",
                         "failure_reason": json.dumps(bad, sort_keys=True),
-                        "submit_quote_at": priced_at})
+                        "submit_quote_at": priced_at,
+                        "submit_quote_refresh_seconds": refresh_wait})
             self._save(row)
             return False
         credit = fresh_call["bid"] + fresh_put["bid"]
         row.update({
             "submit_quote_at": priced_at,
+            "submit_quote_refresh_seconds": refresh_wait,
             "submit_quote_json": json.dumps(
                 {"atm_call": fresh_call, "atm_put": fresh_put},
                 sort_keys=True, default=str,
@@ -245,10 +248,10 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
         if marks.empty:
             return
         existing = self.storage.load_vrp_paper_straddle_mtm(self.symbol, date_str)
-        existing_keys = set(zip(
-            existing.get("order_ref", pd.Series(dtype=str)).astype(str),
-            existing.get("checkpoint", pd.Series(dtype=str)).astype(str),
-        ))
+        existing_by_key = {
+            (str(row.get("order_ref")), str(row.get("checkpoint"))): row
+            for row in existing.to_dict("records")
+        }
         rows = []
         for order_ref, order in self._orders.items():
             if str(order.get("status")) not in {"Filled", "EXPIRED"}:
@@ -263,7 +266,11 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
             ]
             for mark in matching.to_dict("records"):
                 key = (order_ref, str(mark["checkpoint"]))
-                if key in existing_keys:
+                old = existing_by_key.get(key)
+                if (old is not None
+                        and _finite(old.get("actual_entry_credit")) == credit
+                        and (_finite(old.get("actual_entry_commission_dollars")) or 0.0)
+                        == commission):
                     continue
                 close_cost = _finite(mark.get("close_cost_ask"))
                 # The theoretical mark stores round-trip fees (entry + exit).
@@ -284,8 +291,11 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
                     - commission - exit_fees if close_cost is not None else None,
                     "status": "ok",
                 })
-                existing_keys.add(key)
+                existing_by_key[key] = rows[-1]
         self.storage.persist_vrp_paper_straddle_mtm(self.symbol, date_str, rows)
+        self._update_mtm_risk_metrics(
+            self.storage.load_vrp_paper_straddle_mtm(self.symbol, date_str)
+        )
 
     def settle(self, date_str: str, observations: pd.DataFrame) -> int:
         self._load_date(date_str)
@@ -312,6 +322,10 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
                 "paper_realized_pnl_dollars": (credit - payoff) * 100 - commission,
                 "commission_complete": int(row.get("commission_report_count") or 0) >= 2,
             })
+            self._apply_observation_path_fields(
+                row, observation,
+                self.storage.load_vrp_paper_straddle_mtm(self.symbol, date_str),
+            )
             self._save(row)
             count += 1
         return count

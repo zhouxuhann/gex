@@ -71,6 +71,7 @@ intraday_vrp:
   max_combined_spread_ratio: 0.10
   commission_per_straddle: 1.30
   mtm_checkpoints_minutes: [5, 15, 30, 60]
+  mtm_interval_minutes: 5
   mtm_fixed_times_et: ["15:30"]
   vix_cache_seconds: 300
   # Paper-only experiments. Hard-blocked unless IB port=4002 and account starts DU.
@@ -81,6 +82,7 @@ intraday_vrp:
   paper_iron_fly_width: 3
   paper_quantity: 1
   paper_order_timeout_seconds: 30
+  paper_quote_refresh_seconds: 2.0
 
 alerts:
   ib_errors:

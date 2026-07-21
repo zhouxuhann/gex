@@ -194,6 +194,7 @@ class IntradayVRPMonitor:
             "surface_far_atm_iv": None, "surface_term_spread_iv": None,
             "surface_near_rr25": None, "surface_far_rr25": None,
             "surface_term_spread_rr25": None,
+            "surface_quality": "unavailable",
         }
         files = sorted(Path(self.storage.data_dir).glob(
             f"skew_surface_{self.symbol}_*.parquet"
@@ -209,8 +210,16 @@ class IntradayVRPMonitor:
             good = frame
             if "quality" in frame:
                 good = frame[frame["quality"] != "bad"]
-            near = good[good["dte"] <= 8]
-            far = good[(good["dte"] >= 20) & (good["dte"] <= 55)]
+            good = good.copy()
+            good["atm_iv"] = pd.to_numeric(good.get("atm_iv"), errors="coerce")
+            near = good[(good["dte"] <= 8) & good["atm_iv"].notna()]
+            far = good[(good["dte"] >= 20) & (good["dte"] <= 55)
+                       & good["atm_iv"].notna()]
+            quality = "preferred"
+            if far.empty and not near.empty:
+                near_dte = float(near.iloc[(near["dte"] - 0).abs().argsort()[:1]].iloc[0]["dte"])
+                far = good[(good["dte"] > near_dte) & good["atm_iv"].notna()]
+                quality = "fallback_far_tenor"
             if near.empty or far.empty:
                 raise ValueError("missing usable near/far tenor")
             near_row = near.iloc[(near["dte"] - 0).abs().argsort()[:1]].iloc[0]
@@ -227,6 +236,7 @@ class IntradayVRPMonitor:
                 "surface_near_rr25": near_rr, "surface_far_rr25": far_rr,
                 "surface_term_spread_rr25": near_rr - far_rr
                 if near_rr is not None and far_rr is not None else None,
+                "surface_quality": quality,
             }
         except Exception:
             result = dict(empty)
@@ -276,14 +286,24 @@ class IntradayVRPMonitor:
         observed = self._as_et(row.get("observed_at"))
         if observed is None:
             return []
-        targets = [(f"+{minutes}m", observed + timedelta(minutes=minutes))
-                   for minutes in self.config.mtm_checkpoints_minutes]
+        targets_by_time: dict[datetime, str] = {}
+        for minutes in self.config.mtm_checkpoints_minutes:
+            targets_by_time[observed + timedelta(minutes=minutes)] = f"+{minutes}m"
+        interval = max(0, int(self.config.mtm_interval_minutes))
+        if interval:
+            minutes = interval
+            while True:
+                target = observed + timedelta(minutes=minutes)
+                if target.time() > datetime.strptime("15:55", "%H:%M").time():
+                    break
+                targets_by_time[target] = f"+{minutes}m"
+                minutes += interval
         for clock in self.config.mtm_fixed_times_et:
             hour, minute = (int(value) for value in clock.split(":"))
             target = observed.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if target > observed:
-                targets.append((clock, target))
-        return [(name, target) for name, target in targets
+                targets_by_time[target] = clock
+        return [(name, target) for target, name in sorted(targets_by_time.items())
                 if target.time() < datetime.strptime("15:59", "%H:%M").time()]
 
     def _capture_mtm_checkpoints(self, ib, contracts: list, *, now: datetime,

@@ -29,6 +29,41 @@ def _json_default(value):
     raise TypeError(f"Cannot serialize {type(value)!r}")
 
 
+def _execution_funnel(frame: pd.DataFrame | None) -> dict:
+    if frame is None or frame.empty:
+        return {"eligible": 0, "submitted": 0, "filled": 0, "cancelled": 0,
+                "skipped": 0, "blocked": 0, "submit_errors": 0,
+                "fill_rate": None, "mean_fill_delay_seconds": None,
+                "mean_credit_slippage": None}
+    statuses = frame.get("status", pd.Series("missing", index=frame.index)).astype(str)
+    skipped = statuses.str.startswith("SKIPPED_")
+    blocked = statuses.eq("BLOCKED_SAFETY")
+    submit_errors = statuses.eq("SUBMIT_ERROR")
+    non_submitted = skipped | blocked | submit_errors | statuses.eq("INTENT_RECORDED")
+    submitted = ~non_submitted
+    filled = statuses.isin(["Filled", "EXPIRED"])
+    cancelled = statuses.isin(["Cancelled", "ApiCancelled", "Inactive"])
+    delays = pd.Series(dtype=float)
+    if "submitted_at" in frame and "filled_at" in frame:
+        submitted_at = pd.to_datetime(frame["submitted_at"], errors="coerce", utc=True)
+        filled_at = pd.to_datetime(frame["filled_at"], errors="coerce", utc=True)
+        delays = (filled_at - submitted_at).dt.total_seconds().dropna()
+    slippage = pd.to_numeric(
+        frame.get("credit_slippage", pd.Series(dtype=float)), errors="coerce"
+    ).dropna()
+    submitted_count = int(submitted.sum())
+    filled_count = int(filled.sum())
+    return {
+        "eligible": len(frame), "submitted": submitted_count,
+        "filled": filled_count, "cancelled": int(cancelled.sum()),
+        "skipped": int(skipped.sum()), "blocked": int(blocked.sum()),
+        "submit_errors": int(submit_errors.sum()),
+        "fill_rate": filled_count / submitted_count if submitted_count else None,
+        "mean_fill_delay_seconds": float(delays.mean()) if not delays.empty else None,
+        "mean_credit_slippage": float(slippage.mean()) if not slippage.empty else None,
+    }
+
+
 def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | tuple[str, ...],
                           quotes: pd.DataFrame, observations: pd.DataFrame,
                           mtm: pd.DataFrame | None = None,
@@ -86,18 +121,42 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
         problems.append(f"rth_bars={rth_bars}<{min_rth_bars}")
 
     if coverage >= 0.95 and settled_coverage == 1.0 and rth_bars >= min_rth_bars:
-        quality = "good" if ok_ratio >= 0.90 else "warning"
+        core_quality = "good" if ok_ratio >= 0.90 else "warning"
     elif coverage >= 0.80 and settled_coverage >= 0.80:
-        quality = "warning"
+        core_quality = "warning"
     else:
-        quality = "bad"
+        core_quality = "bad"
+    critical_context = ("vix", "vix_ma20_ratio", "surface_term_spread_iv")
+    critical_values = [feature_coverage[name] for name in critical_context]
+    if all(value >= 0.80 for value in critical_values):
+        context_quality = "good"
+    elif any(value > 0 for value in critical_values):
+        context_quality = "warning"
+    else:
+        context_quality = "bad"
+    quality = core_quality
+    if core_quality == "good" and context_quality != "good":
+        quality = "warning"
+        missing = [name for name in critical_context if feature_coverage[name] < 0.80]
+        problems.append(f"critical_context_incomplete={','.join(missing)}")
+
+    fly_funnel = _execution_funnel(paper_orders)
+    straddle_funnel = _execution_funnel(paper_straddle_orders)
+    combined_frames = [frame.assign(strategy=name) for frame, name in (
+        (paper_orders, "iron_fly"), (paper_straddle_orders, "short_straddle")
+    ) if frame is not None and not frame.empty]
+    combined_funnel = _execution_funnel(
+        pd.concat(combined_frames, ignore_index=True) if combined_frames else None
+    )
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "symbol": symbol,
         "trading_date": date_str,
         "generated_at": datetime.now(ET),
         "quality": quality,
+        "core_quality": core_quality,
+        "context_quality": context_quality,
         "expected_slots": expected,
         "observed_slots": observed,
         "settled_slots": settled,
@@ -142,6 +201,11 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
         "paper_straddle_mtm_rows": (
             0 if paper_straddle_mtm is None else len(paper_straddle_mtm)
         ),
+        "paper_execution_funnel": {
+            "combined": combined_funnel,
+            "iron_fly": fly_funnel,
+            "short_straddle": straddle_funnel,
+        },
         "problems": problems,
     }
 

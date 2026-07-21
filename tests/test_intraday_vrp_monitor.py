@@ -50,6 +50,22 @@ def test_due_slot_window_and_persisted_dedup(tmp_path):
     storage.shutdown()
 
 
+def test_mtm_targets_are_generated_every_five_minutes_to_1555(tmp_path):
+    storage = StorageManager(tmp_path)
+    monitor = IntradayVRPMonitor(
+        "QQQ", storage,
+        IntradayVRPConfig(enabled=True, mtm_checkpoints_minutes=[],
+                         mtm_interval_minutes=5, mtm_fixed_times_et=["15:30"]),
+    )
+    entry = datetime(2026, 7, 16, 14, 0, tzinfo=ET)
+    targets = monitor._checkpoint_targets({"observed_at": entry})
+    assert targets[0][0] == "+5m"
+    assert targets[-1][0] == "+115m"
+    assert targets[-1][1].strftime("%H:%M") == "15:55"
+    assert "15:30" in {name for name, _ in targets}
+    storage.shutdown()
+
+
 def test_collects_same_strike_pair_and_executable_credit(tmp_path):
     storage = StorageManager(tmp_path)
     config = IntradayVRPConfig(enabled=True, max_quote_age_seconds=10)
