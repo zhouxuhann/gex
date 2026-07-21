@@ -189,6 +189,9 @@ def main():
             ib_error_watcher=ib_error_watcher,
             extended_hours=sym_config.extended_hours,
             intraday_vrp_config=config.intraday_vrp,
+            intraday_turning_point_shadow_config=(
+                config.intraday_turning_point_shadow
+            ),
         )
         workers.append(worker)
 

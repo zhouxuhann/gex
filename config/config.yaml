@@ -84,6 +84,19 @@ intraday_vrp:
   paper_order_timeout_seconds: 30
   paper_quote_refresh_seconds: 2.0
 
+# 日内转折点实时影子评分：只观察、只落盘，代码中没有下单接口。
+intraday_turning_point_shadow:
+  enabled: true
+  observation_only: true
+  symbols: [QQQ, SPY]
+  model_path: "config/turning_point_shadow_v1.json"
+  lookback_minutes: 60
+  cooldown_minutes: 15
+  max_candidate_lag_seconds: 90
+  latest_candidate_time_et: "15:44"
+  gex_tolerance_seconds: 120
+  strike_tolerance_seconds: 120
+
 alerts:
   ib_errors:
     email:

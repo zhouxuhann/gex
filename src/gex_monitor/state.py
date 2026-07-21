@@ -3,7 +3,7 @@ import logging
 import threading
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -279,6 +279,19 @@ class StateManager:
                 ohlc.append(dict(self._last_minute_bar))
             strikes = [dict(s) for s in self._strikes_history]
             return hist, ohlc, strikes
+
+    def get_turning_point_inputs(self, lookback_minutes: int = 60) -> tuple[list, list, list]:
+        """仅复制影子评分所需的近期数据，避免每分钟复制整日 strike 历史。"""
+        cutoff = et_now() - timedelta(minutes=max(30, int(lookback_minutes)))
+        with self._lock:
+            hist = [dict(row) for row in self._history if row['ts'] >= cutoff]
+            bars = [dict(row) for row in self._ohlc_minute if row['ts'] >= cutoff]
+            if self._last_minute_bar is not None and self._last_minute_bar['ts'] >= cutoff:
+                bars.append(dict(self._last_minute_bar))
+            strikes = [
+                dict(row) for row in self._strikes_history if row['ts'] >= cutoff
+            ]
+            return hist, bars, strikes
 
     def resample_history(self, rule: str) -> pd.DataFrame:
         """重采样历史数据"""

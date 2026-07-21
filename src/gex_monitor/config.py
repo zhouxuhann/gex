@@ -120,6 +120,21 @@ class IntradayVRPConfig(BaseModel):
     paper_quote_refresh_seconds: float = 2.0
 
 
+class IntradayTurningPointShadowConfig(BaseModel):
+    """日内转折点影子评分器；类型约束确保它永远不能下单。"""
+
+    enabled: bool = False
+    observation_only: Literal[True] = True
+    symbols: list[str] = Field(default_factory=lambda: ["QQQ", "SPY"])
+    model_path: str = "config/turning_point_shadow_v1.json"
+    lookback_minutes: int = 60
+    cooldown_minutes: int = 15
+    max_candidate_lag_seconds: int = 90
+    latest_candidate_time_et: str = "15:44"
+    gex_tolerance_seconds: int = 120
+    strike_tolerance_seconds: int = 120
+
+
 class EmailAlertConfig(BaseModel):
     """通用邮件告警配置"""
     enabled: bool = False
@@ -162,6 +177,9 @@ class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
     intraday_vrp: IntradayVRPConfig = Field(default_factory=IntradayVRPConfig)
+    intraday_turning_point_shadow: IntradayTurningPointShadowConfig = Field(
+        default_factory=IntradayTurningPointShadowConfig
+    )
     timing: TimingConfig = Field(default_factory=TimingConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)

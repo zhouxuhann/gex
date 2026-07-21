@@ -470,6 +470,22 @@ class StorageManager:
             return pd.DataFrame()
         return read_parquet_et(path, self._io_lock)
 
+    def persist_turning_point_shadow(self, symbol: str, date_str: str, row: dict) -> None:
+        """保存实时转折点候选、评分和后续回填；不会连接任何执行路径。"""
+        path = self.data_dir / f'turning_point_shadow_{symbol}_{date_str}.parquet'
+        _merge_and_write(
+            path,
+            pd.DataFrame([row]),
+            ['symbol', 'trading_date', 'event_id'],
+            self._io_lock,
+        )
+
+    def load_turning_point_shadow(self, symbol: str, date_str: str) -> "pd.DataFrame":
+        path = self.data_dir / f'turning_point_shadow_{symbol}_{date_str}.parquet'
+        if not path.exists():
+            return pd.DataFrame()
+        return read_parquet_et(path, self._io_lock)
+
     def persist_sync(self, symbol: str, hist: list[dict], ohlc: list[dict],
                      strikes: list[dict] | None = None) -> None:
         """同步落盘（使用缓冲区，达到阈值才写磁盘）"""

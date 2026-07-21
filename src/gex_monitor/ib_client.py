@@ -9,13 +9,18 @@ from statistics import median
 import numpy as np
 from ib_insync import IB, Index, Option, Stock
 
-from .config import IntradayVRPConfig, TimingConfig
+from .config import (
+    IntradayTurningPointShadowConfig,
+    IntradayVRPConfig,
+    TimingConfig,
+)
 from .data_quality import evaluate_tick_quality
 from .db_storage import GEXDBStorage
 from .features import compute_realtime_features
 from .gex_calc import calculate_gex, pick_expiry
 from .hedge_executor import HedgeExecutor, format_trade_result
 from .hedge_signal import format_recommendation, generate_hedge_signal
+from .intraday_turning_point_shadow import IntradayTurningPointShadow
 from .intraday_vrp_monitor import IntradayVRPMonitor
 from .macro import fetch_macro_snapshot
 from .skew import SkewTracker, compute_skew
@@ -89,6 +94,9 @@ class IBWorker:
         ib_error_watcher=None,
         extended_hours: bool = False,
         intraday_vrp_config: IntradayVRPConfig | None = None,
+        intraday_turning_point_shadow_config: (
+            IntradayTurningPointShadowConfig | None
+        ) = None,
     ):
         self.symbol = symbol
         self.trading_class = trading_class
@@ -165,6 +173,22 @@ class IBWorker:
             mode = ('observation + PAPER ' + ' + '.join(paper_modes) + ' execution'
                     if paper_modes else 'observation only')
             self._log('info', f'Intraday VRP enabled ({mode})')
+        self._turning_point_shadow = None
+        self._intraday_turning_point_shadow_config = intraday_turning_point_shadow_config
+        if (
+            intraday_turning_point_shadow_config is not None
+            and intraday_turning_point_shadow_config.enabled
+            and self.symbol in intraday_turning_point_shadow_config.symbols
+        ):
+            self._turning_point_shadow = IntradayTurningPointShadow(
+                self.symbol,
+                self.storage,
+                intraday_turning_point_shadow_config,
+            )
+            self._log(
+                'info',
+                'Intraday turning-point shadow enabled (observation only, no orders)',
+            )
 
     def _load_prev_oi(self) -> None:
         """加载前一交易日的 OI 快照"""
@@ -710,6 +734,26 @@ class IBWorker:
             partial=getattr(result, 'partial', False),
             quality_reasons=quality_reasons,
         )
+
+        if self._turning_point_shadow is not None:
+            try:
+                shadow_row = self._turning_point_shadow.on_update(
+                    now=et_now(),
+                    input_provider=lambda: self.state.get_turning_point_inputs(
+                        self._intraday_turning_point_shadow_config.lookback_minutes
+                    ),
+                )
+                if shadow_row is not None:
+                    self._log(
+                        'info',
+                        'Turning-point shadow '
+                        f"{shadow_row['watch_level']} "
+                        f"{shadow_row['setup_direction']} "
+                        f"bias={shadow_row['score_bias']} "
+                        f"event={shadow_row['event_id']}",
+                    )
+            except Exception as e:
+                self._log('warning', f'Turning-point shadow failed: {e}')
 
         if self._vrp_monitor is not None:
             try:
