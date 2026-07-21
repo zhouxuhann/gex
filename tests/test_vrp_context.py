@@ -52,6 +52,8 @@ def test_vix_context_uses_prior_daily_history_and_shared_cache():
         def __init__(self):
             self.subscriptions = 0
             self.contract = None
+            self.ticker_reads = 0
+            self.sleeps = 0
 
         def isConnected(self):
             return True
@@ -64,10 +66,14 @@ def test_vix_context_uses_prior_daily_history_and_shared_cache():
             self.contract = contract
 
         def sleep(self, seconds):
-            return None
+            self.sleeps += 1
 
         def ticker(self, contract):
-            return SimpleNamespace(marketPrice=lambda: 22.0)
+            self.ticker_reads += 1
+            # Reproduce IB delivering contract/close first and LAST later.
+            last = float("nan") if self.ticker_reads < 3 else 22.0
+            return SimpleNamespace(last=last, close=20.0,
+                                   marketPrice=lambda: 20.0)
 
         def cancelMktData(self, contract):
             return None
@@ -87,3 +93,5 @@ def test_vix_context_uses_prior_daily_history_and_shared_cache():
     assert first["vix_ma20"] == 10.5
     assert second == first
     assert ib.subscriptions == 1
+    assert ib.ticker_reads == 3
+    assert ib.sleeps == 2

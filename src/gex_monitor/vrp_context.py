@@ -116,13 +116,27 @@ def vix_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
                 return dict(cached[1]) if cached else empty
             live_contract = qualified[0]
             ib.reqMktData(live_contract, genericTickList="", snapshot=False)
-            ib.sleep(1.0)
-            ticker = ib.ticker(live_contract)
-            value = _finite(ticker.marketPrice()) if ticker is not None else None
             try:
-                ib.cancelMktData(live_contract)
-            except Exception:
-                pass
+                # VIX has no regular bid/ask and its first LAST tick can arrive
+                # materially later than the contract/close fields.  Requiring
+                # LAST prevents a stale previous close from masquerading as a
+                # live marketPrice(), while the bounded poll avoids blocking a
+                # worker indefinitely when the feed is unavailable.
+                value = None
+                for attempt in range(21):  # immediate read + 20 x 0.25s = 5s
+                    ticker = ib.ticker(live_contract)
+                    last = _finite(getattr(ticker, "last", None)) \
+                        if ticker is not None else None
+                    if last is not None and last > 0:
+                        value = last
+                        break
+                    if attempt < 20:
+                        ib.sleep(0.25)
+            finally:
+                try:
+                    ib.cancelMktData(live_contract)
+                except Exception:
+                    pass
 
             history = _VIX_HISTORY_CACHE.get(date_str)
             if history is None:
