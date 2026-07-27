@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fanzhouxu.ibgateway.premarket-restart</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/fanzhouxu/.scripts/premarket_restart_ib_then_gex.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>GEX_ROOT</key>
+    <string>/Users/fanzhouxu/Downloads/gex</string>
+    <key>IB_RESTART_HOME</key>
+    <string>/Users/fanzhouxu/.scripts/ib_gateway_restart</string>
+    <key>FULL_RESTART_SCRIPT</key>
+    <string>/Users/fanzhouxu/.scripts/restart_ib_gateway_then_trade.sh</string>
+    <key>IB_RESTART_SCRIPT</key>
+    <string>/Users/fanzhouxu/.scripts/ib_gateway_premarket_restart.sh</string>
+    <key>GEX_MODE</key>
+    <string>trade</string>
+    <key>PORT_WAIT_SEC</key>
+    <string>300</string>
+    <key>GEX_WAIT_SEC</key>
+    <string>120</string>
+    <key>IB_HOST</key>
+    <string>127.0.0.1</string>
+    <key>IB_PORT</key>
+    <string>4002</string>
+    <key>IB_START_METHOD</key>
+    <string>ibc</string>
+    <key>IBC_START_SCRIPT</key>
+    <string>/Users/fanzhouxu/.scripts/start_ib_gateway_ibc.sh</string>
+    <key>IBC_CONFIG_WRITER</key>
+    <string>/Users/fanzhouxu/.scripts/write_ibc_config.py</string>
+    <key>IBC_PATH</key>
+    <string>/Users/fanzhouxu/.local/share/ibc/current</string>
+    <key>IBC_CONFIG</key>
+    <string>/Users/fanzhouxu/ibc/config.ini</string>
+    <key>TRADING_MODE</key>
+    <string>paper</string>
+    <key>IB_GATEWAY_PORT</key>
+    <string>4002</string>
+    <key>NOTIFY_EMAIL_ENABLED</key>
+    <string>0</string>
+    <key>IB_AUTO_LOGIN</key>
+    <string>0</string>
+    <key>IB_USERNAME_KEYCHAIN_SERVICE</key>
+    <string>ibkr-username</string>
+    <key>IB_PASSWORD_KEYCHAIN_SERVICE</key>
+    <string>ibkr-password</string>
+    <key>IB_APP_PATH</key>
+    <string>/Users/fanzhouxu/Applications/IB Gateway 10.46/IB Gateway 10.46.app</string>
+    <key>IB_APP_NAME</key>
+    <string>IB Gateway 10.46</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <array>
+    <!-- Asia/Shanghai: 09:00 ET during US daylight saving time. -->
+    <dict>
+      <key>Hour</key>
+      <integer>21</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+    <!-- Asia/Shanghai: 09:00 ET during US standard time. -->
+    <dict>
+      <key>Hour</key>
+      <integer>22</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+    <!-- Asia/Shanghai: 16:05 ET during US daylight saving time. -->
+    <dict>
+      <key>Hour</key>
+      <integer>4</integer>
+      <key>Minute</key>
+      <integer>5</integer>
+    </dict>
+    <!-- Asia/Shanghai: 16:05 ET during US standard time. -->
+    <dict>
+      <key>Hour</key>
+      <integer>5</integer>
+      <key>Minute</key>
+      <integer>5</integer>
+    </dict>
+  </array>
+  <key>StandardOutPath</key>
+  <string>/Users/fanzhouxu/.scripts/ib_gateway_restart/logs/launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/fanzhouxu/.scripts/ib_gateway_restart/logs/launchd.err</string>
+</dict>
+</plist>

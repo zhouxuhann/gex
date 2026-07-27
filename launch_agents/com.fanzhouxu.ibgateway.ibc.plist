@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.fanzhouxu.ibgateway.ibc</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/fanzhouxu/.scripts/start_ib_gateway_ibc.sh</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>IBC_PATH</key>
+    <string>/Users/fanzhouxu/.local/share/ibc/current</string>
+    <key>IBC_CONFIG</key>
+    <string>/Users/fanzhouxu/ibc/config.ini</string>
+    <key>IBC_CONFIG_WRITER</key>
+    <string>/Users/fanzhouxu/.scripts/write_ibc_config.py</string>
+    <key>TRADING_MODE</key>
+    <string>paper</string>
+    <key>IB_GATEWAY_PORT</key>
+    <string>4002</string>
+    <key>IB_USERNAME_KEYCHAIN_SERVICE</key>
+    <string>ibkr-username</string>
+    <key>IB_PASSWORD_KEYCHAIN_SERVICE</key>
+    <string>ibkr-password</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/fanzhouxu/.scripts/ib_gateway_restart/logs/ibc-agent.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/fanzhouxu/.scripts/ib_gateway_restart/logs/ibc-agent.err</string>
+  <key>WorkingDirectory</key>
+  <string>/Users/fanzhouxu/ibc</string>
+</dict>
+</plist>
