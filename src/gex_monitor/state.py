@@ -18,7 +18,7 @@ class GEXSnapshot:
     ts: datetime
     spot: float
     total_gex: float
-    flip: float
+    flip: float | None
     call_gex: float
     put_gex: float
     atm_iv_pct: float | None
@@ -64,7 +64,12 @@ class StateManager:
         # 实时状态
         self._spot: float = 0
         self._total_gex: float = 0
-        self._gamma_flip: float = 0
+        self._gamma_flip: float | None = None
+        self._volume_gamma: float = 0.0
+        self._gross_gex: float = 0.0
+        self._net_gex_ratio: float = 0.0
+        self._gross_volume_gamma: float = 0.0
+        self._gamma_flip_method: str = 'unavailable'
         self._atm_iv_pct: float | None = None
         self._expiry: str | None = None
         self._is_true_0dte: bool = False
@@ -108,7 +113,7 @@ class StateManager:
         self._cache_lock = threading.Lock()
         self._resample_cache = {'version': -1, 'df': None}
 
-    def update(self, spot: float, total_gex: float, gamma_flip: float,
+    def update(self, spot: float, total_gex: float, gamma_flip: float | None,
                call_gex: float, put_gex: float, atm_iv_pct: float | None,
                expiry: str, is_true_0dte: bool, df: pd.DataFrame,
                call_wall: float | None = None, put_wall: float | None = None,
@@ -117,7 +122,12 @@ class StateManager:
                rr_25: float | None = None, skew_slope: float | None = None,
                rr_25_zscore: float | None = None, skew_signal: str | None = None,
                partial: bool = False,
-               quality_reasons: list[str] | None = None) -> None:
+               quality_reasons: list[str] | None = None,
+               volume_gamma: float = 0.0,
+               gamma_flip_method: str = 'unavailable',
+               gross_gex: float = 0.0,
+               net_gex_ratio: float = 0.0,
+               gross_volume_gamma: float = 0.0) -> None:
         """更新实时状态"""
         now = et_now()
         minute = now.replace(second=0, microsecond=0)
@@ -126,6 +136,11 @@ class StateManager:
             self._spot = spot
             self._total_gex = total_gex
             self._gamma_flip = gamma_flip
+            self._volume_gamma = volume_gamma
+            self._gross_gex = gross_gex
+            self._net_gex_ratio = net_gex_ratio
+            self._gross_volume_gamma = gross_volume_gamma
+            self._gamma_flip_method = gamma_flip_method
             self._atm_iv_pct = atm_iv_pct
             self._expiry = expiry
             self._is_true_0dte = is_true_0dte
@@ -159,6 +174,19 @@ class StateManager:
                 'call_gex': call_gex,
                 'put_gex': put_gex,
                 'atm_iv_pct': atm_iv_pct,
+                'volume_gamma': volume_gamma,
+                'gross_gex': gross_gex,
+                'net_gex_ratio': net_gex_ratio,
+                'gross_volume_gamma': gross_volume_gamma,
+                'volume_gamma_to_gex': (
+                    gross_volume_gamma / gross_gex if gross_gex > 0 else None
+                ),
+                'gamma_flip_status': gamma_flip_method,
+                'gamma_flip_reliable': bool(
+                    gamma_flip is not None and not partial and not quality_reasons
+                    and gamma_flip_method == 'repriced_oi'
+                ),
+                'gex_method': 'oi_position_v2',
                 'call_wall': call_wall,
                 'put_wall': put_wall,
                 'positive_gamma': positive_gamma,
@@ -195,9 +223,15 @@ class StateManager:
                             'strike': row['strike'],
                             'right': row['right'],
                             'gex': row['gex'],
+                            'volume_gamma': row.get('volume_gamma', 0),
+                            'volume': row.get('volume', 0),
+                            'gex_method': 'oi_position_v2',
                             'gamma': row.get('gamma', 0),
                             'oi': row.get('oi', 0),
                             'iv': row.get('iv', None),
+                            'expiry': row.get('expiry'),
+                            'multiplier': row.get('multiplier', 100),
+                            'con_id': row.get('con_id'),
                         })
 
             self._history_version += 1
@@ -226,6 +260,22 @@ class StateManager:
                 'spot': self._spot,
                 'total_gex': self._total_gex,
                 'gamma_flip': self._gamma_flip,
+                'volume_gamma': self._volume_gamma,
+                'gross_gex': self._gross_gex,
+                'net_gex_ratio': self._net_gex_ratio,
+                'gross_volume_gamma': self._gross_volume_gamma,
+                'volume_gamma_to_gex': (
+                    self._gross_volume_gamma / self._gross_gex
+                    if self._gross_gex > 0 else None
+                ),
+                'gamma_flip_status': self._gamma_flip_method,
+                'gamma_flip_reliable': bool(
+                    self._gamma_flip is not None
+                    and not self._partial
+                    and not self._quality_reasons
+                    and self._gamma_flip_method == 'repriced_oi'
+                ),
+                'gex_method': 'oi_position_v2',
                 'atm_iv_pct': self._atm_iv_pct,
                 'expiry': self._expiry,
                 'is_true_0dte': self._is_true_0dte,

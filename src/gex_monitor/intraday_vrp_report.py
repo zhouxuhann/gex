@@ -30,13 +30,17 @@ def cluster_bootstrap_mean(values: pd.Series, dates: pd.Series, *,
 
 
 def _sample_status(days: int) -> str:
-    if days < 20:
-        return "raw_only"
     if days < 60:
-        return "exploratory"
-    if days < 90:
-        return "comparison_ready"
-    return "sizing_eligible"
+        return "raw_only"
+    if days < 150:
+        return "prototype"
+    if days < 250:
+        return "median_iqr_only"
+    if days < 500:
+        return "basic_cone"
+    if days < 750:
+        return "q10_q90_ready"
+    return "conditional_cone_ready"
 
 
 def _group_rows(frame: pd.DataFrame, strategy: str, *, bounded: bool) -> list[dict]:
@@ -99,7 +103,7 @@ def _group_rows(frame: pd.DataFrame, strategy: str, *, bounded: bool) -> list[di
                     row.update({"kelly_fraction_raw": raw,
                                 "kelly_fraction_quarter": quarter,
                                 "p99_risk_cap_fraction": risk_cap})
-                    if days >= 90 and mean > 0:
+                    if days >= 500 and mean > 0:
                         row["recommended_fraction"] = min(quarter, risk_cap, 0.25)
                         row["sizing_reason"] = "eligible_1q_kelly_p99_capped"
                     elif mean <= 0:
@@ -175,11 +179,100 @@ def generate_vrp_report(data_dir: Path | str, symbol: str) -> pd.DataFrame:
         "overall": report[report["dimension"] == "overall"].replace(
             {np.nan: None}
         ).to_dict("records"),
-        "sizing_gate": "Iron fly only; >=90 independent days; positive net edge; "
+        "sizing_gate": "Iron fly only; >=500 independent days; positive net edge; "
                        "min(1/4 Kelly, 2% p99 cap, 25% hard cap).",
     }
     path = data_dir / f"vrp_report_{symbol}.json"
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(summary, ensure_ascii=False, indent=2, default=str) + "\n")
+    tmp.replace(path)
+    return report
+
+
+def generate_vrp_cone_report(data_dir: Path | str, symbol: str) -> pd.DataFrame:
+    """Build point-in-time IV cones; one independent observation per trading day."""
+    data_dir = Path(data_dir)
+    frame = _load_many(
+        data_dir, f"vrp_cone_observations_{symbol}_*.parquet"
+    )
+    if frame.empty:
+        return pd.DataFrame()
+    if "status" in frame:
+        frame = frame[frame["status"] == "ok"].copy()
+    frame["trading_date"] = frame["trading_date"].astype(str)
+    frame["event_group"] = np.where(
+        frame.get("event_flag", pd.Series("none", index=frame.index))
+        .fillna("none").astype(str).eq("none"),
+        "ordinary", "event",
+    )
+    metrics = [
+        "atm_iv_decimal", "implied_move_mid_pct",
+        "implied_one_sigma_move_pct", "annualized_rv_to_close",
+        "implied_variance_remaining", "realized_variance_remaining",
+        "ex_post_variance_spread",
+    ]
+    rows = []
+    group_specs = [("all", pd.Series("all", index=frame.index)),
+                   ("event_group", frame["event_group"])]
+    for condition, labels in group_specs:
+        for bucket in labels.unique():
+            subset = frame[labels == bucket]
+            for slot, group in subset.groupby("scheduled_time"):
+                # Defensive de-duplication ensures intraday rows never inflate N.
+                group = group.sort_values("observed_at").drop_duplicates(
+                    "trading_date", keep="last"
+                )
+                days = group["trading_date"].nunique()
+                for metric in metrics:
+                    if metric not in group:
+                        continue
+                    values = pd.to_numeric(group[metric], errors="coerce").dropna()
+                    if values.empty:
+                        continue
+                    rows.append({
+                        "schema_version": 1,
+                        "symbol": symbol,
+                        "generated_at": datetime.now(ET),
+                        "condition": condition,
+                        "bucket": str(bucket),
+                        "scheduled_time": str(slot),
+                        "metric": metric,
+                        "trading_days": days,
+                        "non_null_days": int(values.index.nunique()),
+                        "sample_status": _sample_status(days),
+                        "q10": float(values.quantile(0.10)),
+                        "q25": float(values.quantile(0.25)),
+                        "q50": float(values.quantile(0.50)),
+                        "q75": float(values.quantile(0.75)),
+                        "q90": float(values.quantile(0.90)),
+                    })
+    report = pd.DataFrame(rows)
+    if report.empty:
+        return report
+    _atomic_write_parquet(
+        report, data_dir / f"vrp_cone_report_{symbol}.parquet"
+    )
+    summary = {
+        "schema_version": 1,
+        "symbol": symbol,
+        "generated_at": datetime.now(ET).isoformat(),
+        "independent_trading_days": int(frame["trading_date"].nunique()),
+        "rows": len(report),
+        "sample_policy": {
+            "under_60": "raw_only",
+            "60_149": "prototype",
+            "150_249": "median_iqr_only",
+            "250_499": "basic_cone",
+            "500_749": "q10_q90_ready",
+            "750_plus": "conditional_cone_ready",
+        },
+        "independence_unit": "trading_date",
+        "statistics_grid": "5-minute ET clock time",
+    }
+    path = data_dir / f"vrp_cone_report_{symbol}.json"
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, default=str) + "\n"
+    )
     tmp.replace(path)
     return report

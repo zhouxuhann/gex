@@ -20,11 +20,14 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("data/analysis"))
     parser.add_argument("--audit-count", type=int, default=50)
+    parser.add_argument(
+        "--gex-method", choices=["stored", "oi_position_v2"], default="stored",
+    )
     args = parser.parse_args()
 
     config = TurningPointConfig()
     minutes, events, day_frames, summary = build_symbol_dataset(
-        args.data_dir, args.symbol, config
+        args.data_dir, args.symbol, config, gex_method=args.gex_method
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     minute_path = args.output_dir / f"turning_point_minutes_{args.symbol}.parquet"

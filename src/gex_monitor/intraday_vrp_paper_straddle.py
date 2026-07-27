@@ -80,6 +80,11 @@ class VRPPaperStraddleExecutor(VRPPaperIronFlyExecutor):
             "positive_gamma", "event_flag", "opex_type", "vix_ma20_ratio",
             "total_gex", "gamma_flip", "rr_25", "combined_spread_ratio",
             "surface_term_spread_iv", "gap_pct", "trend_efficiency_session",
+            "gex_method", "gross_gex", "net_gex_ratio",
+            "gross_volume_gamma", "volume_gamma_to_gex",
+            "gamma_flip_status", "gamma_flip_reliable",
+            "gex_vrp_quality_ok", "gex_vrp_regime",
+            "gex_strategy_preference", "gex_hard_gate_enabled",
         ):
             row[field] = quote_row.get(field)
         if quote_row.get("status") != "ok":

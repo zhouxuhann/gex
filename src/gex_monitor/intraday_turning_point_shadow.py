@@ -90,6 +90,7 @@ def load_shadow_model(path: Path | str) -> ShadowModel:
             external_lift=float(item["external_lift"]),
         )
         for item in payload["rules"]
+        if item.get("enabled", True)
     )
     if not rules:
         raise ValueError("turning-point shadow model contains no rules")
@@ -131,14 +132,18 @@ def build_realtime_feature_frame(
     aligned["gex_quality_ok"] = aligned["total_gex"].notna()
     if "partial" in aligned:
         aligned["gex_quality_ok"] &= ~aligned["partial"].fillna(False).astype(bool)
+    if "gex_method" in aligned:
+        aligned["gex_quality_ok"] &= aligned["gex_method"].eq("oi_position_v2")
+    else:
+        aligned["gex_quality_ok"] = False
     result = add_lagged_features(aligned, config)
-    total = pd.to_numeric(result.get("total_gex"), errors="coerce").abs()
-    scale = total.replace(0, np.nan)
     for minutes in (5, 15):
-        change = pd.to_numeric(
-            result.get(f"total_gex_change_{minutes}m"), errors="coerce"
-        )
-        result[f"gex_change_{minutes}m_ratio"] = change / scale
+        gross_feature = f"gex_change_{minutes}m_gross_ratio"
+        if gross_feature in result:
+            # Compatibility alias for downstream event storage.  The legacy
+            # net-GEX denominator was unstable around zero; all new scoring
+            # must use gross OI-based exposure as the scale.
+            result[f"gex_change_{minutes}m_ratio"] = result[gross_feature]
     return result
 
 
@@ -362,10 +367,19 @@ class IntradayTurningPointShadow:
             "trend_efficiency_15m",
             "twap_distance_pct",
             "total_gex",
+            "gross_gex",
+            "net_gex_ratio",
+            "volume_gamma",
+            "gross_volume_gamma",
+            "volume_gamma_to_gex",
             "total_gex_change_5m",
             "total_gex_change_15m",
             "gex_change_5m_ratio",
             "gex_change_15m_ratio",
+            "gex_change_5m_gross_ratio",
+            "gex_change_15m_gross_ratio",
+            "volume_gamma_change_5m_gross_ratio",
+            "volume_gamma_change_15m_gross_ratio",
             "flip",
             "dist_to_flip_vol",
             "call_wall",
@@ -379,6 +393,13 @@ class IntradayTurningPointShadow:
             "rr_25_change_15m",
             "strike_abs_gex_concentration_50bps",
             "strike_abs_gex_imbalance_50bps",
+            "strike_total_abs_gex",
+            "strike_net_gex_ratio",
+            "strike_total_volume",
+            "strike_total_oi",
+            "strike_volume_oi_ratio",
+            "strike_gross_volume_gamma",
+            "strike_volume_gamma_to_gex",
             "gex_age_seconds",
             "strike_age_seconds",
         )

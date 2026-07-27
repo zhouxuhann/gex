@@ -27,6 +27,7 @@ from .skew import SkewTracker, compute_skew
 from .skew_surface import collect_skew_surface
 from .state import StateManager
 from .storage import SkewSurfaceStorage, StorageManager
+from .strike_selector import select_strikes
 from .time_utils import (
     et_now,
     is_extended_hours,
@@ -37,7 +38,7 @@ from .time_utils import (
     should_connect,
     trading_date_str,
 )
-from .vrp_context import vix_context
+from .vrp_context import market_vol_context, standardized_term_structure_context
 
 log = logging.getLogger(__name__)
 
@@ -193,7 +194,7 @@ class IBWorker:
     def _load_prev_oi(self) -> None:
         """加载前一交易日的 OI 快照"""
         today = option_expiry_date_str()
-        prev_date = self.storage.get_previous_trading_day(today)
+        prev_date = self.storage.get_previous_trading_day(today, self.symbol)
         if prev_date:
             self.prev_oi = self.storage.load_oi_snapshot(self.symbol, prev_date)
             if self.prev_oi:
@@ -397,10 +398,10 @@ class IBWorker:
             return
 
         # 3. 选择 strikes
-        all_strikes = sorted(s for s in self.chain.strikes if s == int(s))
-        below = [s for s in all_strikes if s <= spot][-10:]
-        above = [s for s in all_strikes if s > spot][:10]
-        strikes = sorted(set(below + above))
+        strikes = select_strikes(
+            self.chain.strikes, spot, self.strike_range,
+            include_half_dollar=True,
+        )
         expected_contracts = len(strikes) * 2  # C + P
 
         # 4. 订阅期权（带重试）
@@ -454,10 +455,10 @@ class IBWorker:
             return
 
         # 重新计算 strikes
-        all_strikes = sorted(s for s in self.chain.strikes if s == int(s))
-        below = [s for s in all_strikes if s <= spot][-10:]
-        above = [s for s in all_strikes if s > spot][:10]
-        new_strikes = sorted(set(below + above))
+        new_strikes = select_strikes(
+            self.chain.strikes, spot, self.strike_range,
+            include_half_dollar=True,
+        )
 
         # 检查 strikes 是否变化
         new_key = (expiry, tuple(new_strikes))
@@ -497,6 +498,12 @@ class IBWorker:
             if (expiry, float(s), r) not in self._invalid_contract_cache
         ]
         expected = len(raw)
+        if expected > 80:
+            self._log(
+                'warning',
+                f'期权行情订阅 {expected} 行，可能超过 IB 行情额度；'
+                '请按账户额度调整 strike_range/启用标的数',
+            )
         if not raw:
             self.current_contracts = []
             self.current_key = key
@@ -580,17 +587,20 @@ class IBWorker:
             self._log('error', '无可用 expiry')
             return False
 
-        # 选择 strikes：ATM 前后各 10 个整数 strike
+        # 选择 strikes：严格使用配置的百分比范围，并保留半美元行权价。
         # Hysteresis: spot 偏移超过 $1 才重选，避免边界抖动触发重新订阅
-        all_strikes = sorted(s for s in self.chain.strikes if s == int(s))
+        all_strikes = sorted(float(s) for s in self.chain.strikes if s and float(s) > 0)
         need_reselect = (
             self._last_strike_spot is None
             or abs(spot - self._last_strike_spot) >= 1.0
+            or self.current_key is None
+            or self.current_key[0] != expiry
         )
         if need_reselect:
-            below = [s for s in all_strikes if s <= spot][-10:]
-            above = [s for s in all_strikes if s > spot][:10]
-            strikes = sorted(set(below + above))
+            strikes = select_strikes(
+                self.chain.strikes, spot, self.strike_range,
+                include_half_dollar=True,
+            )
             self._subscribe_options(expiry, strikes)
             self._last_strike_spot = spot
 
@@ -658,18 +668,26 @@ class IBWorker:
         for _, row in result.df.iterrows():
             strike = row['strike']
             if strike not in self.today_oi:
-                self.today_oi[strike] = {'call_oi': 0, 'put_oi': 0}
+                self.today_oi[strike] = {
+                    'call_oi': 0,
+                    'put_oi': 0,
+                    'expiry': row.get('expiry'),
+                }
             if row['right'] == 'C':
                 self.today_oi[strike]['call_oi'] = int(row['oi'])
             else:
                 self.today_oi[strike]['put_oi'] = int(row['oi'])
 
-        # Flip 平滑：滑动中位数 + 低 GEX 锁定
+        # Flip 平滑：只接纳 solver 确实找到的有限零点。
         raw_flip = result.gamma_flip
-        if abs(result.total_gex) < 5e8:
+        flip_is_valid = raw_flip is not None and np.isfinite(raw_flip)
+        if not flip_is_valid or abs(result.total_gex) < 5e8:
             # GEX < 0.5B: flip 不可靠，沿用上次值
             if self._flip_buffer:
                 result.gamma_flip = median(self._flip_buffer)
+                result.gamma_flip_method = 'smoothed_previous'
+            else:
+                result.gamma_flip = None
             # 不把不可靠的值放进 buffer
         else:
             self._flip_buffer.append(raw_flip)
@@ -688,8 +706,10 @@ class IBWorker:
         # 计算 skew 指标
         rr_25 = skew_slope = rr_25_zscore = skew_signal = None
         drr_25 = drr_25_zscore = skew_alert_level = skew_alert_score = None
-        rr_10 = butterfly_25 = put_25_richness = call_25_richness = None
+        rr_10 = butterfly_25 = put_25_iv = call_25_iv = None
+        put_25_richness = call_25_richness = None
         wing_curvature_asymmetry = None
+        skew_node_context = {}
         try:
             skew_snap = compute_skew(tickers, spot)
             skew_snap = self.skew_tracker.update(skew_snap, result.positive_gamma)
@@ -704,9 +724,18 @@ class IBWorker:
                 skew_alert_score = skew_snap.alert_score
                 rr_10 = skew_snap.rr_10
                 butterfly_25 = skew_snap.butterfly_25
+                put_25_iv = skew_snap.put_25_iv
+                call_25_iv = skew_snap.call_25_iv
                 put_25_richness = skew_snap.put_25_richness
                 call_25_richness = skew_snap.call_25_richness
                 wing_curvature_asymmetry = skew_snap.wing_curvature_asymmetry
+                for prefix in ("put_25", "call_25"):
+                    for suffix in (
+                        "strike", "delta", "bid", "ask", "mid",
+                        "volume", "open_interest",
+                    ):
+                        field = f"{prefix}_{suffix}"
+                        skew_node_context[field] = getattr(skew_snap, field, None)
         except Exception as e:
             log.debug(f"Skew 计算失败: {e}")
 
@@ -733,6 +762,11 @@ class IBWorker:
             skew_signal=skew_signal,
             partial=getattr(result, 'partial', False),
             quality_reasons=quality_reasons,
+            volume_gamma=result.volume_gamma,
+            gamma_flip_method=result.gamma_flip_method,
+            gross_gex=result.gross_gex,
+            net_gex_ratio=result.net_gex_ratio,
+            gross_volume_gamma=result.gross_volume_gamma,
         )
 
         if self._turning_point_shadow is not None:
@@ -769,10 +803,13 @@ class IBWorker:
                     'skew_alert_score': skew_alert_score,
                     'rr_10': rr_10,
                     'butterfly_25': butterfly_25,
+                    'put_25_iv': put_25_iv,
+                    'call_25_iv': call_25_iv,
                     'put_25_richness': put_25_richness,
                     'call_25_richness': call_25_richness,
                     'wing_curvature_asymmetry': wing_curvature_asymmetry,
                 })
+                vrp_state.update(skew_node_context)
                 self._vrp_monitor.on_gex_update(
                     self.ib,
                     self.current_contracts,
@@ -783,8 +820,13 @@ class IBWorker:
                     gex_state=vrp_state,
                     # 只在固定采样点调用，避免每个 3 秒 tick 都复制状态。
                     intraday_bars_provider=lambda: self.state.get_persist_data()[1],
-                    market_context_provider=lambda: vix_context(
+                    market_context_provider=lambda: market_vol_context(
                         self.ib, et_now(), self._intraday_vrp_config.vix_cache_seconds
+                    ),
+                    term_structure_provider=lambda: standardized_term_structure_context(
+                        self.ib, self.symbol, et_now(), spot,
+                        self._intraday_vrp_config.standardized_iv_dtes,
+                        self._intraday_vrp_config.term_structure_cache_seconds,
                     ),
                     ib_port=self.ib_port,
                 )

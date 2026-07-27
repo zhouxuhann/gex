@@ -43,7 +43,8 @@ def get_latest():
     if not row:
         return None
     return {
-        'spot': float(row[0]), 'gex': float(row[1]), 'flip': float(row[2]),
+        'spot': float(row[0]), 'gex': float(row[1]),
+        'flip': float(row[2]) if row[2] is not None else None,
         'cw': float(row[3]) if row[3] else None,
         'pw': float(row[4]) if row[4] else None,
         'mp': float(row[5]) if row[5] else None,
@@ -68,8 +69,10 @@ def narrate(d) -> str:
 
     # ── 2. 价格位置 ──
     flip = d['flip']
-    dist_flip = spot - flip
-    if abs(dist_flip) < 0.5:
+    dist_flip = spot - flip if flip is not None else None
+    if flip is None:
+        lines.append("  Gamma Flip 当前无可靠零点")
+    elif abs(dist_flip) < 0.5:
         lines.append(f"  价格 ${spot:.2f} 在 Flip ${flip:.1f} {Y}附近（翻转边缘）{X}")
     elif dist_flip > 0:
         lines.append(f"  价格 ${spot:.2f} 在 Flip ${flip:.1f} {G}上方 ${dist_flip:.1f}{X}（稳定区）")
@@ -142,7 +145,9 @@ def narrate(d) -> str:
         else:
             lines.append(f"  {B}建议{X}：正 Gamma 区间内，{C}高抛低吸{X}。区间 ${pw:.0f}-${cw:.0f}")
     elif not d['pos_gamma']:
-        if dist_flip > 0:
+        if dist_flip is None:
+            lines.append(f"  {B}建议{X}：负 Gamma 环境，但无可靠 flip；只参考价格趋势与风险限额")
+        elif dist_flip > 0:
             lines.append(f"  {B}建议{X}：负 Gamma + spot > flip，{G}顺势做多{X}，趋势可能延续")
         else:
             lines.append(f"  {B}建议{X}：负 Gamma + spot < flip，{R}顺势做空{X}或持有 put")

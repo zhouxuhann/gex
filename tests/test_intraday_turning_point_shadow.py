@@ -43,6 +43,7 @@ def _row(**values) -> pd.Series:
         "strike_abs_gex_concentration_50bps": 0.8,
         "gex_change_5m_ratio": 0.0,
         "gex_change_15m_ratio": 0.5,
+        "call_put_gex_imbalance": 0.5,
     }
     base.update(values)
     return pd.Series(base)
@@ -74,6 +75,8 @@ def _market_inputs(minutes: int, *, future_decline: bool = False):
                 "ts": timestamp,
                 "spot": close,
                 "total_gex": 1_000_000_000.0,
+                "gross_gex": 2_000_000_000.0,
+                "gex_method": "oi_position_v2",
                 "flip": 98.0,
                 "call_gex": 1_500_000_000.0,
                 "put_gex": -500_000_000.0,
@@ -92,9 +95,9 @@ def _market_inputs(minutes: int, *, future_decline: bool = False):
 def test_frozen_model_contains_only_cross_symbol_rules():
     model = load_shadow_model(MODEL_PATH)
 
-    assert model.model_id == "qqq_turning_point_shadow_v1_20260722"
-    assert len(model.rules) == 5
-    assert {rule.direction for rule in model.rules} == {"after_down", "after_up"}
+    assert model.model_id == "qqq_turning_point_shadow_oi_v2_20260723"
+    assert len(model.rules) == 3
+    assert {rule.direction for rule in model.rules} == {"after_down"}
 
 
 def test_observation_only_is_a_configuration_hard_lock():
@@ -102,7 +105,7 @@ def test_observation_only_is_a_configuration_hard_lock():
         IntradayTurningPointShadowConfig(observation_only=False)
 
 
-def test_same_feature_family_cannot_double_count():
+def test_legacy_gex_rules_are_disabled_after_method_migration():
     model = load_shadow_model(MODEL_PATH)
     score = score_candidate(
         _row(gex_change_5m_ratio=0.2, gex_change_15m_ratio=0.1),
@@ -110,24 +113,38 @@ def test_same_feature_family_cannot_double_count():
         model,
     )
 
-    assert score["matched_rule_count"] == 2
-    assert score["reversal_support_points"] == 1
-    assert score["reversal_support_max"] == 1
-    assert score["watch_level"] == "WATCH"
+    assert score["matched_rule_count"] == 0
+    assert score["reversal_support_points"] == 0
+    assert score["reversal_support_max"] == 0
+    assert score["watch_level"] == "IGNORE"
 
 
-def test_two_independent_continuation_families_make_strong_watch():
+def test_oi_gamma_reversal_and_atm_iv_continuation_report_conflict():
     model = load_shadow_model(MODEL_PATH)
     score = score_candidate(
-        _row(atm_iv_pct=35.0, strike_abs_gex_concentration_50bps=0.5),
+        _row(atm_iv_pct=35.0, strike_abs_gex_concentration_50bps=0.4),
         "after_down",
         model,
     )
 
-    assert score["continuation_risk_points"] == 2
+    assert score["continuation_risk_points"] == 1
     assert score["continuation_risk_score"] == 100.0
+    assert score["reversal_support_points"] == 1
+    assert score["watch_level"] == "CONFLICT"
+    assert score["score_bias"] == "conflict"
+
+
+def test_two_independent_oi_gamma_families_make_strong_reversal_watch():
+    model = load_shadow_model(MODEL_PATH)
+    score = score_candidate(
+        _row(call_put_gex_imbalance=0.0,
+             strike_abs_gex_concentration_50bps=0.4),
+        "after_down",
+        model,
+    )
+    assert score["reversal_support_points"] == 2
     assert score["watch_level"] == "STRONG_WATCH"
-    assert score["score_bias"] == "continuation"
+    assert score["score_bias"] == "reversal"
 
 
 def test_candidate_and_outcome_use_frozen_label_thresholds():

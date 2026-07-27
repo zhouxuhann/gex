@@ -21,6 +21,9 @@ GEX_COLUMNS = (
     "spot", "total_gex", "flip", "call_gex", "put_gex", "atm_iv_pct",
     "call_wall", "put_wall", "positive_gamma", "max_pain", "rr_25",
     "skew_slope", "rr_25_zscore", "partial", "quality_reasons",
+    "volume_gamma", "gross_gex", "net_gex_ratio", "gross_volume_gamma",
+    "volume_gamma_to_gex", "gex_method", "gamma_flip_status",
+    "gamma_flip_reliable",
 )
 
 
@@ -113,6 +116,14 @@ def strike_snapshot_features(strikes: pd.DataFrame, spot_by_ts: pd.DataFrame) ->
     frame["gex"] = pd.to_numeric(frame.get("gex"), errors="coerce").fillna(0.0)
     frame["gamma"] = pd.to_numeric(frame.get("gamma"), errors="coerce").fillna(0.0)
     frame["oi"] = pd.to_numeric(frame.get("oi"), errors="coerce").fillna(0.0)
+    frame["volume"] = (
+        pd.to_numeric(frame["volume"], errors="coerce").fillna(0.0)
+        if "volume" in frame else 0.0
+    )
+    frame["volume_gamma"] = (
+        pd.to_numeric(frame["volume_gamma"], errors="coerce").fillna(0.0)
+        if "volume_gamma" in frame else 0.0
+    )
     frame["distance_pct"] = frame["strike"] / frame["matched_spot"] - 1.0
     frame["abs_gex"] = frame["gex"].abs()
     frame["near"] = frame["distance_pct"].abs() <= 0.005
@@ -138,6 +149,10 @@ def strike_snapshot_features(strikes: pd.DataFrame, spot_by_ts: pd.DataFrame) ->
         below = snapshot[snapshot["below_near"]]
         near_abs = float(snapshot.loc[snapshot["near"], "abs_gex"].sum())
         total_abs = float(snapshot["abs_gex"].sum())
+        total_gex = float(snapshot["gex"].sum())
+        total_oi = float(snapshot["oi"].sum())
+        total_volume = float(snapshot["volume"].sum())
+        gross_volume_gamma = float(snapshot["volume_gamma"].abs().sum())
         above_abs = float(above["abs_gex"].sum())
         below_abs = float(below["abs_gex"].sum())
         denominator = above_abs + below_abs
@@ -154,6 +169,15 @@ def strike_snapshot_features(strikes: pd.DataFrame, spot_by_ts: pd.DataFrame) ->
             "strike_gex_below_50bps": float(below["gex"].sum()),
             "strike_abs_gex_concentration_50bps": near_abs / total_abs
             if total_abs else None,
+            "strike_total_abs_gex": total_abs,
+            "strike_net_gex_ratio": total_gex / total_abs if total_abs else None,
+            "strike_total_volume": total_volume,
+            "strike_total_oi": total_oi,
+            "strike_volume_oi_ratio": total_volume / total_oi if total_oi else None,
+            "strike_gross_volume_gamma": gross_volume_gamma,
+            "strike_volume_gamma_to_gex": (
+                gross_volume_gamma / total_abs if total_abs else None
+            ),
             "strike_abs_gex_imbalance_50bps": (above_abs - below_abs) / denominator
             if denominator else None,
             "strike_gamma_above_50bps": float(above["gamma"].sum()),
@@ -192,6 +216,90 @@ def align_strike_features(
     return result
 
 
+def rebuild_oi_position_gex(
+    gex: pd.DataFrame,
+    strikes: pd.DataFrame,
+    *,
+    multiplier: float = 100.0,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Rebuild historical strike and snapshot GEX from gamma × OI only.
+
+    Historical files without volume can still support the position channel.
+    The legacy flip is deliberately cleared because it cannot be faithfully
+    repriced without the original expiry metadata and full option inputs.
+    """
+    if gex.empty or strikes.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    history = gex.copy()
+    surface = strikes.copy()
+    history["ts"] = _to_et(history["ts"])
+    surface["ts"] = _to_et(surface["ts"])
+    spots = history[["ts", "spot"]].copy().dropna().sort_values("ts")
+    spots["spot"] = pd.to_numeric(spots["spot"], errors="coerce")
+    surface = pd.merge_asof(
+        surface.sort_values("ts"), spots.rename(columns={"spot": "matched_spot"}),
+        on="ts", direction="backward", tolerance=pd.Timedelta(seconds=120),
+    )
+    for column in ("strike", "gamma", "oi", "matched_spot"):
+        surface[column] = pd.to_numeric(surface.get(column), errors="coerce")
+    right = surface.get("right", pd.Series("", index=surface.index)).astype(str)
+    surface = surface[
+        surface[["strike", "gamma", "oi", "matched_spot"]].notna().all(axis=1)
+        & right.isin(["C", "P"])
+    ].copy()
+    if surface.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    sign = np.where(surface["right"].astype(str).eq("C"), 1.0, -1.0)
+    surface["gex"] = (
+        surface["gamma"] * surface["oi"] * multiplier
+        * surface["matched_spot"].pow(2) * 0.01 * sign
+    )
+    surface["gex_method"] = "oi_position_v2"
+    surface = surface.drop(columns=["matched_spot"])
+
+    rows = []
+    for timestamp, snapshot in surface.groupby("ts", sort=True):
+        calls = snapshot[snapshot["right"].astype(str).eq("C")]
+        puts = snapshot[snapshot["right"].astype(str).eq("P")]
+        call_gex = float(calls["gex"].sum())
+        put_gex = float(puts["gex"].sum())
+        gross = abs(call_gex) + abs(put_gex)
+        call_by_strike = calls.groupby("strike")["gex"].sum()
+        put_by_strike = puts.groupby("strike")["gex"].sum().abs()
+        rows.append({
+            "ts": timestamp,
+            "total_gex_v2": call_gex + put_gex,
+            "call_gex_v2": call_gex,
+            "put_gex_v2": put_gex,
+            "gross_gex_v2": gross,
+            "net_gex_ratio_v2": (call_gex + put_gex) / gross if gross else None,
+            "call_wall_v2": float(call_by_strike.idxmax())
+            if not call_by_strike.empty else None,
+            "put_wall_v2": float(put_by_strike.idxmax())
+            if not put_by_strike.empty else None,
+        })
+    aggregates = pd.DataFrame(rows).sort_values("ts")
+    metadata = history.sort_values("ts").rename(columns={"ts": "source_gex_ts"})
+    rebuilt = pd.merge_asof(
+        aggregates, metadata, left_on="ts", right_on="source_gex_ts",
+        direction="backward", tolerance=pd.Timedelta(seconds=120),
+    )
+    rebuilt = rebuilt.dropna(subset=["spot"])
+    rebuilt["total_gex"] = rebuilt.pop("total_gex_v2")
+    rebuilt["call_gex"] = rebuilt.pop("call_gex_v2")
+    rebuilt["put_gex"] = rebuilt.pop("put_gex_v2")
+    rebuilt["gross_gex"] = rebuilt.pop("gross_gex_v2")
+    rebuilt["net_gex_ratio"] = rebuilt.pop("net_gex_ratio_v2")
+    rebuilt["call_wall"] = rebuilt.pop("call_wall_v2")
+    rebuilt["put_wall"] = rebuilt.pop("put_wall_v2")
+    rebuilt["positive_gamma"] = rebuilt["total_gex"] > 0
+    rebuilt["gex_method"] = "oi_position_v2"
+    rebuilt["flip"] = np.nan
+    rebuilt["gamma_flip_status"] = "unavailable_historical_metadata"
+    rebuilt["gamma_flip_reliable"] = False
+    return rebuilt, surface
+
+
 def add_lagged_features(frame: pd.DataFrame, config: TurningPointConfig) -> pd.DataFrame:
     """Compute feature columns using current and lagged rows only."""
     result = frame.copy().sort_values("ts").reset_index(drop=True)
@@ -211,7 +319,11 @@ def add_lagged_features(frame: pd.DataFrame, config: TurningPointConfig) -> pd.D
     path = close.diff().abs().rolling(15, min_periods=8).sum()
     result["trend_efficiency_15m"] = close.diff(15).abs() / path
 
-    for column in ("total_gex", "flip", "call_wall", "put_wall", "rr_25"):
+    for column in (
+        "total_gex", "volume_gamma", "gross_volume_gamma",
+        "flip", "call_wall", "put_wall", "rr_25",
+        "strike_total_volume", "strike_gross_volume_gamma",
+    ):
         if column in result:
             values = pd.to_numeric(result[column], errors="coerce")
             result[f"{column}_change_5m"] = values - values.shift(5)
@@ -232,6 +344,30 @@ def add_lagged_features(frame: pd.DataFrame, config: TurningPointConfig) -> pd.D
         call = pd.to_numeric(result["call_gex"], errors="coerce")
         put = pd.to_numeric(result["put_gex"], errors="coerce")
         result["call_put_gex_imbalance"] = _safe_ratio(call + put, call.abs() + put.abs())
+    gross_source = None
+    if "strike_total_abs_gex" in result:
+        gross_source = result["strike_total_abs_gex"]
+    elif "gross_gex" in result:
+        gross_source = result["gross_gex"]
+    gross = (
+        pd.to_numeric(gross_source, errors="coerce")
+        if gross_source is not None else None
+    )
+    if "total_gex" in result and gross is not None:
+        result["net_gex_ratio"] = _safe_ratio(
+            pd.to_numeric(result["total_gex"], errors="coerce"), gross
+        )
+    for minutes in (5, 15):
+        gex_change = result.get(f"total_gex_change_{minutes}m")
+        if gex_change is not None and gross is not None:
+            result[f"gex_change_{minutes}m_gross_ratio"] = _safe_ratio(
+                pd.to_numeric(gex_change, errors="coerce"), gross
+            )
+        volume_change = result.get(f"strike_gross_volume_gamma_change_{minutes}m")
+        if volume_change is not None and gross is not None:
+            result[f"volume_gamma_change_{minutes}m_gross_ratio"] = _safe_ratio(
+                pd.to_numeric(volume_change, errors="coerce"), gross
+            )
     return result
 
 
@@ -348,6 +484,8 @@ def build_symbol_dataset(
     data_dir: Path | str,
     symbol: str,
     config: TurningPointConfig | None = None,
+    *,
+    gex_method: str = "stored",
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame], dict]:
     """Build full minute features and deduplicated candidate events."""
     config = config or TurningPointConfig()
@@ -368,6 +506,16 @@ def build_symbol_dataset(
             continue
         gex = pd.read_parquet(gex_path)
         strikes = pd.read_parquet(strikes_path) if strikes_path.exists() else None
+        if gex_method == "oi_position_v2":
+            if strikes is None:
+                rejected[date_str] = "missing_strikes_for_oi_position_v2"
+                continue
+            gex, strikes = rebuild_oi_position_gex(gex, strikes)
+            if gex.empty or strikes.empty:
+                rejected[date_str] = "oi_position_v2_rebuild_failed"
+                continue
+        elif gex_method != "stored":
+            raise ValueError(f"unsupported gex_method: {gex_method}")
         frame = prepare_day(
             bars, gex, strikes, symbol=symbol, date_str=date_str, config=config
         )
@@ -391,6 +539,7 @@ def build_symbol_dataset(
     summary = {
         "schema_version": 1,
         "symbol": symbol,
+        "gex_method": gex_method,
         "config": config.__dict__,
         "usable_days": len(day_frames),
         "rejected_days": rejected,

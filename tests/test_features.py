@@ -4,10 +4,10 @@ import pandas as pd
 from gex_monitor.features import compute_snapshot_features, classify_regime
 
 
-def test_snapshot_flip_uses_main_crossing_logic_and_gex_flip_column():
+def test_snapshot_balance_feature_uses_position_gex():
     df = pd.DataFrame([
-        {'strike': 100.0, 'right': 'C', 'gex': 100.0, 'gex_flip': -5.0},
-        {'strike': 101.0, 'right': 'C', 'gex': 100.0, 'gex_flip': 10.0},
+        {'strike': 100.0, 'right': 'P', 'gex': -5.0},
+        {'strike': 101.0, 'right': 'C', 'gex': 10.0},
     ])
 
     feat = compute_snapshot_features(df, spot=100.4)

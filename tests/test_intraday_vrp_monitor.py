@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from gex_monitor.config import IntradayVRPConfig
-from gex_monitor.intraday_vrp_monitor import IntradayVRPMonitor
+from gex_monitor.intraday_vrp_monitor import IntradayVRPMonitor, vrp_gex_advisory
 from gex_monitor.storage import StorageManager
 from gex_monitor.time_utils import ET
 
@@ -34,6 +34,25 @@ def ticker(bid, ask, delta, ts, gamma=0.02, theta=-0.08, vega=0.03, iv=0.25):
         modelGreeks=SimpleNamespace(delta=delta, gamma=gamma, theta=theta,
                                     vega=vega, impliedVol=iv),
     )
+
+
+def test_vrp_gex_context_is_advisory_and_requires_new_oi_method():
+    valid = vrp_gex_advisory({
+        "gex_method": "oi_position_v2", "total_gex": -200.0,
+        "gross_gex": 1000.0, "gross_volume_gamma": 250.0,
+        "partial": False,
+    })
+    assert valid["gex_vrp_regime"] == "short_gamma"
+    assert valid["gex_strategy_preference"] == "defined_risk_preferred"
+    assert valid["volume_gamma_to_gex"] == 0.25
+    assert valid["gex_hard_gate_enabled"] is False
+
+    legacy = vrp_gex_advisory({
+        "gex_method": "legacy_mixed", "total_gex": 200.0,
+        "gross_gex": 1000.0,
+    })
+    assert legacy["gex_vrp_regime"] == "unknown"
+    assert legacy["gex_strategy_preference"] == "observe_only"
 
 
 def test_due_slot_window_and_persisted_dedup(tmp_path):
@@ -90,6 +109,7 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
         gex_state={"total_gex": 1e9, "gamma_flip": 720,
                    "positive_gamma": True, "regime_tags": {},
                    "rr_25": 0.04, "skew_slope": 0.2,
+                   "put_25_iv": 0.31, "call_25_iv": 0.27,
                    "rr_25_zscore": 1.1, "drr_25": 0.005,
                    "drr_25_zscore": 0.7},
         intraday_bars_provider=lambda: bars,
@@ -98,9 +118,18 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
     assert row["status"] == "ok"
     assert row["strike"] == 725
     assert row["sell_credit_bid"] == 3.5
-    assert row["schema_version"] == 4
+    assert row["schema_version"] == 5
     assert row["rr_25"] == 0.04
     assert row["drr_25"] == 0.005
+    assert row["put_25_iv"] == 0.31
+    assert row["call_25_iv"] == 0.27
+    assert abs(row["minutes_to_close"] - (385 - 2 / 60)) < 1e-9
+    assert abs(row["tau_session"] - row["minutes_to_close"] / 390) < 1e-9
+    assert abs(row["tau_years"] - row["minutes_to_close"] / (252 * 390)) < 1e-9
+    assert abs(
+        row["tau_calendar_years"]
+        - row["minutes_to_close"] / (365 * 24 * 60)
+    ) < 1e-9
     assert abs(row["straddle_gamma"] - 0.04) < 1e-9
     assert abs(row["straddle_theta"] + 0.16) < 1e-9
     assert row["entry_bar_count"] == 1
@@ -118,6 +147,12 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
     assert abs(fly["gross_net_credit"] - 0.7) < 1e-9
     assert abs(fly["net_credit_after_fees"] - 0.674) < 1e-9
     assert abs(fly["max_loss_dollars"] - 32.6) < 1e-9
+    minute = storage.load_vrp_minute_nodes("QQQ", "20260716")
+    cone = storage.load_vrp_cone_nodes("QQQ", "20260716")
+    assert len(minute) == 1
+    assert len(cone) == 1
+    assert minute.iloc[0]["sample_kind"] == "raw_1m"
+    assert cone.iloc[0]["sample_kind"] == "cone_5m"
     storage.shutdown()
 
 
@@ -192,6 +227,8 @@ def test_settlement_uses_actual_strike_and_cleans_cross_day_bars(tmp_path):
         "schema_version": 1, "symbol": "QQQ", "trading_date": "20260715",
         "scheduled_time": "15:00", "observed_at": observed, "spot": 724.6,
         "strike": 725.0, "straddle_mid": 2.0, "sell_credit_bid": 1.8,
+        "call_implied_vol": 0.20, "put_implied_vol": 0.20,
+        "tau_calendar_years": 1 / (365 * 24),
         "status": "ok",
     })
     storage.persist_vrp_iron_flies("QQQ", "20260715", [{
@@ -218,6 +255,9 @@ def test_settlement_uses_actual_strike_and_cleans_cross_day_bars(tmp_path):
     assert row["terminal_payoff"] == 1.0
     assert abs(row["pnl_executable"] - 0.787) < 1e-9
     assert row["rth_bar_count"] == 390
+    assert row["implied_variance_remaining"] > 0
+    assert row["realized_variance_remaining"] == 0
+    assert row["ex_post_variance_spread"] > 0
     assert bool(row["breakeven_breached"])
     assert row["path_high"] == 726.0
     fly = storage.load_vrp_iron_fly_observations("QQQ", "20260715").iloc[0]

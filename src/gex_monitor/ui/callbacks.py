@@ -188,6 +188,8 @@ def register_callbacks(
         max_pain = s.get('max_pain')
         call_wall_txt = f"{call_wall:.0f}" if call_wall else "—"
         put_wall_txt = f"{put_wall:.0f}" if put_wall else "—"
+        gamma_flip = s.get('gamma_flip')
+        gamma_flip_txt = f"{gamma_flip:.1f}" if gamma_flip is not None else "—"
         max_pain_txt = f"{max_pain:.0f}" if max_pain else "—"
 
         # Skew 指标
@@ -206,7 +208,7 @@ def register_callbacks(
                       style={'color': '#00ff88' if s['total_gex'] > 0 else '#ff4444'}),
             html.Span(f"[{gamma_env_txt}]  |  ",
                       style={'color': gamma_env_color, 'fontWeight': 'bold'}),
-            html.Span(f"Flip: {s['gamma_flip']:.0f}  |  ", style={'color': '#ffaa00'}),
+            html.Span(f"Flip: {gamma_flip_txt}  |  ", style={'color': '#ffaa00'}),
             html.Span(f"Call Wall: {call_wall_txt}  |  ", style={'color': '#00d4ff'}),
             html.Span(f"Put Wall: {put_wall_txt}  |  ", style={'color': '#ff66cc'}),
             html.Span(f"Max Pain: {max_pain_txt}  |  ", style={'color': '#aaaaaa'}),
@@ -281,7 +283,8 @@ def register_callbacks(
                               marker_color='#ff66cc', name='Puts'), row=2, col=1)
         for r in [1, 2]:
             fig1.add_vline(x=s['spot'], line=dict(color='white', dash='dash'), row=r, col=1)
-            fig1.add_vline(x=s['gamma_flip'], line=dict(color='#ffaa00', dash='dot'), row=r, col=1)
+            if gamma_flip is not None:
+                fig1.add_vline(x=gamma_flip, line=dict(color='#ffaa00', dash='dot'), row=r, col=1)
             # Call Wall (阻力) - 青色
             if call_wall:
                 fig1.add_vline(x=call_wall, line=dict(color='#00d4ff', width=2), row=r, col=1)

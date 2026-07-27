@@ -52,6 +52,22 @@ class SkewSnapshot:
     alert_note: str | None = None
     rr_10: float | None = None
     butterfly_25: float | None = None
+    put_25_iv: float | None = None
+    call_25_iv: float | None = None
+    put_25_strike: float | None = None
+    put_25_delta: float | None = None
+    put_25_bid: float | None = None
+    put_25_ask: float | None = None
+    put_25_mid: float | None = None
+    put_25_volume: float | None = None
+    put_25_open_interest: float | None = None
+    call_25_strike: float | None = None
+    call_25_delta: float | None = None
+    call_25_bid: float | None = None
+    call_25_ask: float | None = None
+    call_25_mid: float | None = None
+    call_25_volume: float | None = None
+    call_25_open_interest: float | None = None
     put_25_richness: float | None = None
     call_25_richness: float | None = None
     wing_curvature_asymmetry: float | None = None
@@ -88,6 +104,13 @@ def compute_skew(tickers, spot: float) -> SkewSnapshot | None:
             'right': c.right,
             'iv': g.impliedVol,
             'delta': g.delta,
+            'bid': getattr(t, 'bid', None),
+            'ask': getattr(t, 'ask', None),
+            'volume': getattr(t, 'volume', None),
+            'open_interest': (
+                getattr(t, 'putOpenInterest', None) if c.right == 'P'
+                else getattr(t, 'callOpenInterest', None)
+            ),
         })
 
     if len(rows) < 4:  # 至少需要几个合约
@@ -108,6 +131,8 @@ def compute_skew(tickers, spot: float) -> SkewSnapshot | None:
 
     put_25_iv = _iv_at_delta(puts, TARGET_DELTA_25)
     call_25_iv = _iv_at_delta(calls, TARGET_DELTA_25)
+    put_25 = _row_at_delta(puts, TARGET_DELTA_25)
+    call_25 = _row_at_delta(calls, TARGET_DELTA_25)
     rr_10 = _calc_risk_reversal(puts, calls, 0.10)
     butterfly_25 = (0.5 * (put_25_iv + call_25_iv) - atm_iv
                     if None not in (put_25_iv, call_25_iv, atm_iv) else None)
@@ -127,6 +152,10 @@ def compute_skew(tickers, spot: float) -> SkewSnapshot | None:
         signal=None,        # SkewTracker 填充
         rr_10=rr_10,
         butterfly_25=butterfly_25,
+        put_25_iv=put_25_iv,
+        call_25_iv=call_25_iv,
+        **_node_fields("put_25", put_25),
+        **_node_fields("call_25", call_25),
         put_25_richness=put_richness,
         call_25_richness=call_richness,
         wing_curvature_asymmetry=(put_richness - call_richness
@@ -180,6 +209,38 @@ def _iv_at_delta(side_df: pd.DataFrame, target_delta: float) -> float | None:
         return None
 
     return float(valid.loc[idx, 'iv'])
+
+
+def _row_at_delta(side_df: pd.DataFrame,
+                  target_delta: float) -> pd.Series | None:
+    valid = side_df.dropna(subset=['delta', 'iv'])
+    if valid.empty:
+        return None
+    diffs = (valid['delta'].abs() - target_delta).abs()
+    idx = diffs.idxmin()
+    return None if diffs.loc[idx] > 0.15 else valid.loc[idx]
+
+
+def _clean_number(value) -> float | None:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def _node_fields(prefix: str, row: pd.Series | None) -> dict:
+    fields = ("strike", "delta", "bid", "ask", "volume", "open_interest")
+    result = {f"{prefix}_{field}": None for field in fields}
+    result[f"{prefix}_mid"] = None
+    if row is None:
+        return result
+    for field in fields:
+        result[f"{prefix}_{field}"] = _clean_number(row.get(field))
+    bid, ask = result[f"{prefix}_bid"], result[f"{prefix}_ask"]
+    if bid is not None and ask is not None and bid >= 0 and ask >= bid:
+        result[f"{prefix}_mid"] = (bid + ask) / 2
+    return result
 
 
 def _calc_skew_slope(

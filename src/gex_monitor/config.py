@@ -99,6 +99,10 @@ class IntradayVRPConfig(BaseModel):
         "09:35", "10:00", "10:30", "11:00", "12:00",
         "13:00", "14:00", "14:30", "15:00",
     ])
+    minute_nodes_enabled: bool = True
+    minute_node_start_et: str = "09:35"
+    minute_node_end_et: str = "15:55"
+    cone_interval_minutes: int = 5
     sample_window_seconds: int = 180
     candidate_strikes_each_side: int = 2
     wing_strikes_each_side: int = 5
@@ -110,6 +114,8 @@ class IntradayVRPConfig(BaseModel):
     mtm_interval_minutes: int = 5
     mtm_fixed_times_et: list[str] = Field(default_factory=lambda: ["15:30"])
     vix_cache_seconds: int = 300
+    standardized_iv_dtes: list[int] = Field(default_factory=lambda: [1, 2, 5])
+    term_structure_cache_seconds: int = 900
     paper_execution_enabled: bool = False
     paper_straddle_execution_enabled: bool = False
     paper_required_port: int = 4002

@@ -10,16 +10,19 @@ GEX 约定
 单位: 美元 per 1% spot 变动。
 
 注意: IB 返回的 OI 是前一交易日收盘数字，盘中不会变。
-因此盘中 GEX 的波动 100% 来自 gamma 和 spot^2 ——
-本实现严格说是 "基于前日 OI 的理论 dealer GEX"。
+因此盘中 position GEX 的波动来自 gamma 和 spot^2。本模块另外计算
+volume_gamma 作为当日成交活跃度，但绝不再用 volume 替代 OI。
 """
 from dataclasses import dataclass
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 # ATM IV 计算时，strike 偏离 spot 的最大允许比例
 ATM_MAX_DEVIATION_PCT = 0.02
+ET = ZoneInfo("America/New_York")
 
 
 @dataclass
@@ -29,7 +32,7 @@ class GEXResult:
     total_gex: float           # 总 GEX
     call_gex: float            # Call GEX
     put_gex: float             # Put GEX
-    gamma_flip: float          # Gamma Flip 行权价
+    gamma_flip: float | None   # 重新定价求得的 Gamma Flip；无零点时为 None
     atm_iv_pct: float | None   # ATM IV (百分比)
     missing_greeks: int        # 缺少 Greeks 的合约数
     missing_oi: int            # 缺少 OI 的合约数
@@ -46,6 +49,14 @@ class GEXResult:
     max_put_delta_oi_strike: float | None = None   # Put ΔOI 最大的 strike
     # 降级模式标记
     partial: bool = False  # True = 尾盘降级模式，仅 ATM 附近少量 strike
+    # 成交量只描述活动，不代表未平仓 dealer 仓位。
+    volume_gamma: float = 0.0
+    call_volume_gamma: float = 0.0
+    put_volume_gamma: float = 0.0
+    gamma_flip_method: str = "unavailable"
+    gross_gex: float = 0.0
+    net_gex_ratio: float = 0.0
+    gross_volume_gamma: float = 0.0
 
 
 def calculate_gex(
@@ -53,6 +64,7 @@ def calculate_gex(
     spot: float,
     oi_ready_threshold: float = 0.8,
     prev_oi: dict[float, dict] | None = None,
+    as_of: datetime | None = None,
 ) -> GEXResult | None:
     """
     从 IB tickers 计算 GEX
@@ -66,18 +78,21 @@ def calculate_gex(
     Returns:
         GEXResult 或 None（无有效数据或 OI 未就绪时）
     """
+    if not np.isfinite(spot) or spot <= 0:
+        return None
+    oi_ready_threshold = float(np.clip(oi_ready_threshold, 0.0, 1.0))
     rows = []
     missing_oi = 0
     missing_greeks = 0
     invalid_contracts = 0
     total_with_greeks = 0  # 有 Greeks 的合约数
-    total_with_exposure_qty = 0  # 有 OI 或盘中 volume，可用于 GEX 暴露计算
+    total_with_oi = 0
 
     for t in tickers:
         if t is None:
             continue
         g = t.modelGreeks
-        if not g or g.gamma is None:
+        if not g or g.gamma is None or not np.isfinite(g.gamma) or g.gamma < 0:
             missing_greeks += 1
             continue
         c = t.contract
@@ -95,38 +110,41 @@ def calculate_gex(
 
         total_with_greeks += 1
 
-        # OI: 用于计算 Flip（稳定的 dealer 仓位）
-        if oi is None or (isinstance(oi, float) and np.isnan(oi)) or oi <= 0:
+        # OI 是 position GEX 的唯一仓位输入。
+        try:
+            oi_value = float(oi)
+        except (TypeError, ValueError):
+            oi_value = np.nan
+        if not np.isfinite(oi_value) or oi_value <= 0:
             missing_oi += 1
             oi_qty = 0
         else:
-            oi_qty = oi
+            oi_qty = oi_value
 
-        # Volume: 用于计算 GEX（盘中实时活动）
+        # Volume 仅用于独立的活动度指标，不能代替未平仓量。
         vol = getattr(t, 'volume', None)
-        has_volume = (vol is not None
-                      and isinstance(vol, (int, float))
-                      and not (isinstance(vol, float) and np.isnan(vol))
-                      and vol > 0)
+        try:
+            vol_value = float(vol)
+        except (TypeError, ValueError):
+            vol_value = np.nan
+        has_volume = np.isfinite(vol_value) and vol_value > 0
         if has_volume:
-            vol_qty = vol
+            vol_qty = vol_value
         else:
-            vol_qty = oi_qty  # fallback 到 OI
+            vol_qty = 0
 
-        if oi_qty > 0 or has_volume:
-            total_with_exposure_qty += 1
+        if oi_qty > 0:
+            total_with_oi += 1
 
         # dealer 约定: +1 for calls, -1 for puts
         multiplier = int(c.multiplier) if c.multiplier else 100
-        gex_oi = sign * g.gamma * oi_qty * multiplier * spot ** 2 * 0.01    # 用于 Flip
+        gex_oi = sign * g.gamma * oi_qty * multiplier * spot ** 2 * 0.01
+        volume_gamma = sign * g.gamma * vol_qty * multiplier * spot ** 2 * 0.01
 
-        # Flip 用量: 有成交量的 strike 用 volume，无成交量的用 OI * 衰减因子
-        # 尾盘 OTM 期权 volume 归零，stale OI 会锚定 flip，降权以减少干扰
-        OI_DECAY_FACTOR = 0.3
-        flip_qty = vol if has_volume else oi_qty * OI_DECAY_FACTOR
-        gex_flip = sign * g.gamma * flip_qty * multiplier * spot ** 2 * 0.01
-
-        gex_vol = sign * g.gamma * vol_qty * multiplier * spot ** 2 * 0.01  # 用于 GEX 总量
+        expiry = getattr(c, 'lastTradeDateOrContractMonth', None)
+        expiry = expiry if isinstance(expiry, str) else None
+        con_id = getattr(c, 'conId', None)
+        con_id = int(con_id) if isinstance(con_id, (int, np.integer)) else None
 
         rows.append({
             'strike': c.strike,
@@ -136,41 +154,45 @@ def calculate_gex(
             'volume': vol_qty,
             'has_volume': has_volume,
             'gex_oi': gex_oi,    # OI-based GEX
-            'gex_flip': gex_flip, # Flip 专用 (volume 优先，OI 降权)
-            'gex': gex_vol,      # Volume-based GEX (for total)
+            'gex': gex_oi,       # 主 GEX 始终是 OI-based
+            'volume_gamma': volume_gamma,
             'iv': g.impliedVol,
+            'multiplier': multiplier,
+            'expiry': expiry,
+            'con_id': con_id,
         })
 
     if not rows:
         return None
 
-    # 检查可用于暴露计算的数据比例。IB 有时盘中返回 Greeks/volume，
-    # 但 OI 字段为 NaN；这种情况下仍可用 volume 计算实时 GEX。
+    # 检查 OI 就绪比例。成交量不能让 position GEX 通过就绪检查。
     if total_with_greeks > 0:
-        exposure_ready_ratio = total_with_exposure_qty / total_with_greeks
-        if exposure_ready_ratio < oi_ready_threshold:
-            return None  # OI/volume 数据未就绪，等待
+        oi_ready_ratio = total_with_oi / total_with_greeks
+        if oi_ready_ratio < oi_ready_threshold:
+            return None  # OI 数据未就绪，等待
 
     df = pd.DataFrame(rows)
 
-    # 按行权价汇总（OI-based）
-    by_strike_oi = df.groupby('strike')['gex_oi'].sum().sort_index()
+    # Gamma Flip：在候选 spot 上用 Black-Scholes 重新计算各合约 gamma。
+    gamma_flip = _calculate_repriced_gamma_flip(df, spot, as_of=as_of)
+    gamma_flip_method = "repriced_oi" if gamma_flip is not None else "unavailable"
 
-    # Gamma Flip: 用 flip 专用 GEX（有量用 volume，无量 OI 降权 0.3）
-    by_strike_flip = df.groupby('strike')['gex_flip'].sum().sort_index()
-    gamma_flip = _calculate_gamma_flip(by_strike_flip, spot)
-
-    # GEX 总量: 用 Volume-based GEX 计算（实时）
+    # Position GEX 总量：只用 OI。
     total_gex = df['gex'].sum()
     call_gex = df[df.right == 'C']['gex'].sum()
     put_gex = df[df.right == 'P']['gex'].sum()
+    gross_gex = abs(call_gex) + abs(put_gex)
+    net_gex_ratio = total_gex / gross_gex if gross_gex > 0 else 0.0
+    total_volume_gamma = df['volume_gamma'].sum()
+    call_volume_gamma = df[df.right == 'C']['volume_gamma'].sum()
+    put_volume_gamma = df[df.right == 'P']['volume_gamma'].sum()
+    gross_volume_gamma = abs(call_volume_gamma) + abs(put_volume_gamma)
 
     # ATM IV
     atm_iv_pct = _calculate_atm_iv(df, spot)
 
-    # Call Wall / Put Wall 计算（用 Volume-based GEX，反映实时交易压力）
-    by_strike_vol = df.groupby('strike')['gex'].sum().sort_index()
-    call_wall, put_wall = _calculate_walls(by_strike_vol, spot)
+    # Walls 分别从 call/put OI gamma 中计算，避免同 strike 相互抵消。
+    call_wall, put_wall = _calculate_side_walls(df, spot)
 
     # 是否正 Gamma 环境
     positive_gamma = total_gex > 0
@@ -186,13 +208,20 @@ def calculate_gex(
         call_oi_today = df[df.right == 'C'].groupby('strike')['oi'].sum()
         put_oi_today = df[df.right == 'P'].groupby('strike')['oi'].sum()
 
-        all_strikes = set(call_oi_today.index) | set(put_oi_today.index) | set(prev_oi.keys())
-        for strike in sorted(all_strikes):
+        current_expiries = {x for x in df['expiry'].dropna().unique() if x}
+        current_expiry = next(iter(current_expiries)) if len(current_expiries) == 1 else None
+        # 只比较当前窗口内、且 expiry 明确相同的合约。缺失不能解释为 OI=0。
+        for strike in sorted(set(call_oi_today.index) | set(put_oi_today.index)):
             call_today = call_oi_today.get(strike, 0)
             put_today = put_oi_today.get(strike, 0)
-            prev = prev_oi.get(strike, {'call_oi': 0, 'put_oi': 0})
-            call_prev = prev.get('call_oi', 0)
-            put_prev = prev.get('put_oi', 0)
+            prev = prev_oi.get(strike)
+            same_contract = (
+                prev is not None
+                and current_expiry is not None
+                and prev.get('expiry') == current_expiry
+            )
+            call_prev = prev.get('call_oi') if same_contract else np.nan
+            put_prev = prev.get('put_oi') if same_contract else np.nan
 
             delta_oi_rows.append({
                 'strike': strike,
@@ -208,10 +237,12 @@ def calculate_gex(
             delta_oi_df = pd.DataFrame(delta_oi_rows)
             # 找 ΔOI 最大的 strike
             if not delta_oi_df.empty:
-                max_call_idx = delta_oi_df['call_delta_oi'].idxmax()
-                max_put_idx = delta_oi_df['put_delta_oi'].idxmax()
-                max_call_delta_oi_strike = delta_oi_df.loc[max_call_idx, 'strike']
-                max_put_delta_oi_strike = delta_oi_df.loc[max_put_idx, 'strike']
+                valid_call = delta_oi_df['call_delta_oi'].dropna()
+                valid_put = delta_oi_df['put_delta_oi'].dropna()
+                if not valid_call.empty:
+                    max_call_delta_oi_strike = delta_oi_df.loc[valid_call.idxmax(), 'strike']
+                if not valid_put.empty:
+                    max_put_delta_oi_strike = delta_oi_df.loc[valid_put.idxmax(), 'strike']
 
     # Max Pain 计算（使用 OI）
     max_pain = _calculate_max_pain(df)
@@ -233,7 +264,25 @@ def calculate_gex(
         delta_oi_df=delta_oi_df,
         max_call_delta_oi_strike=max_call_delta_oi_strike,
         max_put_delta_oi_strike=max_put_delta_oi_strike,
+        volume_gamma=total_volume_gamma,
+        call_volume_gamma=call_volume_gamma,
+        put_volume_gamma=put_volume_gamma,
+        gamma_flip_method=gamma_flip_method,
+        gross_gex=gross_gex,
+        net_gex_ratio=net_gex_ratio,
+        gross_volume_gamma=gross_volume_gamma,
     )
+
+
+def _calculate_side_walls(df: pd.DataFrame, spot: float) -> tuple[float | None, float | None]:
+    """Return the strongest OI call above spot and OI put below spot."""
+    calls = df[(df['right'] == 'C') & (df['strike'] >= spot)]
+    puts = df[(df['right'] == 'P') & (df['strike'] <= spot)]
+    call_by_strike = calls.groupby('strike')['gex'].sum()
+    put_by_strike = puts.groupby('strike')['gex'].sum()
+    call_wall = float(call_by_strike.idxmax()) if not call_by_strike.empty else None
+    put_wall = float(put_by_strike.idxmin()) if not put_by_strike.empty else None
+    return call_wall, put_wall
 
 
 def _calculate_walls(by_strike: pd.Series, spot: float) -> tuple[float | None, float | None]:
@@ -264,9 +313,9 @@ def _calculate_walls(by_strike: pd.Series, spot: float) -> tuple[float | None, f
     return call_wall, put_wall
 
 
-def _calculate_gamma_flip(by_strike: pd.Series, spot: float) -> float:
+def _calculate_gamma_flip(by_strike: pd.Series, spot: float) -> float | None:
     """
-    计算 Gamma Flip 价格（累积 GEX 穿越零点的位置）
+    计算累积 GEX 平衡点（兼容旧调用；不是严格的 repriced flip）。
 
     使用线性插值找到精确的零点位置，而不是简单取最近的 strike。
 
@@ -275,23 +324,23 @@ def _calculate_gamma_flip(by_strike: pd.Series, spot: float) -> float:
         spot: 当前现货价格
 
     Returns:
-        Gamma flip 价格
+        离 spot 最近的平衡点；没有穿越时返回 None
     """
-    if len(by_strike) == 0:
-        return spot  # fallback to spot
+    if by_strike is None or len(by_strike) == 0 or not np.isfinite(spot):
+        return None
 
     if len(by_strike) == 1:
-        return float(by_strike.index[0])
+        return None
 
     cumsum = by_strike.cumsum()
 
-    # 检查是否有符号变化（穿越零点）
-    signs = np.sign(cumsum.values)
+    values = cumsum.to_numpy(dtype=float)
+    exact = np.flatnonzero(np.isclose(values, 0.0, atol=1e-12))
+    candidates = [float(cumsum.index[i]) for i in exact]
+    signs = np.sign(values)
     sign_changes = np.where(signs[:-1] * signs[1:] < 0)[0]
 
-    if len(sign_changes) > 0:
-        # 找到第一个符号变化位置，进行线性插值
-        idx = sign_changes[0]
+    for idx in sign_changes:
         strike_low = by_strike.index[idx]
         strike_high = by_strike.index[idx + 1]
         cumsum_low = cumsum.iloc[idx]
@@ -302,14 +351,118 @@ def _calculate_gamma_flip(by_strike: pd.Series, spot: float) -> float:
         # t = -cumsum_low / (cumsum_high - cumsum_low)
         if cumsum_high != cumsum_low:
             t = -cumsum_low / (cumsum_high - cumsum_low)
-            gamma_flip = strike_low + (strike_high - strike_low) * t
+            candidate = strike_low + (strike_high - strike_low) * t
         else:
-            gamma_flip = (strike_low + strike_high) / 2
-    else:
-        # 没有穿越零点，返回累积绝对值最小的 strike
-        gamma_flip = float(cumsum.abs().idxmin())
+            candidate = (strike_low + strike_high) / 2
+        candidates.append(float(candidate))
 
-    return gamma_flip
+    if not candidates:
+        return None
+    return min(candidates, key=lambda x: abs(x - spot))
+
+
+def _parse_expiry_close(value: object) -> datetime | None:
+    if not isinstance(value, str) or len(value) < 8:
+        return None
+    try:
+        day = datetime.strptime(value[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+    return datetime.combine(day, time(16, 0), tzinfo=ET)
+
+
+def _calculate_repriced_gamma_flip(
+    df: pd.DataFrame,
+    spot: float,
+    *,
+    as_of: datetime | None = None,
+    risk_free_rate: float = 0.05,
+    search_pct: float = 0.15,
+    grid_points: int = 301,
+) -> float | None:
+    """Solve net OI gamma(S)=0 after re-pricing gamma across candidate spots.
+
+    IV is held constant per contract. This is still a positioning estimate—the
+    call-positive/put-negative dealer convention is an assumption—but unlike a
+    strike cumsum it answers the actual spot-perturbation question.
+    """
+    required = {'strike', 'right', 'oi', 'iv', 'multiplier', 'expiry'}
+    if df is None or df.empty or not required.issubset(df.columns):
+        return None
+    if not np.isfinite(spot) or spot <= 0 or grid_points < 3:
+        return None
+
+    now = as_of or datetime.now(ET)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ET)
+    else:
+        now = now.astimezone(ET)
+
+    records = []
+    for row in df[list(required)].to_dict('records'):
+        expiry_close = _parse_expiry_close(row['expiry'])
+        if expiry_close is None:
+            continue
+        t_years = (expiry_close - now).total_seconds() / (365.0 * 86400.0)
+        try:
+            strike = float(row['strike'])
+            oi = float(row['oi'])
+            iv = float(row['iv'])
+            multiplier = float(row['multiplier'])
+        except (TypeError, ValueError):
+            continue
+        if not (t_years > 0 and strike > 0 and oi > 0 and 0 < iv < 5 and multiplier > 0):
+            continue
+        sign = 1.0 if row['right'] == 'C' else -1.0 if row['right'] == 'P' else 0.0
+        if sign:
+            records.append((strike, oi, iv, multiplier, t_years, sign))
+
+    if len(records) < 2:
+        return None
+
+    arr = np.asarray(records, dtype=float)
+    strikes, oi, iv, multiplier, t_years, signs = arr.T
+    # Never extrapolate a flip beyond the observed strike universe. A root at
+    # the edge is evidence that the subscription window is too narrow, not a
+    # reliable market level.
+    lower = max(spot * (1.0 - search_pct), float(strikes.min()))
+    upper = min(spot * (1.0 + search_pct), float(strikes.max()))
+    if not lower < upper:
+        return None
+    spots = np.linspace(lower, upper, grid_points)
+    sqrt_t = np.sqrt(t_years)[None, :]
+    sigma = iv[None, :]
+    spot_grid = spots[:, None]
+    d1 = (
+        np.log(spot_grid / strikes[None, :])
+        + (risk_free_rate + 0.5 * sigma ** 2) * t_years[None, :]
+    ) / (sigma * sqrt_t)
+    normal_pdf = np.exp(-0.5 * d1 ** 2) / np.sqrt(2.0 * np.pi)
+    gamma = normal_pdf / (spot_grid * sigma * sqrt_t)
+    exposures = (
+        gamma * oi[None, :] * multiplier[None, :] * signs[None, :]
+        * spot_grid ** 2 * 0.01
+    ).sum(axis=1)
+
+    exact = np.flatnonzero(np.isclose(exposures, 0.0, atol=1e-8))
+    candidates = [float(spots[i]) for i in exact]
+    changes = np.flatnonzero(exposures[:-1] * exposures[1:] < 0)
+    for idx in changes:
+        y0, y1 = exposures[idx], exposures[idx + 1]
+        x0, x1 = spots[idx], spots[idx + 1]
+        candidates.append(float(x0 - y0 * (x1 - x0) / (y1 - y0)))
+
+    if not candidates:
+        return None
+    unique_strikes = np.unique(strikes)
+    spacing = (
+        float(np.median(np.diff(unique_strikes)))
+        if len(unique_strikes) > 1 else (upper - lower)
+    )
+    interior = [x for x in candidates if lower + spacing <= x <= upper - spacing]
+    if not interior:
+        return None
+    return min(interior, key=lambda x: abs(x - spot))
 
 
 def _calculate_atm_iv(df: pd.DataFrame, spot: float) -> float | None:
@@ -335,7 +488,13 @@ def _calculate_atm_iv(df: pd.DataFrame, spot: float) -> float | None:
     if deviation > ATM_MAX_DEVIATION_PCT:
         return None  # strike 偏离太远，不够 ATM
 
-    atm_rows = df[(df['strike'] == atm_strike) & df['iv'].notna()]
+    iv_numeric = pd.to_numeric(df['iv'], errors='coerce')
+    atm_rows = df[
+        (df['strike'] == atm_strike)
+        & iv_numeric.notna()
+        & (iv_numeric > 0)
+        & (iv_numeric < 5)
+    ]
     if atm_rows.empty:
         return None
 
@@ -377,6 +536,8 @@ def _calculate_max_pain(df: pd.DataFrame) -> float | None:
     put_oi = df[df['right'] == 'P'].groupby('strike')['oi'].sum()
 
     if call_oi.empty and put_oi.empty:
+        return None
+    if float(call_oi.sum()) + float(put_oi.sum()) <= 0:
         return None
 
     # 获取所有 strikes 作为候选价格

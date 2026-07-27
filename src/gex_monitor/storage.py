@@ -298,6 +298,53 @@ class StorageManager:
             ['symbol', 'trading_date', 'scheduled_time'], self._io_lock,
         )
 
+    def persist_vrp_minute_node(self, symbol: str, date_str: str,
+                                row: dict) -> None:
+        """保存每分钟标准化0DTE节点；不进入策略订单或MTM链路。"""
+        path = self.data_dir / f'vrp_minute_nodes_{symbol}_{date_str}.parquet'
+        _merge_and_write(
+            path, pd.DataFrame([row]),
+            ['symbol', 'trading_date', 'scheduled_time'], self._io_lock,
+        )
+
+    def load_vrp_minute_nodes(self, symbol: str, date_str: str) -> "pd.DataFrame":
+        path = self.data_dir / f'vrp_minute_nodes_{symbol}_{date_str}.parquet'
+        if not path.exists():
+            return pd.DataFrame()
+        return read_parquet_et(path, self._io_lock)
+
+    def persist_vrp_cone_node(self, symbol: str, date_str: str,
+                              row: dict) -> None:
+        """保存用于跨交易日点位分位数的5分钟标准节点。"""
+        path = self.data_dir / f'vrp_cone_nodes_{symbol}_{date_str}.parquet'
+        _merge_and_write(
+            path, pd.DataFrame([row]),
+            ['symbol', 'trading_date', 'scheduled_time'], self._io_lock,
+        )
+
+    def load_vrp_cone_nodes(self, symbol: str, date_str: str) -> "pd.DataFrame":
+        path = self.data_dir / f'vrp_cone_nodes_{symbol}_{date_str}.parquet'
+        if not path.exists():
+            return pd.DataFrame()
+        return read_parquet_et(path, self._io_lock)
+
+    def persist_vrp_cone_observations(self, symbol: str, date_str: str,
+                                      rows: list[dict]) -> None:
+        if not rows:
+            return
+        path = self.data_dir / f'vrp_cone_observations_{symbol}_{date_str}.parquet'
+        _merge_and_write(
+            path, pd.DataFrame(rows),
+            ['symbol', 'trading_date', 'scheduled_time'], self._io_lock,
+        )
+
+    def load_vrp_cone_observations(self, symbol: str,
+                                   date_str: str) -> "pd.DataFrame":
+        path = self.data_dir / f'vrp_cone_observations_{symbol}_{date_str}.parquet'
+        if not path.exists():
+            return pd.DataFrame()
+        return read_parquet_et(path, self._io_lock)
+
     def persist_vrp_wing_quotes(self, symbol: str, date_str: str,
                                 rows: list[dict]) -> None:
         """保存 ATM 周围保护翼候选的完整分腿报价。"""
@@ -633,7 +680,7 @@ class StorageManager:
         Args:
             symbol: 标的代码
             date_str: 日期 YYYYMMDD
-            oi_data: {strike: {'call_oi': int, 'put_oi': int}, ...}
+            oi_data: {strike: {'call_oi': int, 'put_oi': int, 'expiry': str}, ...}
         """
         if not oi_data:
             return
@@ -643,6 +690,7 @@ class StorageManager:
                 'strike': strike,
                 'call_oi': data.get('call_oi', 0),
                 'put_oi': data.get('put_oi', 0),
+                'expiry': data.get('expiry'),
             })
         df = pd.DataFrame(rows)
         path = self.data_dir / f'oi_snapshot_{symbol}_{date_str}.parquet'
@@ -655,7 +703,7 @@ class StorageManager:
         加载指定日期的 OI 快照
 
         Returns:
-            {strike: {'call_oi': int, 'put_oi': int}, ...} 或 None
+            {strike: {'call_oi': int, 'put_oi': int, 'expiry': str}, ...} 或 None
         """
         path = self.data_dir / f'oi_snapshot_{symbol}_{date_str}.parquet'
         if not path.exists():
@@ -667,12 +715,14 @@ class StorageManager:
             result[row['strike']] = {
                 'call_oi': int(row['call_oi']),
                 'put_oi': int(row['put_oi']),
+                'expiry': row.get('expiry') if pd.notna(row.get('expiry')) else None,
             }
         return result
 
-    def get_previous_trading_day(self, date_str: str) -> str | None:
-        """获取上一个有 OI 快照的交易日"""
-        files = sorted(self.data_dir.glob('oi_snapshot_*_*.parquet'), reverse=True)
+    def get_previous_trading_day(self, date_str: str, symbol: str | None = None) -> str | None:
+        """获取该标的上一个有 OI 快照的交易日。"""
+        pattern = f'oi_snapshot_{symbol}_*.parquet' if symbol else 'oi_snapshot_*_*.parquet'
+        files = sorted(self.data_dir.glob(pattern), reverse=True)
         for f in files:
             parts = f.stem.split('_')
             if len(parts) >= 3:

@@ -1,13 +1,14 @@
 {
   "schema_version": 1,
-  "model_id": "qqq_turning_point_shadow_v1_20260722",
+  "model_id": "qqq_turning_point_shadow_oi_v2_20260723",
   "label_schema": "intraday_turning_point_v1",
   "selection_policy": "stable_cross_symbol_only",
   "source": {
     "primary_symbol": "QQQ",
     "external_symbol": "SPY",
-    "primary_sha256": "a0e059cfc4809054050660a8647e9f99851bb1b18e33a233ac768ea107f89345",
-    "external_sha256": "ecbf19a8927229e0acea117087ea265ca8809899e73cba18771c90cccbf9f5e1"
+    "primary_sha256": "804c5df9829abd3e44ae1d788217574b3aa10a879d31a09b4c0002919b1df618",
+    "external_sha256": "6f1bbb6df1cce0f79d205b26b8787538321272b1c6a6b580284cf0b79a3196d8",
+    "gex_method": "oi_position_v2"
   },
   "candidate": {
     "lookback_minutes": 15,
@@ -21,16 +22,16 @@
   },
   "rules": [
     {
-      "id": "after_down_reversal_rr25_change_5m_q3",
+      "id": "after_down_reversal_call_put_gex_imbalance_q2_oi_v2",
       "direction": "after_down",
       "target": "reversal",
-      "family": "skew",
-      "feature": "rr_25_change_5m",
-      "lower_exclusive": 0.002354265638591424,
-      "upper_inclusive": 0.007882754961867633,
-      "validation_lift": 1.3611111111111112,
-      "test_lift": 1.7032967032967037,
-      "external_lift": 1.050417568821528
+      "family": "gamma_balance",
+      "feature": "call_put_gex_imbalance",
+      "lower_exclusive": -0.2365536594445956,
+      "upper_inclusive": 0.01575854287828774,
+      "validation_lift": 1.5,
+      "test_lift": 2.189655,
+      "external_lift": 1.079545
     },
     {
       "id": "after_down_continuation_atm_iv_q4",
@@ -40,45 +41,21 @@
       "feature": "atm_iv_pct",
       "lower_exclusive": 29.963537550253683,
       "upper_inclusive": null,
-      "validation_lift": 1.1264367816091956,
-      "test_lift": 1.0746666666666669,
-      "external_lift": 1.1241310824230386
+      "validation_lift": 1.126437,
+      "test_lift": 1.082623,
+      "external_lift": 1.132075
     },
     {
-      "id": "after_down_continuation_gamma_concentration_q1",
+      "id": "after_down_reversal_gamma_concentration_q1_oi_v2",
       "direction": "after_down",
-      "target": "continuation",
+      "target": "reversal",
       "family": "gamma_structure",
       "feature": "strike_abs_gex_concentration_50bps",
       "lower_exclusive": null,
-      "upper_inclusive": 0.6646730088589077,
-      "validation_lift": 1.435897435897436,
-      "test_lift": 1.085,
-      "external_lift": 1.2135506003430532
-    },
-    {
-      "id": "after_up_reversal_gex_change_5m_q3",
-      "direction": "after_up",
-      "target": "reversal",
-      "family": "gex_change",
-      "feature": "gex_change_5m_ratio",
-      "lower_exclusive": 0.12912229386478208,
-      "upper_inclusive": 0.35312727027391405,
-      "validation_lift": 1.1076923076923078,
-      "test_lift": 1.2455716586151369,
-      "external_lift": 1.1980410893454372
-    },
-    {
-      "id": "after_up_reversal_gex_change_15m_q1",
-      "direction": "after_up",
-      "target": "reversal",
-      "family": "gex_change",
-      "feature": "gex_change_15m_ratio",
-      "lower_exclusive": null,
-      "upper_inclusive": 0.12801372711211018,
-      "validation_lift": 1.1868131868131868,
-      "test_lift": 1.101851851851852,
-      "external_lift": 1.3501144164759724
+      "upper_inclusive": 0.46928747662240156,
+      "validation_lift": 1.441176,
+      "test_lift": 1.368534,
+      "external_lift": 1.195804
     }
   ]
 }

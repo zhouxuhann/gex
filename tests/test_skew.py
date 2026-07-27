@@ -14,6 +14,11 @@ def _make_ticker(strike, right, iv, delta):
     g.impliedVol = iv
     g.delta = delta
     t.modelGreeks = g
+    t.bid = 1.0
+    t.ask = 1.2
+    t.volume = 100
+    t.putOpenInterest = 200
+    t.callOpenInterest = 300
     return t
 
 
@@ -50,6 +55,12 @@ class TestComputeSkew:
         assert snap.atm_iv > 0
         # RR 应该有值（符号取决于 delta 映射）
         assert snap.rr_25 is not None
+        assert snap.put_25_iv is not None
+        assert snap.call_25_iv is not None
+        assert snap.put_25_mid == 1.1
+        assert snap.call_25_mid == 1.1
+        assert snap.put_25_open_interest == 200
+        assert snap.call_25_open_interest == 300
         assert snap.skew_slope is not None
         # z-score 和 signal 由 tracker 填充
         assert snap.rr_25_zscore is None

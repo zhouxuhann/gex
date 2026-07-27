@@ -4,7 +4,8 @@ from types import SimpleNamespace
 from gex_monitor.time_utils import ET
 import gex_monitor.vrp_context as context_module
 from gex_monitor.vrp_context import (
-    VRPEventCalendar, opex_context, path_features, vix_context,
+    VRPEventCalendar, intraday_time_context, interpolate_total_variance,
+    opex_context, path_features, vix_context,
 )
 
 
@@ -23,6 +24,27 @@ def test_quarterly_opex_label():
     context = opex_context(datetime(2026, 9, 18, 10, 0, tzinfo=ET))
     assert context["weekday"] == "Friday"
     assert context["opex_type"] == "quarterly"
+
+
+def test_intraday_time_context_preserves_remaining_0dte_life():
+    context = intraday_time_context(datetime(2026, 7, 16, 10, 0, tzinfo=ET))
+    assert context["minutes_to_close"] == 360
+    assert context["tau_session"] == 360 / 390
+    assert context["tau_years"] == 360 / (252 * 390)
+    assert context["tau_trading_years"] == 360 / (252 * 390)
+    assert context["tau_calendar_years"] == 360 / (365 * 24 * 60)
+
+
+def test_fixed_tenor_iv_uses_total_variance_interpolation():
+    target = 2 / 365
+    value, source = interpolate_total_variance(
+        [(1 / 365, 0.20), (3 / 365, 0.30)], target
+    )
+    expected_variance = (
+        (0.20 ** 2) * (1 / 365) + (0.30 ** 2) * (3 / 365)
+    ) / 2
+    assert abs(value - (expected_variance / target) ** 0.5) < 1e-12
+    assert source.startswith("total_variance:")
 
 
 def test_path_features_exclude_premarket_and_use_only_past_bars():

@@ -60,20 +60,10 @@ def compute_snapshot_features(df: pd.DataFrame, spot: float) -> dict:
     put_abs = abs(put_gex)
     call_gex_ratio = call_abs / (call_abs + put_abs) if (call_abs + put_abs) > 0 else 0.5
 
-    # Flip 与主 GEX 引擎使用同一数据列和零点插值逻辑。
-    # 没有任何零交叉时不制造假 flip，而是显式返回 no_flip。
-    flip_col = 'gex_flip' if 'gex_flip' in df.columns else 'gex'
-    by_strike_flip = df.groupby('strike')[flip_col].sum().sort_index()
-    cumulative = by_strike_flip.cumsum()
-    cumulative_values = cumulative.to_numpy(dtype=float)
-    exact_zero = np.flatnonzero(np.isclose(cumulative_values, 0.0, atol=1e-12))
-    sign_change = np.flatnonzero(cumulative_values[:-1] * cumulative_values[1:] < 0)
-    if len(exact_zero):
-        flip = float(cumulative.index[exact_zero[0]])
-    elif len(sign_change):
-        flip = float(_calculate_gamma_flip(by_strike_flip, spot))
-    else:
-        flip = np.nan
+    # 这里只保留兼容性的“累计平衡点”形状特征；主引擎的 Gamma Flip
+    # 由重新定价 solver 计算。无平衡点时保持 NaN，不能制造边界值。
+    flip_value = _calculate_gamma_flip(by_strike, spot)
+    flip = float(flip_value) if flip_value is not None else np.nan
     spot_to_flip_pct = (spot - flip) / spot if not np.isnan(flip) else np.nan
 
     # ---- Shape ----

@@ -63,6 +63,11 @@ intraday_vrp:
   observation_only: true
   symbols: [QQQ, SPY]
   schedule_et: ["09:35", "10:00", "10:30", "11:00", "12:00", "13:00", "14:00", "14:30", "15:00"]
+  # 1分钟原始节点；统计锥使用5分钟标准节点。
+  minute_nodes_enabled: true
+  minute_node_start_et: "09:35"
+  minute_node_end_et: "15:55"
+  cone_interval_minutes: 5
   sample_window_seconds: 180
   candidate_strikes_each_side: 2
   wing_strikes_each_side: 5
@@ -74,6 +79,10 @@ intraday_vrp:
   mtm_interval_minutes: 5
   mtm_fixed_times_et: ["15:30"]
   vix_cache_seconds: 300
+  # 每个 VRP 时点按总方差插值的标准化 ATM IV 期限节点。
+  standardized_iv_dtes: [1, 2, 5]
+  # 多到期日请求较重，每15分钟刷新；中间5分钟节点复用并保留asof。
+  term_structure_cache_seconds: 900
   # Paper-only experiments. Hard-blocked unless IB port=4002 and account starts DU.
   paper_execution_enabled: true
   paper_straddle_execution_enabled: true

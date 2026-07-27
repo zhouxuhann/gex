@@ -9,6 +9,7 @@ from gex_monitor.intraday_turning_points import (
     add_outcome_labels,
     align_minute_gex,
     deduplicate_candidates,
+    rebuild_oi_position_gex,
     select_audit_events,
     strike_snapshot_features,
 )
@@ -87,6 +88,57 @@ def test_strike_features_do_not_conflict_with_legacy_spot_column():
     result = strike_snapshot_features(strikes, spots)
     assert len(result) == 1
     assert result.iloc[0]["nearest_up_strike_distance_pct"] == pytest.approx(0.01)
+
+
+def test_strike_features_keep_oi_and_volume_gamma_separate():
+    strikes = pd.DataFrame({
+        "ts": [_ts(1), _ts(1)], "strike": [99.0, 101.0],
+        "right": ["P", "C"], "gex": [-2.0, 3.0], "gamma": [0.1, 0.1],
+        "oi": [100, 300], "volume": [50, 30],
+        "volume_gamma": [-0.5, 0.25],
+    })
+    spots = pd.DataFrame({"gex_ts": [_ts(0)], "spot": [100.0]})
+    row = strike_snapshot_features(strikes, spots).iloc[0]
+    assert row["strike_total_abs_gex"] == 5.0
+    assert row["strike_net_gex_ratio"] == pytest.approx(0.2)
+    assert row["strike_total_oi"] == 400
+    assert row["strike_total_volume"] == 80
+    assert row["strike_volume_oi_ratio"] == pytest.approx(0.2)
+    assert row["strike_gross_volume_gamma"] == pytest.approx(0.75)
+
+
+def test_gex_change_uses_gross_exposure_not_near_zero_net_gex():
+    total = [1.0] * 20
+    total[-1] = 2.0
+    frame = pd.DataFrame({
+        "ts": [_ts(i) for i in range(20)],
+        "close": [100.0] * 20,
+        "total_gex": total,
+        "gross_gex": [2_000_000_000.0] * 20,
+    })
+    result = add_lagged_features(frame, TurningPointConfig())
+    assert result.iloc[-1]["gex_change_5m_gross_ratio"] == pytest.approx(5e-10)
+
+
+def test_historical_rebuild_uses_oi_and_clears_legacy_flip():
+    gex = pd.DataFrame({
+        "ts": [_ts(0)], "spot": [100.0], "total_gex": [999.0],
+        "flip": [101.0], "atm_iv_pct": [20.0],
+    })
+    strikes = pd.DataFrame({
+        "ts": [_ts(0), _ts(0)], "strike": [99.0, 101.0],
+        "right": ["P", "C"], "gamma": [0.1, 0.2], "oi": [20, 10],
+        "gex": [-999.0, 999.0],
+    })
+    rebuilt, surface = rebuild_oi_position_gex(gex, strikes)
+    expected_leg = 0.1 * 20 * 100 * 100 ** 2 * 0.01
+    assert surface.loc[surface["right"] == "P", "gex"].iloc[0] == -expected_leg
+    assert surface.loc[surface["right"] == "C", "gex"].iloc[0] == expected_leg
+    assert rebuilt.iloc[0]["total_gex"] == pytest.approx(0.0)
+    assert rebuilt.iloc[0]["gross_gex"] == pytest.approx(2 * expected_leg)
+    assert rebuilt.iloc[0]["gex_method"] == "oi_position_v2"
+    assert pd.isna(rebuilt.iloc[0]["flip"])
+    assert not bool(rebuilt.iloc[0]["gamma_flip_reliable"])
 
 
 def test_audit_selection_is_stratified_and_bounded():

@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from calendar import monthcalendar, FRIDAY
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +21,26 @@ log = logging.getLogger(__name__)
 _VIX_LOCK = threading.Lock()
 _VIX_LIVE_CACHE: dict = {}
 _VIX_HISTORY_CACHE: dict = {}
+_VIX1D_LIVE_CACHE: dict = {}
+_TERM_STRUCTURE_CACHE: dict = {}
+
+
+def intraday_time_context(now: datetime) -> dict:
+    """Standardize a 0DTE observation by its remaining regular-session life."""
+    now = now.astimezone(ET)
+    close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    minutes = max(0.0, min(390.0, (close - now).total_seconds() / 60.0))
+    return {
+        "minutes_to_close": minutes,
+        "tau_session": minutes / 390.0,
+        # Trading-session normalization and calendar-time pricing maturity are
+        # deliberately separate: both are useful, but not interchangeable.
+        "tau_trading_years": minutes / (252.0 * 390.0),
+        "tau_years": minutes / (252.0 * 390.0),
+        "tau_calendar_years": (
+            max(0.0, (close - now).total_seconds()) / (365.0 * 24.0 * 3600.0)
+        ),
+    }
 
 
 def _finite(value) -> float | None:
@@ -184,6 +204,207 @@ def vix_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
         except Exception as exc:
             log.warning("VRP VIX context unavailable: %s", exc)
             return dict(cached[1]) if cached else empty
+
+
+def vix1d_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
+    """Fetch a throttled live VIX1D value without making it a hard dependency."""
+    empty = {"vix1d": None, "vix1d_asof": None,
+             "vix1d_source": "unavailable"}
+    if ib is None or not ib.isConnected():
+        return empty
+    now = now.astimezone(ET)
+    with _VIX_LOCK:
+        cached = _VIX1D_LIVE_CACHE.get("value")
+        if cached and time.monotonic() - cached[0] <= max(30, cache_seconds):
+            return dict(cached[1])
+        try:
+            from ib_insync import Index
+
+            qualified = ib.qualifyContracts(Index("VIX1D", "CBOE", "USD"))
+            if not qualified:
+                return dict(cached[1]) if cached else empty
+            contract = qualified[0]
+            ib.reqMktData(contract, genericTickList="", snapshot=False)
+            try:
+                value = None
+                for attempt in range(21):
+                    ticker = ib.ticker(contract)
+                    last = _finite(getattr(ticker, "last", None)) \
+                        if ticker is not None else None
+                    if last is not None and last > 0:
+                        value = last
+                        break
+                    if attempt < 20:
+                        ib.sleep(0.25)
+            finally:
+                try:
+                    ib.cancelMktData(contract)
+                except Exception:
+                    pass
+            if value is None:
+                return dict(cached[1]) if cached else empty
+            result = {"vix1d": value, "vix1d_asof": now,
+                      "vix1d_source": "ib_streaming"}
+            _VIX1D_LIVE_CACHE["value"] = (time.monotonic(), result)
+            return dict(result)
+        except Exception as exc:
+            log.warning("VRP VIX1D context unavailable: %s", exc)
+            return dict(cached[1]) if cached else empty
+
+
+def market_vol_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
+    """Return VIX, VIX1D and the short/standard volatility spread."""
+    result = vix_context(ib, now, cache_seconds)
+    result.update(vix1d_context(ib, now, cache_seconds))
+    vix = _finite(result.get("vix"))
+    vix1d = _finite(result.get("vix1d"))
+    result["vix1d_minus_vix"] = (
+        vix1d - vix if vix1d is not None and vix is not None else None
+    )
+    result["vix1d_vix_ratio"] = (
+        vix1d / vix if vix1d is not None and vix not in (None, 0) else None
+    )
+    return result
+
+
+def interpolate_total_variance(nodes: list[tuple[float, float]],
+                               target_t: float) -> tuple[float | None, str]:
+    """Interpolate IV through total variance w(T)=sigma(T)^2*T."""
+    clean = sorted(
+        (float(t), float(iv)) for t, iv in nodes
+        if _finite(t) is not None and _finite(iv) is not None and t > 0 and iv > 0
+    )
+    if not clean or target_t <= 0:
+        return None, "unavailable"
+    for t, iv in clean:
+        if abs(t - target_t) <= 1e-10:
+            return iv, "exact"
+    lower = [item for item in clean if item[0] < target_t]
+    upper = [item for item in clean if item[0] > target_t]
+    if not lower or not upper:
+        return None, "unavailable"
+    t0, iv0 = lower[-1]
+    t1, iv1 = upper[0]
+    weight = (target_t - t0) / (t1 - t0)
+    variance = iv0 * iv0 * t0 + weight * (iv1 * iv1 * t1 - iv0 * iv0 * t0)
+    return (float(np.sqrt(max(variance, 0.0) / target_t)),
+            f"total_variance:{t0:.8f}-{t1:.8f}")
+
+
+def standardized_term_structure_context(
+    ib, symbol: str, now: datetime, spot: float, target_dtes=(1, 2, 5),
+    cache_seconds: int = 120,
+) -> dict:
+    """Collect live ATM term nodes and standardize them to fixed calendar DTEs."""
+    targets = tuple(sorted({int(item) for item in target_dtes if int(item) > 0}))
+    empty = {"term_structure_quality": "unavailable",
+             "term_structure_asof": None}
+    for dte in targets:
+        empty.update({f"iv_{dte}dte": None, f"iv_{dte}dte_source": "unavailable"})
+    if ib is None or not ib.isConnected() or spot <= 0:
+        return empty
+    now = now.astimezone(ET)
+    cache_key = (symbol, targets)
+    cached = _TERM_STRUCTURE_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] <= max(30, cache_seconds):
+        return dict(cached[1])
+    try:
+        from ib_insync import Option, Stock
+
+        stocks = ib.qualifyContracts(Stock(symbol, "SMART", "USD"))
+        if not stocks:
+            return empty
+        chains = ib.reqSecDefOptParams(symbol, "", "STK", stocks[0].conId)
+        chains = [chain for chain in chains
+                  if getattr(chain, "expirations", None)
+                  and getattr(chain, "strikes", None)]
+        if not chains:
+            return empty
+        chain = max(chains, key=lambda item: len(item.expirations))
+        today = now.date()
+        expiries = []
+        for text in sorted(chain.expirations):
+            try:
+                expiry_date = datetime.strptime(text, "%Y%m%d").date()
+            except ValueError:
+                continue
+            if expiry_date >= today:
+                expiries.append((text, expiry_date))
+        if not expiries:
+            return empty
+
+        target_times = {
+            dte: ((now.replace(hour=16, minute=0, second=0, microsecond=0)
+                   + timedelta(days=dte)) - now).total_seconds()
+            / (365.0 * 24.0 * 3600.0)
+            for dte in targets
+        }
+        wanted = set()
+        for target_t in target_times.values():
+            dated = []
+            for text, expiry_date in expiries:
+                expiry_close = datetime.combine(
+                    expiry_date, datetime.min.time(), tzinfo=ET
+                ).replace(hour=16)
+                t = (expiry_close - now).total_seconds() / (365.0 * 24.0 * 3600.0)
+                if t > 0:
+                    dated.append((text, t))
+            lower = [item for item in dated if item[1] <= target_t]
+            upper = [item for item in dated if item[1] >= target_t]
+            if lower:
+                wanted.add(lower[-1][0])
+            if upper:
+                wanted.add(upper[0][0])
+
+        strike = min((float(item) for item in chain.strikes),
+                     key=lambda item: abs(item - spot))
+        trading_class = getattr(chain, "tradingClass", symbol)
+        contracts = []
+        for expiry in sorted(wanted):
+            for right in ("C", "P"):
+                contracts.append(Option(
+                    symbol, expiry, strike, right, "SMART",
+                    currency="USD", tradingClass=trading_class,
+                ))
+        qualified = ib.qualifyContracts(*contracts)
+        tickers = ib.reqTickers(*qualified) if qualified else []
+        by_expiry: dict[str, list[float]] = {}
+        for ticker in tickers:
+            contract = getattr(ticker, "contract", None)
+            greeks = getattr(ticker, "modelGreeks", None)
+            iv = _finite(getattr(greeks, "impliedVol", None))
+            expiry = str(getattr(contract, "lastTradeDateOrContractMonth", ""))
+            if iv is not None and iv > 0 and expiry:
+                by_expiry.setdefault(expiry, []).append(iv)
+
+        nodes = []
+        for expiry, ivs in by_expiry.items():
+            expiry_date = datetime.strptime(expiry, "%Y%m%d").date()
+            expiry_close = datetime.combine(
+                expiry_date, datetime.min.time(), tzinfo=ET
+            ).replace(hour=16)
+            t = (expiry_close - now).total_seconds() / (365.0 * 24.0 * 3600.0)
+            if t > 0 and ivs:
+                nodes.append((t, float(np.mean(ivs))))
+        result = dict(empty)
+        result["term_structure_asof"] = now
+        result["term_structure_atm_strike"] = strike
+        result["term_structure_node_count"] = len(nodes)
+        available = 0
+        for dte, target_t in target_times.items():
+            iv, source = interpolate_total_variance(nodes, target_t)
+            result[f"iv_{dte}dte"] = iv
+            result[f"iv_{dte}dte_source"] = source
+            available += iv is not None
+        result["term_structure_quality"] = (
+            "good" if available == len(targets)
+            else "partial" if available else "unavailable"
+        )
+        _TERM_STRUCTURE_CACHE[cache_key] = (time.monotonic(), result)
+        return dict(result)
+    except Exception as exc:
+        log.warning("VRP standardized term structure unavailable: %s", exc)
+        return dict(cached[1]) if cached else empty
 
 
 def path_features(bars, now: datetime, spot: float,

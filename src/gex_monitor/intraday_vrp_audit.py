@@ -72,6 +72,10 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
                           paper_mtm: pd.DataFrame | None = None,
                           paper_straddle_orders: pd.DataFrame | None = None,
                           paper_straddle_mtm: pd.DataFrame | None = None,
+                          minute_nodes: pd.DataFrame | None = None,
+                          cone_nodes: pd.DataFrame | None = None,
+                          expected_minute_nodes: int = 0,
+                          expected_cone_nodes: int = 0,
                           min_rth_bars: int = 389) -> dict:
     """生成一份可机器读取的 VRP 日终审计报告。"""
     expected_slots = list(schedule)
@@ -102,6 +106,8 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
         "rv_15m", "rv_30m", "trend_efficiency_session",
         "dist_to_flip_im", "weekday", "opex_type", "event_flag",
         "gap_pct", "session_vwap", "vix", "vix_ma20_ratio",
+        "vix1d", "minutes_to_close", "tau_session", "tau_calendar_years",
+        "put_25_iv", "call_25_iv", "iv_1dte", "iv_2dte", "iv_5dte",
         "surface_term_spread_iv", "butterfly_25",
     ]
     feature_coverage = {}
@@ -206,6 +212,16 @@ def build_vrp_daily_audit(*, symbol: str, date_str: str, schedule: list[str] | t
             "iron_fly": fly_funnel,
             "short_straddle": straddle_funnel,
         },
+        "minute_node_rows": 0 if minute_nodes is None else len(minute_nodes),
+        "minute_node_coverage": (
+            len(minute_nodes) / expected_minute_nodes
+            if minute_nodes is not None and expected_minute_nodes else None
+        ),
+        "cone_node_rows": 0 if cone_nodes is None else len(cone_nodes),
+        "cone_node_coverage": (
+            len(cone_nodes) / expected_cone_nodes
+            if cone_nodes is not None and expected_cone_nodes else None
+        ),
         "problems": problems,
     }
 

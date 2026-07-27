@@ -41,6 +41,7 @@ class GEXSnapshot:
     max_pain: Optional[float] = None
     atm_iv_pct: Optional[float] = None
     regime_code: Optional[str] = None
+    partial: bool = False
     age_sec: float = 0.0   # seconds since snapshot
 
     @property
@@ -101,7 +102,8 @@ class GEXRegimeReader:
             cur = self._conn.cursor()
             cur.execute("""
                 SELECT datetime, spot, total_gex, positive_gamma,
-                       call_wall, put_wall, max_pain, atm_iv_pct, regime_code
+                       call_wall, put_wall, max_pain, atm_iv_pct, regime_code,
+                       partial
                 FROM gex_snapshots WHERE symbol=%s
                 ORDER BY datetime DESC LIMIT 1
             """, (self.symbol,))
@@ -124,6 +126,7 @@ class GEXRegimeReader:
                 max_pain=float(row[6]) if row[6] is not None else None,
                 atm_iv_pct=float(row[7]) if row[7] is not None else None,
                 regime_code=row[8],
+                partial=bool(row[9]) if row[9] is not None else False,
                 age_sec=age,
             )
         except Exception as e:
@@ -160,6 +163,7 @@ class GEXRegimeReader:
                 max_pain=float(row['max_pain']) if pd.notna(row.get('max_pain')) else None,
                 atm_iv_pct=float(row['atm_iv_pct']) if pd.notna(row.get('atm_iv_pct')) else None,
                 regime_code=None,
+                partial=bool(row.get('partial', False)),
                 age_sec=age,
             )
         except Exception:
@@ -173,7 +177,8 @@ class GEXRegimeReader:
             conn = psycopg2.connect(**self.db_dsn)
             q = """
                 SELECT datetime as ts, spot, total_gex, positive_gamma,
-                       call_wall, put_wall, max_pain, atm_iv_pct, regime_code
+                       call_wall, put_wall, max_pain, atm_iv_pct, regime_code,
+                       partial
                 FROM gex_snapshots
                 WHERE symbol=%s AND datetime >= %s AND datetime <= %s
                 ORDER BY datetime ASC
@@ -235,6 +240,7 @@ class GEXRegimeReader:
             max_pain=float(row['max_pain']) if pd.notna(row.get('max_pain')) else None,
             atm_iv_pct=float(row['atm_iv_pct']) if pd.notna(row.get('atm_iv_pct')) else None,
             regime_code=row.get('regime_code'),
+            partial=bool(row.get('partial', False)),
             age_sec=age,
         )
 
@@ -254,6 +260,8 @@ class GEXRegimeReader:
             return True, 'gex_missing'
         if snap.age_sec > self.stale_sec_max:
             return True, f'gex_stale({int(snap.age_sec)}s)'
+        if snap.partial:
+            return True, 'gex_partial'
 
         is_ab = signal_key in ('A_LONG', 'A_SHORT', 'B_LONG', 'B_SHORT')
         is_t = signal_key in ('T_LONG', 'T_SHORT')

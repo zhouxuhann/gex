@@ -15,12 +15,17 @@ import pandas as pd
 
 from .config import IntradayVRPConfig
 from .intraday_vrp_audit import build_vrp_daily_audit, write_vrp_daily_audit
-from .intraday_vrp_report import generate_vrp_report
+from .intraday_vrp_report import generate_vrp_cone_report, generate_vrp_report
 from .intraday_vrp_paper import VRPPaperIronFlyExecutor
 from .intraday_vrp_paper_straddle import VRPPaperStraddleExecutor
 from .storage import StorageManager, read_parquet_et
 from .time_utils import ET, et_now, trading_date_str
-from .vrp_context import VRPEventCalendar, opex_context, path_features
+from .vrp_context import (
+    VRPEventCalendar,
+    intraday_time_context,
+    opex_context,
+    path_features,
+)
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +36,43 @@ def _finite(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if np.isfinite(value) else None
+
+
+def remaining_variance_pair(row: dict, future_returns: pd.Series) -> dict:
+    """Match entry IV to ex-post realized variance over the same horizon."""
+    realized_variance = float(np.nansum(np.square(
+        pd.to_numeric(future_returns, errors="coerce")
+    )))
+    call_iv = _finite(row.get("call_implied_vol"))
+    put_iv = _finite(row.get("put_implied_vol"))
+    atm_iv_pct = _finite(row.get("atm_iv_pct"))
+    iv = (
+        float(np.mean([call_iv, put_iv]))
+        if call_iv is not None and put_iv is not None
+        else atm_iv_pct / 100.0 if atm_iv_pct is not None else None
+    )
+    maturity = _finite(row.get("tau_calendar_years"))
+    implied_variance = (
+        iv * iv * maturity if iv is not None and maturity is not None else None
+    )
+    annualized_rv = (
+        float(np.sqrt(realized_variance / maturity))
+        if maturity is not None and maturity > 0 else None
+    )
+    return {
+        "atm_iv_decimal": iv,
+        "implied_variance_remaining": implied_variance,
+        "realized_variance_remaining": realized_variance,
+        "annualized_rv_to_close": annualized_rv,
+        "ex_post_variance_spread": (
+            implied_variance - realized_variance
+            if implied_variance is not None else None
+        ),
+        "implied_one_sigma_move_pct": (
+            iv * np.sqrt(maturity)
+            if iv is not None and maturity is not None else None
+        ),
+    }
 
 
 def _ticker_time(ticker) -> datetime | None:
@@ -53,6 +95,45 @@ def _option_open_interest(ticker, right: str) -> float | None:
     ))
 
 
+def vrp_gex_advisory(gex: dict) -> dict:
+    """Classify GEX context for research without changing order eligibility."""
+    method = str(gex.get("gex_method") or "")
+    partial = bool(gex.get("partial", False))
+    gross = _finite(gex.get("gross_gex"))
+    net_ratio = _finite(gex.get("net_gex_ratio"))
+    if net_ratio is None and gross is not None and gross > 0:
+        total = _finite(gex.get("total_gex"))
+        net_ratio = total / gross if total is not None else None
+    gross_volume = _finite(gex.get("gross_volume_gamma"))
+    volume_ratio = _finite(gex.get("volume_gamma_to_gex"))
+    if volume_ratio is None and gross is not None and gross > 0:
+        volume_ratio = gross_volume / gross if gross_volume is not None else None
+
+    quality_ok = method == "oi_position_v2" and not partial and net_ratio is not None
+    if not quality_ok:
+        regime, preference = "unknown", "observe_only"
+    elif net_ratio >= 0.10:
+        regime, preference = "long_gamma", "short_vol_allowed"
+    elif net_ratio <= -0.10:
+        regime, preference = "short_gamma", "defined_risk_preferred"
+    else:
+        regime, preference = "neutral_gamma", "reduced_risk"
+    return {
+        "gex_method": method or None,
+        "gross_gex": gross,
+        "net_gex_ratio": net_ratio,
+        "gross_volume_gamma": gross_volume,
+        "volume_gamma_to_gex": volume_ratio,
+        "gamma_flip_status": gex.get("gamma_flip_status"),
+        "gamma_flip_reliable": bool(gex.get("gamma_flip_reliable", False)),
+        "gex_vrp_quality_ok": quality_ok,
+        "gex_vrp_regime": regime,
+        "gex_strategy_preference": preference,
+        # Explicitly advisory until enough post-migration observations exist.
+        "gex_hard_gate_enabled": False,
+    }
+
+
 class IntradayVRPMonitor:
     """由 IBWorker 驱动的固定时点 0DTE straddle 观测器。"""
 
@@ -66,6 +147,9 @@ class IntradayVRPMonitor:
         self._schedule = tuple(config.schedule_et)
         self._recorded_date: str | None = None
         self._recorded: set[str] = set()
+        self._minute_recorded_date: str | None = None
+        self._minute_recorded: set[str] = set()
+        self._cone_recorded: set[str] = set()
         self._event_calendar = VRPEventCalendar(storage.data_dir)
         self._mtm_date: str | None = None
         self._mtm_recorded: set[tuple[str, str]] = set()
@@ -100,13 +184,87 @@ class IntradayVRPMonitor:
                 return slot, target
         return None
 
+    def _due_minute_node(self, now: datetime) -> tuple[str, datetime, bool] | None:
+        if not self.config.minute_nodes_enabled:
+            return None
+        now = now.astimezone(ET)
+        date_str = trading_date_str(now)
+        if self._minute_recorded_date != date_str:
+            minute = self.storage.load_vrp_minute_nodes(self.symbol, date_str)
+            cone = self.storage.load_vrp_cone_nodes(self.symbol, date_str)
+            self._minute_recorded = set(
+                minute.get("scheduled_time", pd.Series(dtype=str)).astype(str)
+            )
+            self._cone_recorded = set(
+                cone.get("scheduled_time", pd.Series(dtype=str)).astype(str)
+            )
+            self._minute_recorded_date = date_str
+        target = now.replace(second=0, microsecond=0)
+        slot = target.strftime("%H:%M")
+        if slot in self._minute_recorded:
+            return None
+        start_h, start_m = (int(item) for item in self.config.minute_node_start_et.split(":"))
+        end_h, end_m = (int(item) for item in self.config.minute_node_end_et.split(":"))
+        minute_of_day = target.hour * 60 + target.minute
+        start = start_h * 60 + start_m
+        end = end_h * 60 + end_m
+        if minute_of_day < start or minute_of_day > end:
+            return None
+        interval = max(1, int(self.config.cone_interval_minutes))
+        is_cone = (minute_of_day - start) % interval == 0
+        return slot, target, is_cone
+
     def on_gex_update(self, ib, contracts: list, *, now: datetime, spot: float,
                       expiry: str, is_true_0dte: bool, gex_state: dict,
                       intraday_bars_provider=None, market_context_provider=None,
+                      term_structure_provider=None,
                       ib_port: int | None = None) -> bool:
         self._capture_mtm_checkpoints(ib, contracts, now=now, expiry=expiry)
         self._paper_executor.poll(ib, now=now, ib_port=ib_port)
         self._paper_straddle_executor.poll(ib, now=now, ib_port=ib_port)
+        shared_market_context = None
+
+        def get_market_context() -> dict:
+            nonlocal shared_market_context
+            if shared_market_context is None:
+                shared_market_context = (
+                    market_context_provider() if market_context_provider is not None else {}
+                )
+            return dict(shared_market_context)
+
+        minute_due = self._due_minute_node(now)
+        if minute_due is not None:
+            minute_slot, minute_target, is_cone = minute_due
+            date_str = trading_date_str(now)
+            minute_row = self._build_quote_row(
+                ib, contracts, now, minute_target, minute_slot, spot, expiry,
+                is_true_0dte, gex_state,
+            )
+            minute_row["sample_kind"] = "raw_1m"
+            minute_row.update(get_market_context())
+            self.storage.persist_vrp_minute_node(
+                self.symbol, date_str, minute_row
+            )
+            self._minute_recorded.add(minute_slot)
+            if is_cone and minute_slot not in self._cone_recorded:
+                cone_row = dict(minute_row)
+                cone_row["sample_kind"] = "cone_5m"
+                fallback_bars = (
+                    intraday_bars_provider()
+                    if intraday_bars_provider is not None else None
+                )
+                cone_row.update(path_features(
+                    self._entry_bars(date_str, fallback_bars),
+                    now, spot, previous_close=self._previous_close(date_str),
+                ))
+                cone_row.update(self._previous_surface_context(date_str))
+                if term_structure_provider is not None:
+                    cone_row.update(term_structure_provider())
+                self.storage.persist_vrp_cone_node(
+                    self.symbol, date_str, cone_row
+                )
+                self._cone_recorded.add(minute_slot)
+
         due = self.due_slot(now)
         if due is None:
             return False
@@ -122,7 +280,9 @@ class IntradayVRPMonitor:
         ))
         row.update(self._previous_surface_context(date_str))
         if market_context_provider is not None:
-            row.update(market_context_provider())
+            row.update(get_market_context())
+        if term_structure_provider is not None:
+            row.update(term_structure_provider())
         self.storage.persist_vrp_quote(self.symbol, date_str, row)
         wing_rows, fly_rows = self._build_wings_and_flies(
             ib, contracts, now=now, quote_row=row
@@ -607,7 +767,7 @@ class IntradayVRPMonitor:
                          slot: str, spot: float, expiry: str, is_true_0dte: bool,
                          gex: dict) -> dict:
         base = {
-            "schema_version": 4,
+            "schema_version": 5,
             "symbol": self.symbol,
             "trading_date": trading_date_str(now),
             "scheduled_time": slot,
@@ -636,6 +796,16 @@ class IntradayVRPMonitor:
             "skew_alert_score": gex.get("skew_alert_score"),
             "rr_10": gex.get("rr_10"),
             "butterfly_25": gex.get("butterfly_25"),
+            "put_25_iv": gex.get("put_25_iv"),
+            "call_25_iv": gex.get("call_25_iv"),
+            **{
+                f"{prefix}_{suffix}": gex.get(f"{prefix}_{suffix}")
+                for prefix in ("put_25", "call_25")
+                for suffix in (
+                    "strike", "delta", "bid", "ask", "mid",
+                    "volume", "open_interest",
+                )
+            },
             "put_25_richness": gex.get("put_25_richness"),
             "call_25_richness": gex.get("call_25_richness"),
             "wing_curvature_asymmetry": gex.get("wing_curvature_asymmetry"),
@@ -644,6 +814,8 @@ class IntradayVRPMonitor:
             "gex_partial": bool(gex.get("partial", False)),
             "gex_quality_reasons": ";".join(gex.get("quality_reasons") or []),
         }
+        base.update(vrp_gex_advisory(gex))
+        base.update(intraday_time_context(now))
         flip = _finite(gex.get("gamma_flip"))
         base["dist_to_flip_pct"] = ((spot - flip) / spot) if flip is not None else None
         base.update(opex_context(now))
@@ -884,8 +1056,13 @@ class IntradayVRPMonitor:
                 "pnl_executable": credit - payoff - self.config.commission_per_straddle / 100.0
                 if credit is not None and payoff is not None else None,
             })
+            row.update(remaining_variance_pair(row, returns[path_mask]))
             rows.append(row)
         self.storage.persist_vrp_observations(self.symbol, date_str, rows)
+        cone_rows = self._settle_cone_nodes(
+            date_str=date_str, bars=bars, returns=returns,
+            settlement_price=settle, settlement_source=source,
+        )
         fly_count = self._settle_iron_flies(
             date_str=date_str,
             settlement_price=settle,
@@ -903,6 +1080,7 @@ class IntradayVRPMonitor:
         self.audit_date(date_str)
         try:
             generate_vrp_report(self.storage.data_dir, self.symbol)
+            generate_vrp_cone_report(self.storage.data_dir, self.symbol)
         except Exception as exc:
             log.warning("[%s] VRP cross-day report failed: %s", self.symbol, exc)
         log.info("[%s] VRP settled %s: %s straddles, %s iron flies, "
@@ -910,6 +1088,54 @@ class IntradayVRPMonitor:
                  self.symbol, date_str, len(rows), fly_count, paper_count,
                  paper_straddle_count, source)
         return len(rows)
+
+    def _settle_cone_nodes(
+        self, *, date_str: str, bars: pd.DataFrame, returns: pd.Series,
+        settlement_price: float, settlement_source: str,
+    ) -> list[dict]:
+        nodes = self.storage.load_vrp_cone_nodes(self.symbol, date_str)
+        if nodes.empty:
+            return []
+        rows = []
+        for raw in nodes.to_dict("records"):
+            row = dict(raw)
+            observed = pd.Timestamp(row["observed_at"])
+            observed = (
+                observed.tz_localize(ET) if observed.tzinfo is None
+                else observed.tz_convert(ET)
+            )
+            path_mask = bars["ts"] >= observed.floor("min")
+            strike = _finite(row.get("strike"))
+            payoff = (
+                abs(settlement_price - strike) if strike is not None else None
+            )
+            mid = _finite(row.get("straddle_mid"))
+            credit = _finite(row.get("sell_credit_bid"))
+            row.update({
+                "settled_at": et_now(),
+                "settlement_price": settlement_price,
+                "settlement_source": settlement_source,
+                "settlement_quality": "complete" if len(bars) >= 389 else "partial",
+                "rth_bar_count": len(bars),
+                "terminal_payoff": payoff,
+                "spot_move_pct": (
+                    abs(settlement_price - row["spot"]) / row["spot"]
+                    if row.get("spot") else None
+                ),
+                "pnl_mid": (
+                    mid - payoff if mid is not None and payoff is not None else None
+                ),
+                "pnl_executable": (
+                    credit - payoff - self.config.commission_per_straddle / 100.0
+                    if credit is not None and payoff is not None else None
+                ),
+            })
+            row.update(remaining_variance_pair(row, returns[path_mask]))
+            rows.append(row)
+        self.storage.persist_vrp_cone_observations(
+            self.symbol, date_str, rows
+        )
+        return rows
 
     def _settle_iron_flies(self, *, date_str: str, settlement_price: float,
                            settlement_source: str, rth_bar_count: int,
@@ -1020,6 +1246,19 @@ class IntradayVRPMonitor:
         paper_straddle_mtm = self.storage.load_vrp_paper_straddle_mtm(
             self.symbol, date_str
         )
+        minute_nodes = self.storage.load_vrp_minute_nodes(self.symbol, date_str)
+        cone_nodes = self.storage.load_vrp_cone_nodes(self.symbol, date_str)
+        start_h, start_m = (
+            int(item) for item in self.config.minute_node_start_et.split(":")
+        )
+        end_h, end_m = (
+            int(item) for item in self.config.minute_node_end_et.split(":")
+        )
+        minute_count = max(0, (end_h * 60 + end_m) - (start_h * 60 + start_m) + 1)
+        cone_count = (
+            (minute_count - 1) // max(1, self.config.cone_interval_minutes) + 1
+            if minute_count else 0
+        )
         report = build_vrp_daily_audit(
             symbol=self.symbol,
             date_str=date_str,
@@ -1032,6 +1271,10 @@ class IntradayVRPMonitor:
             paper_mtm=paper_mtm,
             paper_straddle_orders=paper_straddle_orders,
             paper_straddle_mtm=paper_straddle_mtm,
+            minute_nodes=minute_nodes,
+            cone_nodes=cone_nodes,
+            expected_minute_nodes=minute_count,
+            expected_cone_nodes=cone_count,
         )
         path = write_vrp_daily_audit(report, self.storage.data_dir)
         level = logging.INFO if report["quality"] == "good" else logging.WARNING

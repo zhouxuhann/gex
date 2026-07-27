@@ -6,7 +6,8 @@ from unittest.mock import MagicMock
 
 from gex_monitor.gex_calc import (
     calculate_gex, pick_expiry, GEXResult,
-    _calculate_gamma_flip, _calculate_atm_iv, _calculate_max_pain,
+    _calculate_gamma_flip, _calculate_repriced_gamma_flip,
+    _calculate_atm_iv, _calculate_max_pain,
     ATM_MAX_DEVIATION_PCT
 )
 
@@ -31,6 +32,13 @@ class TestCalculateGex:
         assert result.total_gex != 0
         assert result.call_gex > 0  # Calls have positive GEX
         assert result.put_gex < 0   # Puts have negative GEX
+        assert result.gross_gex == pytest.approx(
+            abs(result.call_gex) + abs(result.put_gex)
+        )
+        assert result.net_gex_ratio == pytest.approx(
+            result.total_gex / result.gross_gex
+        )
+        assert result.gross_volume_gamma >= abs(result.volume_gamma)
         assert len(result.df) == 4
 
     def test_calculate_gex_empty_tickers(self):
@@ -119,8 +127,8 @@ class TestCalculateGex:
         assert result_degraded is not None
         assert result_degraded.missing_oi == 2
 
-    def test_missing_oi_with_volume_is_usable(self, mock_ib_ticker):
-        """IB can return 0DTE Greeks/volume before OI; volume should keep GEX usable."""
+    def test_missing_oi_with_volume_does_not_fake_position_gex(self, mock_ib_ticker):
+        """Volume is activity, not an OI substitute for position GEX."""
         t1 = mock_ib_ticker(500, 'C', gamma=0.10, oi=1000)
         t1.callOpenInterest = float('nan')
         t1.volume = 1200
@@ -130,10 +138,13 @@ class TestCalculateGex:
 
         result = calculate_gex([t1, t2], spot=502.0)
 
-        assert result is not None
-        assert result.missing_oi == 2
-        assert result.df['volume'].sum() == 2100
-        assert result.total_gex != 0
+        assert result is None
+
+        degraded = calculate_gex([t1, t2], spot=502.0, oi_ready_threshold=0.0)
+        assert degraded is not None
+        assert degraded.missing_oi == 2
+        assert degraded.total_gex == 0
+        assert degraded.volume_gamma != 0
 
     def test_gamma_flip_single_strike(self, mock_ib_ticker):
         """Test gamma flip calculation with single strike."""
@@ -143,7 +154,8 @@ class TestCalculateGex:
         result = calculate_gex(tickers, spot=500.0)
 
         assert result is not None
-        assert result.gamma_flip == 500
+        assert result.gamma_flip is None
+        assert result.gamma_flip_method == 'unavailable'
 
     def test_gamma_flip_multiple_strikes(self, mock_ib_ticker):
         """Test gamma flip with multiple strikes."""
@@ -159,7 +171,9 @@ class TestCalculateGex:
         result = calculate_gex(tickers, spot=500.0)
 
         assert result is not None
-        assert result.gamma_flip in [495, 500, 505]  # Should be one of the strikes
+        # Mock contracts have no real expiry, so the repricing solver must not
+        # fabricate a strike-cumsum value.
+        assert result.gamma_flip is None
 
     def test_atm_iv_calculation(self, mock_ib_ticker):
         """Test ATM IV calculation."""
@@ -207,6 +221,53 @@ class TestCalculateGex:
         assert result is not None
         actual_gex = result.df[result.df.right == 'C']['gex'].iloc[0]
         assert abs(actual_gex - expected_call_gex) < 0.01
+
+    def test_daily_volume_never_replaces_open_interest(self, mock_ib_ticker):
+        ticker = mock_ib_ticker(500, 'C', gamma=0.10, oi=1000)
+        ticker.volume = 50_000
+
+        result = calculate_gex([ticker], spot=500.0)
+
+        expected_oi_gex = 0.10 * 1000 * 100 * 500**2 * 0.01
+        expected_volume_gamma = 0.10 * 50_000 * 100 * 500**2 * 0.01
+        assert result.total_gex == pytest.approx(expected_oi_gex)
+        assert result.volume_gamma == pytest.approx(expected_volume_gamma)
+        assert result.df.iloc[0]['gex'] == pytest.approx(expected_oi_gex)
+
+    def test_delta_oi_requires_same_expiry(self, mock_ib_ticker):
+        ticker = mock_ib_ticker(500, 'C', gamma=0.10, oi=1200)
+        ticker.contract.lastTradeDateOrContractMonth = '20260724'
+
+        wrong_expiry = {
+            500: {'call_oi': 1000, 'put_oi': 0, 'expiry': '20260723'},
+        }
+        result = calculate_gex(
+            [ticker], spot=500.0, prev_oi=wrong_expiry,
+        )
+        assert result.delta_oi_df['call_delta_oi'].isna().all()
+        assert result.max_call_delta_oi_strike is None
+
+        same_expiry = {
+            500: {'call_oi': 1000, 'put_oi': 0, 'expiry': '20260724'},
+        }
+        result = calculate_gex(
+            [ticker], spot=500.0, prev_oi=same_expiry,
+        )
+        assert result.delta_oi_df.iloc[0]['call_delta_oi'] == 200
+        assert result.max_call_delta_oi_strike == 500
+
+    def test_walls_use_call_and_put_sides_without_netting(self, mock_ib_ticker):
+        tickers = [
+            mock_ib_ticker(99, 'P', gamma=0.10, oi=5000),
+            mock_ib_ticker(99, 'C', gamma=0.10, oi=6000),
+            mock_ib_ticker(101, 'P', gamma=0.10, oi=7000),
+            mock_ib_ticker(101, 'C', gamma=0.10, oi=8000),
+        ]
+
+        result = calculate_gex(tickers, spot=100.0)
+
+        assert result.put_wall == 99.0
+        assert result.call_wall == 101.0
 
     def test_invalid_contract_right(self, mock_ib_ticker):
         """Test handling of invalid contract right."""
@@ -302,20 +363,19 @@ class TestCalculateGammaFlip:
         """Test with empty Series."""
         by_strike = pd.Series([], dtype=float)
         result = _calculate_gamma_flip(by_strike, spot=500.0)
-        assert result == 500.0  # Falls back to spot
+        assert result is None
 
     def test_single_strike(self):
         """Test with single strike."""
         by_strike = pd.Series([1e6], index=[500.0])
         result = _calculate_gamma_flip(by_strike, spot=502.0)
-        assert result == 500.0
+        assert result is None
 
     def test_no_zero_crossing(self):
         """Test when cumsum never crosses zero (all positive)."""
         by_strike = pd.Series([1e6, 2e6, 1.5e6], index=[495.0, 500.0, 505.0])
         result = _calculate_gamma_flip(by_strike, spot=500.0)
-        # Should return the strike with smallest cumsum
-        assert result == 495.0  # cumsum at 495 is 1e6, smallest
+        assert result is None
 
     def test_zero_crossing_interpolation(self):
         """Test linear interpolation when cumsum crosses zero."""
@@ -337,12 +397,49 @@ class TestCalculateGammaFlip:
         assert abs(result - expected) < 0.01
 
     def test_multiple_zero_crossings(self):
-        """Test with multiple zero crossings - should return first."""
+        """Test with multiple zero crossings - should return nearest to spot."""
         # cumsum: -1, 1, -1, 1
         by_strike = pd.Series([-1e6, 2e6, -2e6, 2e6], index=[490.0, 495.0, 500.0, 505.0])
         result = _calculate_gamma_flip(by_strike, spot=497.0)
-        # First crossing is between 490 and 495
-        assert 490.0 <= result <= 495.0
+        assert result == pytest.approx(497.5)
+
+
+class TestRepricedGammaFlip:
+    def test_reprices_gamma_and_finds_spot_root(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        df = pd.DataFrame([
+            {'strike': 80.0, 'right': 'P', 'oi': 1, 'iv': 0.25,
+             'multiplier': 100, 'expiry': '20270115'},
+            {'strike': 90.0, 'right': 'P', 'oi': 1000, 'iv': 0.25,
+             'multiplier': 100, 'expiry': '20270115'},
+            {'strike': 110.0, 'right': 'C', 'oi': 1000, 'iv': 0.25,
+             'multiplier': 100, 'expiry': '20270115'},
+            {'strike': 120.0, 'right': 'C', 'oi': 1, 'iv': 0.25,
+             'multiplier': 100, 'expiry': '20270115'},
+        ])
+        flip = _calculate_repriced_gamma_flip(
+            df, 100.0,
+            as_of=datetime(2026, 7, 15, 12, tzinfo=ZoneInfo('America/New_York')),
+        )
+        assert flip is not None
+        assert 90.0 < flip < 110.0
+
+    def test_no_crossing_returns_none(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        df = pd.DataFrame([
+            {'strike': 95.0, 'right': 'C', 'oi': 1000, 'iv': 0.25,
+             'multiplier': 100, 'expiry': '20270115'},
+            {'strike': 105.0, 'right': 'C', 'oi': 1000, 'iv': 0.25,
+             'multiplier': 100, 'expiry': '20270115'},
+        ])
+        assert _calculate_repriced_gamma_flip(
+            df, 100.0,
+            as_of=datetime(2026, 7, 15, 12, tzinfo=ZoneInfo('America/New_York')),
+        ) is None
 
 
 class TestCalculateAtmIv:

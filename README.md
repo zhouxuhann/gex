@@ -111,6 +111,34 @@ gex = sign × gamma × OI × multiplier × spot² × 0.01
 - 假设: dealers short puts, long calls
 - 单位: 美元 per 1% spot 变动
 - 注意: OI 是 T-1 数据，盘中不更新
+- `total_gex/call_gex/put_gex/gex` 始终使用 OI；当日累计成交量另存为
+  `volume_gamma`，只表示活动度，不代表未平仓 dealer 仓位
+- Gamma Flip 使用固定各合约 IV 的 Black-Scholes 重新定价网格求根；没有
+  有效零点时返回空值，不使用 strike 累积值或窗口边界伪造结果
+
+### 日内模型使用约定
+
+- `gross_gex = |call_gex| + |put_gex|`，`net_gex_ratio = total_gex / gross_gex`；
+  GEX 的 5/15 分钟变化统一用 gross GEX 归一化，避免净 GEX 接近零时比率失真。
+- `gross_volume_gamma / gross_gex` 仅作为当日成交活跃度确认项，不替代 OI 仓位结构。
+- VRP 会记录 `long_gamma / neutral_gamma / short_gamma` 和策略偏好，但当前
+  `gex_hard_gate_enabled=false`，不会仅凭 GEX 阻止 paper order。
+- 影子评分仅接受 `gex_method=oi_position_v2`。旧混合 OI/Volume 阈值已经停用，
+  当前规则由 QQQ 66 日训练/验证/测试并用 SPY 48 日做外部验证。
+
+历史 OI 口径回算（不会覆盖默认研究目录）：
+
+```bash
+python scripts/build_intraday_turning_points.py --symbol QQQ \
+  --gex-method oi_position_v2 --output-dir data/analysis/gex_v2
+python scripts/build_intraday_turning_points.py --symbol SPY \
+  --gex-method oi_position_v2 --output-dir data/analysis/gex_v2
+python scripts/analyze_intraday_turning_points.py \
+  --input-dir data/analysis/gex_v2 --output-dir data/analysis/gex_v2
+```
+
+旧 strike 文件没有 volume，因此历史回算只重建 OI position 通道；Volume 通道从
+新版本上线后前向积累。
 
 ## API 端点
 
