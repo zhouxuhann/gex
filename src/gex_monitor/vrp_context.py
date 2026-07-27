@@ -419,6 +419,10 @@ def path_features(bars, now: datetime, spot: float,
         "minutes_to_gap_fill": None,
         "rv_5m": None, "rv_15m": None,
         "rv_30m": None, "rv_60m": None, "range_15m_pct": None,
+        "rv_5m_annualized": None, "rv_15m_annualized": None,
+        "rv_30m_annualized": None, "rv_60m_annualized": None,
+        "rv_session_to_now": None, "rv_session_to_now_annualized": None,
+        "rv_annualized_to_now": None,
         "range_30m_pct": None, "range_60m_pct": None,
         "trend_efficiency_session": None, "trend_efficiency_30m": None,
         "entry_bar_count": 0,
@@ -446,11 +450,18 @@ def path_features(bars, now: datetime, spot: float,
         return empty
     session_open = _finite(df.iloc[0].get("open")) or float(close.iloc[0])
 
-    def rv(minutes: int) -> float | None:
-        values = close.tail(minutes + 1)
+    def rv(values: pd.Series) -> tuple[float | None, int]:
         if len(values) < 2:
+            return None, 0
+        returns = np.log(values).diff().dropna()
+        if returns.empty:
+            return None, 0
+        return float(np.sqrt(np.square(returns).sum())), int(len(returns))
+
+    def annualize(realized: float | None, return_count: int) -> float | None:
+        if realized is None or return_count <= 0:
             return None
-        return float(np.sqrt(np.square(np.log(values).diff().dropna()).sum()))
+        return float(realized * np.sqrt((252 * 390) / return_count))
 
     def window_range(minutes: int) -> float | None:
         window = df.tail(minutes)
@@ -518,8 +529,20 @@ def path_features(bars, now: datetime, spot: float,
         "trend_efficiency_session": efficiency(close),
         "trend_efficiency_30m": efficiency(close.tail(31)),
     })
+    session_rv, session_return_count = rv(close)
+    session_rv_annualized = annualize(session_rv, session_return_count)
+    result.update({
+        "rv_session_to_now": session_rv,
+        "rv_session_to_now_annualized": session_rv_annualized,
+        # Compatibility-friendly explicit alias used by downstream decision code.
+        "rv_annualized_to_now": session_rv_annualized,
+    })
     for minutes in (5, 15, 30, 60):
-        result[f"rv_{minutes}m"] = rv(minutes)
+        window_rv, return_count = rv(close.tail(minutes + 1))
+        result[f"rv_{minutes}m"] = window_rv
+        result[f"rv_{minutes}m_annualized"] = annualize(
+            window_rv, return_count
+        )
     for minutes in (15, 30, 60):
         result[f"range_{minutes}m_pct"] = window_range(minutes)
     return result

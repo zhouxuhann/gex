@@ -1,6 +1,8 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+import numpy as np
+
 from gex_monitor.time_utils import ET
 import gex_monitor.vrp_context as context_module
 from gex_monitor.vrp_context import (
@@ -67,6 +69,13 @@ def test_path_features_exclude_premarket_and_use_only_past_bars():
     assert result["session_vwap"] == 100.75
     assert result["gap_pct"] == (100 - 101) / 101
     assert bool(result["gap_filled_before_entry"])
+    expected_rv = abs(np.log(101 / 100))
+    assert abs(result["rv_session_to_now"] - expected_rv) < 1e-12
+    expected_annualized = expected_rv * np.sqrt(252 * 390)
+    assert abs(result["rv_session_to_now_annualized"] - expected_annualized) < 1e-12
+    assert result["rv_annualized_to_now"] == result["rv_session_to_now_annualized"]
+    assert result["rv_5m"] == result["rv_session_to_now"]
+    assert result["rv_5m_annualized"] == result["rv_session_to_now_annualized"]
 
 
 def test_vix_context_uses_prior_daily_history_and_shared_cache():

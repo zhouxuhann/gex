@@ -223,6 +223,7 @@ class IntradayVRPMonitor:
         self._paper_executor.poll(ib, now=now, ib_port=ib_port)
         self._paper_straddle_executor.poll(ib, now=now, ib_port=ib_port)
         shared_market_context = None
+        shared_intraday_bars = None
 
         def get_market_context() -> dict:
             nonlocal shared_market_context
@@ -231,6 +232,12 @@ class IntradayVRPMonitor:
                     market_context_provider() if market_context_provider is not None else {}
                 )
             return dict(shared_market_context)
+
+        def get_intraday_bars():
+            nonlocal shared_intraday_bars
+            if shared_intraday_bars is None and intraday_bars_provider is not None:
+                shared_intraday_bars = intraday_bars_provider()
+            return shared_intraday_bars
 
         minute_due = self._due_minute_node(now)
         if minute_due is not None:
@@ -242,6 +249,10 @@ class IntradayVRPMonitor:
             )
             minute_row["sample_kind"] = "raw_1m"
             minute_row.update(get_market_context())
+            minute_row.update(path_features(
+                self._entry_bars(date_str, get_intraday_bars()),
+                now, spot, previous_close=self._previous_close(date_str),
+            ))
             self.storage.persist_vrp_minute_node(
                 self.symbol, date_str, minute_row
             )
@@ -249,14 +260,6 @@ class IntradayVRPMonitor:
             if is_cone and minute_slot not in self._cone_recorded:
                 cone_row = dict(minute_row)
                 cone_row["sample_kind"] = "cone_5m"
-                fallback_bars = (
-                    intraday_bars_provider()
-                    if intraday_bars_provider is not None else None
-                )
-                cone_row.update(path_features(
-                    self._entry_bars(date_str, fallback_bars),
-                    now, spot, previous_close=self._previous_close(date_str),
-                ))
                 cone_row.update(self._previous_surface_context(date_str))
                 if term_structure_provider is not None:
                     cone_row.update(term_structure_provider())
@@ -273,7 +276,7 @@ class IntradayVRPMonitor:
         row = self._build_quote_row(
             ib, contracts, now, target, slot, spot, expiry, is_true_0dte, gex_state
         )
-        fallback_bars = intraday_bars_provider() if intraday_bars_provider is not None else None
+        fallback_bars = get_intraday_bars()
         bars = self._entry_bars(date_str, fallback_bars)
         row.update(path_features(
             bars, now, spot, previous_close=self._previous_close(date_str)

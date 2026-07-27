@@ -153,6 +153,10 @@ def test_collects_same_strike_pair_and_executable_credit(tmp_path):
     assert len(cone) == 1
     assert minute.iloc[0]["sample_kind"] == "raw_1m"
     assert cone.iloc[0]["sample_kind"] == "cone_5m"
+    assert minute.iloc[0]["entry_bar_count"] == 1
+    assert "rv_session_to_now" in minute.columns
+    assert "rv_annualized_to_now" in minute.columns
+    assert "rv_5m_annualized" in minute.columns
     storage.shutdown()
 
 
