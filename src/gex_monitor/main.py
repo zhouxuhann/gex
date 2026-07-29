@@ -180,6 +180,7 @@ def main():
             max_retries=config.ib.max_retries,
             timing=config.timing,
             market_data_stale_sec=config.monitoring.reconnect_stale_seconds,
+            max_option_contracts=config.monitoring.max_option_contracts_per_symbol,
             quality_min_contracts=config.monitoring.quality_min_contracts,
             quality_max_missing_ratio=config.monitoring.quality_max_missing_ratio,
             db_storage=db_storage,

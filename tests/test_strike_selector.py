@@ -110,6 +110,32 @@ class TestMinStrikesFloor:
         assert len(strikes) == 51
 
 
+class TestSubscriptionCap:
+    def test_cap_keeps_closest_strikes(self):
+        chain = _qqq_int_chain()
+        strikes = select_strikes(
+            chain,
+            spot=635.0,
+            strike_range=0.04,
+            max_strikes=20,
+        )
+
+        assert len(strikes) == 20
+        assert strikes == [float(s) for s in range(626, 646)]
+
+    def test_cap_preserves_sorted_unique_output(self):
+        chain = [634.0, 635.0, 635.0, 636.0, 637.0]
+        strikes = select_strikes(
+            chain,
+            spot=635.0,
+            strike_range=0.04,
+            min_strikes_each_side=1,
+            max_strikes=3,
+        )
+
+        assert strikes == [634.0, 635.0, 636.0]
+
+
 class TestEdgeCases:
     def test_empty_chain_returns_empty(self):
         assert select_strikes([], spot=635.0, strike_range=0.04) == []

@@ -46,6 +46,7 @@ def select_strikes(
     *,
     include_half_dollar: bool = False,
     min_strikes_each_side: int = 5,
+    max_strikes: int | None = None,
 ) -> list[float]:
     """Select the strikes to subscribe to around spot.
 
@@ -64,6 +65,9 @@ def select_strikes(
             computed range captures fewer than this, fall back to the
             nearest `min_strikes_each_side` strikes on that side. Protects
             against degenerate cases where `chain_strikes` is sparse.
+        max_strikes: optional hard cap after range selection. The closest
+            strikes to spot are retained. This protects the shared IB
+            streaming market-data allowance when multiple symbols run.
 
     Returns:
         Sorted list of strikes to subscribe to. Always includes spot-adjacent
@@ -98,4 +102,22 @@ def select_strikes(
     if len(above) < min_strikes_each_side:
         above = [s for s in filtered if s > spot][:min_strikes_each_side]
 
-    return sorted(set(below + above))
+    selected = sorted(set(below + above))
+    if max_strikes is not None:
+        limit = max(1, int(max_strikes))
+        if len(selected) > limit:
+            below_limit = (limit + 1) // 2
+            above_limit = limit - below_limit
+            capped = (
+                [s for s in selected if s <= spot][-below_limit:]
+                + [s for s in selected if s > spot][:above_limit]
+            )
+            if len(capped) < limit:
+                chosen = set(capped)
+                remainder = sorted(
+                    (s for s in selected if s not in chosen),
+                    key=lambda s: (abs(s - spot), s),
+                )
+                capped.extend(remainder[:limit - len(capped)])
+            selected = sorted(capped)
+    return selected

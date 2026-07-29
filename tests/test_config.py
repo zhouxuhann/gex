@@ -146,16 +146,19 @@ class TestMonitoringConfig:
 
         assert config.stale_seconds == 15
         assert config.spot_sanity_pct == 0.01
+        assert config.max_option_contracts_per_symbol == 40
 
     def test_custom_values(self):
         """Test custom monitoring configuration values."""
         config = MonitoringConfig(
             stale_seconds=30,
             spot_sanity_pct=0.02,
+            max_option_contracts_per_symbol=48,
         )
 
         assert config.stale_seconds == 30
         assert config.spot_sanity_pct == 0.02
+        assert config.max_option_contracts_per_symbol == 48
 
 
 class TestEmailAlertConfig:

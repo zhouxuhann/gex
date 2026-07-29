@@ -83,6 +83,9 @@ class MonitoringConfig(BaseModel):
     stale_seconds: int = 15
     reconnect_stale_seconds: int = 60
     spot_sanity_pct: float = 0.01
+    # 每个标的的流式期权行情上限。QQQ+SPY 默认合计 80 条，
+    # 为 underlying、VIX 和临时期限结构请求预留 IB 行情额度。
+    max_option_contracts_per_symbol: int = 40
     quality_min_contracts: int = 20
     quality_max_missing_ratio: float = 0.25
     quality_min_rth_coverage: float = 0.95

@@ -51,6 +51,8 @@ server:
 monitoring:
   stale_seconds: 15            # 数据陈旧警告阈值
   spot_sanity_pct: 0.01        # spot 单 tick 最大漂移 (1%)
+  # QQQ + SPY 合计最多 80 条流式期权行情，为其他请求预留 IB 行情额度。
+  max_option_contracts_per_symbol: 40
   quality_min_contracts: 20    # 每个快照至少需要的有效期权合约数
   quality_max_missing_ratio: 0.25
   quality_min_rth_coverage: 0.95

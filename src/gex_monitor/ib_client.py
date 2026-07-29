@@ -86,6 +86,7 @@ class IBWorker:
         max_retries: int = 3,
         timing: TimingConfig | None = None,
         market_data_stale_sec: int = 60,
+        max_option_contracts: int = 40,
         quality_min_contracts: int = 20,
         quality_max_missing_ratio: float = 0.25,
         db_storage: GEXDBStorage | None = None,
@@ -118,6 +119,9 @@ class IBWorker:
             int(market_data_stale_sec),
             self.timing.tick_interval_sec * 3,
         )
+        # Call/put 必须成对订阅，因此强制为不小于 2 的偶数。
+        self.max_option_contracts = max(2, int(max_option_contracts))
+        self.max_option_contracts -= self.max_option_contracts % 2
         self.quality_min_contracts = max(1, int(quality_min_contracts))
         self.quality_max_missing_ratio = float(quality_max_missing_ratio)
 
@@ -144,6 +148,11 @@ class IBWorker:
 
         # Strike 选择 hysteresis：spot 偏移超过此值才重选 strike
         self._last_strike_spot: float | None = None
+        # 尾盘行情不足时进入粘性窄窗模式。进入后本交易日不再跳回全链，
+        # 避免价格移动触发 100+ <-> 12 条行情反复退订/重订。
+        self._tail_degraded_active: bool = False
+        self._tail_degraded_expiry: str | None = None
+        self._tail_degraded_spot: float | None = None
 
         # Flip 平滑（滑动中位数，防止单 tick 跳变）
         self._flip_buffer: deque[float] = deque(maxlen=20)
@@ -259,6 +268,9 @@ class IBWorker:
         self.current_key = None
         self.current_contracts = []
         self._last_strike_spot = None
+        self._tail_degraded_active = False
+        self._tail_degraded_expiry = None
+        self._tail_degraded_spot = None
         self.last_good_spot = None
         self._connected_at_ts = 0.0
         self._last_market_data_marker = None
@@ -346,6 +358,9 @@ class IBWorker:
         self._last_success_ts = 0.0
         self._last_market_data_marker = None
         self._reconnect_requested_reason = None
+        self._tail_degraded_active = False
+        self._tail_degraded_expiry = None
+        self._tail_degraded_spot = None
 
         # 重新加载 ΔOI 基线：进程跨天长跑时，"前一交易日"会变，
         # 只在 __init__ 加载一次会让基线越来越陈旧
@@ -401,6 +416,7 @@ class IBWorker:
         strikes = select_strikes(
             self.chain.strikes, spot, self.strike_range,
             include_half_dollar=True,
+            max_strikes=self.max_option_contracts // 2,
         )
         expected_contracts = len(strikes) * 2  # C + P
 
@@ -458,6 +474,7 @@ class IBWorker:
         new_strikes = select_strikes(
             self.chain.strikes, spot, self.strike_range,
             include_half_dollar=True,
+            max_strikes=self.max_option_contracts // 2,
         )
 
         # 检查 strikes 是否变化
@@ -587,22 +604,52 @@ class IBWorker:
             self._log('error', '无可用 expiry')
             return False
 
-        # 选择 strikes：严格使用配置的百分比范围，并保留半美元行权价。
-        # Hysteresis: spot 偏移超过 $1 才重选，避免边界抖动触发重新订阅
+        # 选择 strikes：百分比范围之外再受 IB 行情额度硬上限约束。
+        # 尾盘一旦因行情不足进入窄窗，保持该模式到本交易日结束；
+        # spot 移动时只平移窄窗，不再恢复全链订阅。
         all_strikes = sorted(float(s) for s in self.chain.strikes if s and float(s) > 0)
-        need_reselect = (
-            self._last_strike_spot is None
-            or abs(spot - self._last_strike_spot) >= 1.0
-            or self.current_key is None
-            or self.current_key[0] != expiry
-        )
-        if need_reselect:
-            strikes = select_strikes(
-                self.chain.strikes, spot, self.strike_range,
-                include_half_dollar=True,
+        now_et = et_now()
+        if (
+            self._tail_degraded_active
+            and (now_et.hour < 15 or self._tail_degraded_expiry != expiry)
+        ):
+            self._tail_degraded_active = False
+            self._tail_degraded_expiry = None
+            self._tail_degraded_spot = None
+
+        if self._tail_degraded_active:
+            need_reselect = (
+                self.current_key is None
+                or self.current_key[0] != expiry
+                or self._tail_degraded_spot is None
+                or abs(spot - self._tail_degraded_spot) >= 1.0
             )
-            self._subscribe_options(expiry, strikes)
-            self._last_strike_spot = spot
+            if need_reselect:
+                narrow_below = [s for s in all_strikes if s <= spot][-3:]
+                narrow_above = [s for s in all_strikes if s > spot][:3]
+                narrow_strikes = sorted(set(narrow_below + narrow_above))
+                self._subscribe_options(expiry, narrow_strikes)
+                self._tail_degraded_spot = spot
+                self._log(
+                    'info',
+                    f'尾盘窄窗平移: {len(narrow_strikes)} strikes '
+                    f'(spot={spot:.2f})',
+                )
+        else:
+            need_reselect = (
+                self._last_strike_spot is None
+                or abs(spot - self._last_strike_spot) >= 1.0
+                or self.current_key is None
+                or self.current_key[0] != expiry
+            )
+            if need_reselect:
+                strikes = select_strikes(
+                    self.chain.strikes, spot, self.strike_range,
+                    include_half_dollar=True,
+                    max_strikes=self.max_option_contracts // 2,
+                )
+                self._subscribe_options(expiry, strikes)
+                self._last_strike_spot = spot
 
         # 记录 expiry 变化
         if expiry != self.last_expiry_seen:
@@ -615,15 +662,22 @@ class IBWorker:
 
         # 计算 GEX（传入前一日 OI 用于计算 ΔOI）
         tickers = [self.ib.ticker(c) for c in self.current_contracts]
-        result = calculate_gex(tickers, spot, prev_oi=self.prev_oi)
+        result = calculate_gex(
+            tickers,
+            spot,
+            oi_ready_threshold=0.0 if self._tail_degraded_active else 0.8,
+            prev_oi=self.prev_oi,
+        )
 
         if result is None:
             # 尾盘降级：15:00 ET 之后（最后一小时），缩窄到 ATM ±3 strike 重试
-            now_et = et_now()
             if now_et.hour >= 15:
                 narrow_below = [s for s in all_strikes if s <= spot][-3:]
                 narrow_above = [s for s in all_strikes if s > spot][:3]
                 narrow_strikes = sorted(set(narrow_below + narrow_above))
+                self._tail_degraded_active = True
+                self._tail_degraded_expiry = expiry
+                self._tail_degraded_spot = spot
                 self._subscribe_options(expiry, narrow_strikes)
                 tickers = [self.ib.ticker(c) for c in self.current_contracts]
                 result = calculate_gex(tickers, spot, oi_ready_threshold=0.0,
@@ -638,6 +692,8 @@ class IBWorker:
                           f'No valid data from {len(self.current_contracts)} contracts — '
                           'check market data subscription')
                 return False
+        if self._tail_degraded_active:
+            result.partial = True
 
         if result.missing_greeks > 0 or result.missing_oi > 0:
             # 仅在数据较多缺失时警告
@@ -648,12 +704,24 @@ class IBWorker:
                           f'数据缺失较多: missing_greeks={result.missing_greeks} '
                           f'missing_oi={result.missing_oi}')
 
+        quality_min_contracts = self.quality_min_contracts
+        if self._tail_degraded_active:
+            # 窄窗本来只有 12 张；仍要求至少 75% 合约有效，但不再用
+            # 全链的 20 张门槛制造误导性的 valid_contracts=12<20。
+            quality_min_contracts = max(
+                4,
+                int(np.ceil(len(self.current_contracts) * 0.75)),
+            )
         quality_reasons = evaluate_tick_quality(
             result,
             len(self.current_contracts),
-            min_contracts=self.quality_min_contracts,
+            min_contracts=quality_min_contracts,
             max_missing_ratio=self.quality_max_missing_ratio,
         )
+        if self._tail_degraded_active:
+            quality_reasons.append(
+                f'tail_subscription={len(self.current_contracts)}_contracts'
+            )
         if quality_reasons:
             result.partial = True
         quality_key = tuple(quality_reasons)
