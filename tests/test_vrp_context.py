@@ -90,6 +90,7 @@ def test_vix_context_uses_prior_daily_history_and_shared_cache():
             return True
 
         def qualifyContracts(self, contract):
+            self.timeout_seen = self.RequestTimeout
             return [contract]
 
         def reqMktData(self, contract, genericTickList="", snapshot=False):
@@ -126,3 +127,26 @@ def test_vix_context_uses_prior_daily_history_and_shared_cache():
     assert ib.subscriptions == 1
     assert ib.ticker_reads == 3
     assert ib.sleeps == 2
+    assert ib.timeout_seen == context_module._VIX_IB_REQUEST_TIMEOUT_SECONDS
+    assert not hasattr(ib, "RequestTimeout")
+
+
+def test_vix_context_does_not_wait_for_other_symbol_refresh():
+    class FakeIB:
+        def isConnected(self):
+            return True
+
+        def qualifyContracts(self, contract):
+            raise AssertionError("contended worker must not issue an IB request")
+
+    context_module._VIX_LIVE_CACHE.clear()
+    context_module._VIX_LOCK.acquire()
+    try:
+        result = vix_context(
+            FakeIB(), datetime(2026, 7, 16, 10, 0, tzinfo=ET)
+        )
+    finally:
+        context_module._VIX_LOCK.release()
+
+    assert result["vix"] is None
+    assert result["vix_source"] == "unavailable"

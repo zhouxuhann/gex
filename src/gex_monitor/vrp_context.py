@@ -23,6 +23,7 @@ _VIX_LIVE_CACHE: dict = {}
 _VIX_HISTORY_CACHE: dict = {}
 _VIX1D_LIVE_CACHE: dict = {}
 _TERM_STRUCTURE_CACHE: dict = {}
+_VIX_IB_REQUEST_TIMEOUT_SECONDS = 8.0
 
 
 def intraday_time_context(now: datetime) -> dict:
@@ -123,7 +124,20 @@ def vix_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
         return empty
     now = now.astimezone(ET)
     date_str = now.strftime("%Y%m%d")
-    with _VIX_LOCK:
+    cached = _VIX_LIVE_CACHE.get("value")
+    if cached and time.monotonic() - cached[0] <= max(30, cache_seconds):
+        return dict(cached[1])
+    # Never let one symbol's VIX refresh stop the other symbol's GEX loop.
+    # A stale/empty context row is preferable to blocking both workers.
+    if not _VIX_LOCK.acquire(blocking=False):
+        return dict(cached[1]) if cached else empty
+    had_request_timeout = hasattr(ib, "RequestTimeout")
+    previous_request_timeout = getattr(ib, "RequestTimeout", None)
+    try:
+        try:
+            ib.RequestTimeout = _VIX_IB_REQUEST_TIMEOUT_SECONDS
+        except Exception:
+            pass
         cached = _VIX_LIVE_CACHE.get("value")
         if cached and time.monotonic() - cached[0] <= max(30, cache_seconds):
             return dict(cached[1])
@@ -204,6 +218,15 @@ def vix_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
         except Exception as exc:
             log.warning("VRP VIX context unavailable: %s", exc)
             return dict(cached[1]) if cached else empty
+    finally:
+        try:
+            if had_request_timeout:
+                ib.RequestTimeout = previous_request_timeout
+            else:
+                delattr(ib, "RequestTimeout")
+        except Exception:
+            pass
+        _VIX_LOCK.release()
 
 
 def vix1d_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
@@ -213,7 +236,18 @@ def vix1d_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
     if ib is None or not ib.isConnected():
         return empty
     now = now.astimezone(ET)
-    with _VIX_LOCK:
+    cached = _VIX1D_LIVE_CACHE.get("value")
+    if cached and time.monotonic() - cached[0] <= max(30, cache_seconds):
+        return dict(cached[1])
+    if not _VIX_LOCK.acquire(blocking=False):
+        return dict(cached[1]) if cached else empty
+    had_request_timeout = hasattr(ib, "RequestTimeout")
+    previous_request_timeout = getattr(ib, "RequestTimeout", None)
+    try:
+        try:
+            ib.RequestTimeout = _VIX_IB_REQUEST_TIMEOUT_SECONDS
+        except Exception:
+            pass
         cached = _VIX1D_LIVE_CACHE.get("value")
         if cached and time.monotonic() - cached[0] <= max(30, cache_seconds):
             return dict(cached[1])
@@ -250,6 +284,15 @@ def vix1d_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
         except Exception as exc:
             log.warning("VRP VIX1D context unavailable: %s", exc)
             return dict(cached[1]) if cached else empty
+    finally:
+        try:
+            if had_request_timeout:
+                ib.RequestTimeout = previous_request_timeout
+            else:
+                delattr(ib, "RequestTimeout")
+        except Exception:
+            pass
+        _VIX_LOCK.release()
 
 
 def market_vol_context(ib, now: datetime, cache_seconds: int = 300) -> dict:
