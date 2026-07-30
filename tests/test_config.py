@@ -25,6 +25,7 @@ class TestIBConfig:
         assert config.port == 4002
         assert config.client_id_base == 10
         assert config.connect_timeout == 20
+        assert config.request_timeout == 8.0
         assert config.max_retries == 3
 
     def test_custom_values(self):
@@ -34,6 +35,7 @@ class TestIBConfig:
             port=7496,
             client_id_base=100,
             connect_timeout=30,
+            request_timeout=6.0,
             max_retries=5,
         )
 
@@ -41,6 +43,7 @@ class TestIBConfig:
         assert config.port == 7496
         assert config.client_id_base == 100
         assert config.connect_timeout == 30
+        assert config.request_timeout == 6.0
         assert config.max_retries == 5
 
 
@@ -145,6 +148,8 @@ class TestMonitoringConfig:
         config = MonitoringConfig()
 
         assert config.stale_seconds == 15
+        assert config.hard_stall_restart_seconds == 120
+        assert config.hard_stall_check_seconds == 15
         assert config.spot_sanity_pct == 0.01
         assert config.max_option_contracts_per_symbol == 40
 
@@ -152,11 +157,15 @@ class TestMonitoringConfig:
         """Test custom monitoring configuration values."""
         config = MonitoringConfig(
             stale_seconds=30,
+            hard_stall_restart_seconds=180,
+            hard_stall_check_seconds=10,
             spot_sanity_pct=0.02,
             max_option_contracts_per_symbol=48,
         )
 
         assert config.stale_seconds == 30
+        assert config.hard_stall_restart_seconds == 180
+        assert config.hard_stall_check_seconds == 10
         assert config.spot_sanity_pct == 0.02
         assert config.max_option_contracts_per_symbol == 48
 

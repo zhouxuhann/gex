@@ -4,6 +4,8 @@ ib:
   host: "127.0.0.1"           # Docker 内用 "host.docker.internal"
   port: 4002                   # IB Gateway Live 端口 (Paper: 7497)
   client_id_base: 10           # 每个标的递增 client_id
+  connect_timeout: 20
+  request_timeout: 8           # qualify/历史/快照等同步请求硬超时
 
 symbols:
   - name: QQQ
@@ -50,6 +52,9 @@ server:
 
 monitoring:
   stale_seconds: 15            # 数据陈旧警告阈值
+  reconnect_stale_seconds: 60
+  hard_stall_restart_seconds: 120
+  hard_stall_check_seconds: 15
   spot_sanity_pct: 0.01        # spot 单 tick 最大漂移 (1%)
   # QQQ + SPY 合计最多 80 条流式期权行情，为其他请求预留 IB 行情额度。
   max_option_contracts_per_symbol: 40
@@ -85,6 +90,8 @@ intraday_vrp:
   standardized_iv_dtes: [1, 2, 5]
   # 多到期日请求较重，每15分钟刷新；中间5分钟节点复用并保留asof。
   term_structure_cache_seconds: 900
+  # 15:30 多期限 skew 最多占用 worker 45 秒，超时保留已完成期限。
+  skew_surface_budget_seconds: 45
   # Paper-only experiments. Hard-blocked unless IB port=4002 and account starts DU.
   paper_execution_enabled: true
   paper_straddle_execution_enabled: true
@@ -125,3 +132,13 @@ timing:
   reconnect_delay_sec: 10      # IB 重连等待（秒）
   market_closed_check_sec: 300 # 非交易时段检查间隔（秒）
   max_sleep_sec: 1800          # 非交易时段最长休眠（秒）
+
+database:
+  enabled: true
+  host: "127.0.0.1"
+  port: 5433
+  dbname: "ibkr_market_data"
+  user: "ibkr_user"
+  connect_timeout: 5
+  statement_timeout_ms: 5000
+  lock_timeout_ms: 2000

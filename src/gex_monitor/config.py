@@ -13,6 +13,7 @@ class IBConfig(BaseModel):
     port: int = 4002
     client_id_base: int = 10
     connect_timeout: int = 20  # 连接超时秒数
+    request_timeout: float = 8.0  # 所有同步 IB 请求的硬超时
     max_retries: int = 3  # 最大重试次数
 
 
@@ -66,6 +67,9 @@ class DatabaseConfig(BaseModel):
     dbname: str = "ibkr_market_data"
     user: str = "ibkr_user"
     password: str = ""
+    connect_timeout: int = 5
+    statement_timeout_ms: int = 5000
+    lock_timeout_ms: int = 2000
 
     @model_validator(mode='after')
     def load_password_from_env(self) -> Self:
@@ -82,6 +86,10 @@ class MonitoringConfig(BaseModel):
     """监控配置"""
     stale_seconds: int = 15
     reconnect_stale_seconds: int = 60
+    # 独立 watchdog 不依赖 worker 主循环返回；超时后退出主进程，
+    # 由启动脚本的 supervisor 自动拉起。
+    hard_stall_restart_seconds: int = 120
+    hard_stall_check_seconds: int = 15
     spot_sanity_pct: float = 0.01
     # 每个标的的流式期权行情上限。QQQ+SPY 默认合计 80 条，
     # 为 underlying、VIX 和临时期限结构请求预留 IB 行情额度。
@@ -119,6 +127,7 @@ class IntradayVRPConfig(BaseModel):
     vix_cache_seconds: int = 300
     standardized_iv_dtes: list[int] = Field(default_factory=lambda: [1, 2, 5])
     term_structure_cache_seconds: int = 900
+    skew_surface_budget_seconds: float = 45.0
     paper_execution_enabled: bool = False
     paper_straddle_execution_enabled: bool = False
     paper_required_port: int = 4002

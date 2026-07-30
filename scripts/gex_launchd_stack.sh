@@ -15,6 +15,7 @@ ENV_FILE="${GEX_ENV_FILE:-$RUNTIME_DIR/.env}"
 SRC_DIR="$RUNTIME_DIR/src"
 LOG_DIR="$RUNTIME_DIR/logs"
 PID_FILE="$LOG_DIR/.pids"
+GEX_STOP_FILE="$LOG_DIR/.gex_supervisor_stop"
 MODE="${1:-dry}"
 QQQ_BAR_CLIENT_ID="${GEX_QQQ_BAR_CLIENT_ID:-210}"
 SPY_BAR_CLIENT_ID="${GEX_SPY_BAR_CLIENT_ID:-211}"
@@ -67,6 +68,7 @@ find_matching_pids() {
 
 stop_stack() {
   local stopped_any=0
+  touch "$GEX_STOP_FILE"
   if [ -f "$PID_FILE" ]; then
     while read -r pid; do
       [ -z "$pid" ] && continue
@@ -78,6 +80,7 @@ stop_stack() {
   local stale_pids
   stale_pids="$(find_matching_pids \
     "python -m gex_monitor.main" \
+    "python -m gex_monitor.process_supervisor" \
     "python -m gex_monitor.kdj_live_trader" \
     "python -m gex_monitor.macro_app" \
     "python -m gex_monitor.qqq_bars")"
@@ -129,6 +132,7 @@ fi
 
 existing="$(find_matching_pids \
   "python -m gex_monitor.main" \
+  "python -m gex_monitor.process_supervisor" \
   "python -m gex_monitor.kdj_live_trader" \
   "python -m gex_monitor.macro_app" \
   "python -m gex_monitor.qqq_bars")"
@@ -148,10 +152,14 @@ log "Starting GEX stack from runtime: $RUNTIME_DIR"
 log "GEX log: $GEX_LOG"
 
 cd "$SRC_DIR"
+rm -f "$GEX_STOP_FILE"
 
-nohup "$PYTHON_BIN" -m gex_monitor.main -c "$CONFIG_FILE" $GEX_HEDGE_FLAG > "$GEX_LOG" 2>&1 &
+nohup "$PYTHON_BIN" -m gex_monitor.process_supervisor \
+  --restart-delay 10 --stop-file "$GEX_STOP_FILE" -- \
+  "$PYTHON_BIN" -m gex_monitor.main -c "$CONFIG_FILE" $GEX_HEDGE_FLAG \
+  > "$GEX_LOG" 2>&1 &
 GEX_PID=$!
-log "GEX PID=$GEX_PID"
+log "GEX Supervisor PID=$GEX_PID"
 sleep 5
 if ! kill -0 "$GEX_PID" 2>/dev/null; then
   log "ERROR: GEX Monitor exited during startup"

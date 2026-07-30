@@ -18,6 +18,7 @@ from pathlib import Path
 from .config import AppConfig
 from .db_storage import GEXDBStorage
 from .email_notifier import EmailConfig, EmailNotifier
+from .hard_stall_watchdog import HardStallWatchdog
 from .ib_client import IBWorker
 from .ib_error_watcher import IBErrorWatcher
 from .state import registry
@@ -177,6 +178,7 @@ def main():
             spot_sanity_pct=config.monitoring.spot_sanity_pct,
             sec_type=sym_config.sec_type,
             connect_timeout=config.ib.connect_timeout,
+            request_timeout=config.ib.request_timeout,
             max_retries=config.ib.max_retries,
             timing=config.timing,
             market_data_stale_sec=config.monitoring.reconnect_stale_seconds,
@@ -202,6 +204,22 @@ def main():
         t.start()
         log.info(f"启动 {sym_config.name} worker (client_id={config.ib.client_id_base + i})")
 
+    def fatal_stall(reasons: list[str]) -> None:
+        log.critical(
+            "GEX worker hard stall; exiting for supervisor restart: %s",
+            "; ".join(reasons),
+        )
+        logging.shutdown()
+        os._exit(75)
+
+    hard_stall_watchdog = HardStallWatchdog(
+        workers,
+        threshold_seconds=config.monitoring.hard_stall_restart_seconds,
+        check_seconds=config.monitoring.hard_stall_check_seconds,
+        fatal_callback=fatal_stall,
+    )
+    hard_stall_watchdog.start()
+
     # 创建 Dash 应用
     app = create_app(
         registry=registry,
@@ -220,6 +238,7 @@ def main():
             return
         shutdown_flag.set()
         log.info("Shutting down...")
+        hard_stall_watchdog.stop()
 
         # 停止 workers
         for w in workers:

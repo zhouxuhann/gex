@@ -83,6 +83,7 @@ class IBWorker:
         spot_sanity_pct: float = 0.01,
         sec_type: str = 'STK',
         connect_timeout: int = 20,
+        request_timeout: float = 8.0,
         max_retries: int = 3,
         timing: TimingConfig | None = None,
         market_data_stale_sec: int = 60,
@@ -113,6 +114,7 @@ class IBWorker:
         self.spot_sanity_pct = spot_sanity_pct
         self.sec_type = sec_type
         self.connect_timeout = connect_timeout
+        self.request_timeout = max(1.0, float(request_timeout))
         self.max_retries = max_retries
         self.timing = timing or TimingConfig()
         self.market_data_stale_sec = max(
@@ -136,6 +138,7 @@ class IBWorker:
         self.last_good_spot: float | None = None
         self._connected_at_ts: float = 0.0
         self._last_success_ts: float = 0.0
+        self._loop_heartbeat_ts: float = time.time()
         self._last_market_data_marker: float | None = None
         self._reconnect_requested_reason: str | None = None
         self._last_quality_reasons: tuple[str, ...] = ()
@@ -288,6 +291,14 @@ class IBWorker:
             return f"行情 {age:.0f}s 未成功更新，疑似订阅失效"
         return None
 
+    def health_snapshot(self) -> dict:
+        """Lock-free fields for the out-of-band hard-stall watchdog."""
+        return {
+            "symbol": self.symbol,
+            "running": self._running,
+            "loop_heartbeat_ts": self._loop_heartbeat_ts,
+        }
+
     def _sleep(self, sec: float) -> None:
         """睡眠，同时推进 IB event loop"""
         if self.ib is not None and self.ib.isConnected():
@@ -308,6 +319,9 @@ class IBWorker:
         for attempt in range(1, self.max_retries + 1):
             try:
                 self.ib = IB()
+                # ib_insync defaults RequestTimeout to 0 (wait forever).
+                # Bound every synchronous req*/qualify call made by this worker.
+                self.ib.RequestTimeout = self.request_timeout
                 if self._ib_error_watcher is not None:
                     self._ib_error_watcher.attach(self.ib)
                 self.ib.errorEvent += self._on_ib_error
@@ -931,9 +945,9 @@ class IBWorker:
             # DB flush
             if self.db_storage is not None:
                 try:
-                    self.db_storage.flush()
+                    self.db_storage.flush_async()
                 except Exception as e:
-                    log.warning(f"DB flush error: {e}")
+                    log.warning(f"DB flush scheduling error: {e}")
             self.last_persist = time.time()
 
         self._last_market_data_marker = market_data_marker
@@ -944,6 +958,7 @@ class IBWorker:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
         while self._running:
+            self._loop_heartbeat_ts = time.time()
             now = et_now()
             market_open = is_market_open(now)
             extended = self.extended_hours and is_extended_hours(now)
@@ -1144,6 +1159,9 @@ class IBWorker:
                 # Multi-tenor surface must rebuild and merge all exchange chain
                 # fragments; the GEX worker chain can be a sparse SMART subset.
                 chain_override=None,
+                max_elapsed_seconds=(
+                    self._intraday_vrp_config.skew_surface_budget_seconds
+                ),
             )
             if surface is not None:
                 self._skew_surface_storage.save_surface(surface.to_records())

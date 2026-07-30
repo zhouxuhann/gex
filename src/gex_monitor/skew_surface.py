@@ -10,6 +10,7 @@ Multi-tenor Skew Surface 采集模块
   - 输出结构可直接序列化为 parquet
 """
 import logging
+import time
 from types import SimpleNamespace
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -170,6 +171,7 @@ def collect_skew_surface(
     sec_type: str = 'STK',
     spot_override: float | None = None,
     chain_override=None,
+    max_elapsed_seconds: float = 45.0,
 ) -> SkewSurface | None:
     """
     采集多 tenor skew surface
@@ -224,11 +226,18 @@ def collect_skew_surface(
         return None
 
     log.info(f"[{symbol}] Spot={spot:.2f}, expiries={expiries}")
+    deadline = time.monotonic() + max(1.0, float(max_elapsed_seconds))
 
     # 4. 按 tenor 顺序请求快照，避免五个期限同时占满 IB 行情额度。
     all_strikes = sorted({float(s) for s in chain.strikes if float(s) > 0})
     tenors = []
     for expiry, dte in expiries:
+        if time.monotonic() >= deadline:
+            log.warning(
+                "[%s] Skew surface budget %.1fs exhausted after %s tenors",
+                symbol, max_elapsed_seconds, len(tenors),
+            )
+            break
         strikes = _select_strikes(all_strikes, spot, dte)
         if len(strikes) < 5:
             log.error(f"[{symbol}] {expiry} strikes 不足: {len(strikes)}")
@@ -236,6 +245,12 @@ def collect_skew_surface(
             continue
         tickers = []
         for start in range(0, len(strikes), SNAPSHOT_STRIKES_PER_BATCH):
+            if time.monotonic() >= deadline:
+                log.warning(
+                    "[%s] %s snapshot stopped at budget %.1fs",
+                    symbol, expiry, max_elapsed_seconds,
+                )
+                break
             batch = strikes[start:start + SNAPSHOT_STRIKES_PER_BATCH]
             contracts = [
                 Option(symbol, expiry, s, r, 'SMART', tradingClass=trading_class)

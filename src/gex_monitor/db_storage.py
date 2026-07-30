@@ -14,6 +14,7 @@ import logging
 import threading
 import warnings
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 
 import pandas as pd
@@ -129,6 +130,11 @@ class GEXDBStorage:
         self._lock = threading.Lock()
         self._buffer: deque[dict] = deque(maxlen=5000)
         self._enabled = config.enabled and HAS_PSYCOPG2
+        self._flush_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="gex-db-flush"
+        )
+        self._flush_future: Future | None = None
+        self._flush_future_lock = threading.Lock()
 
         if self._enabled:
             self._try_connect()
@@ -144,7 +150,11 @@ class GEXDBStorage:
                 dbname=self._config.dbname,
                 user=self._config.user,
                 password=self._config.password,
-                connect_timeout=5,
+                connect_timeout=self._config.connect_timeout,
+                options=(
+                    f"-c statement_timeout={self._config.statement_timeout_ms} "
+                    f"-c lock_timeout={self._config.lock_timeout_ms}"
+                ),
             )
             self._conn.autocommit = False
             log.info(
@@ -218,7 +228,8 @@ class GEXDBStorage:
             'skew_signal': record.get('skew_signal'),
             'partial': bool(record.get('partial', False)),
         }
-        self._buffer.append(db_record)
+        with self._lock:
+            self._buffer.append(db_record)
 
     def flush(self) -> int:
         """
@@ -255,8 +266,19 @@ class GEXDBStorage:
                 self._conn = None
             return 0
 
+    def flush_async(self) -> bool:
+        """Schedule one serialized DB flush without blocking a GEX worker."""
+        if not self._enabled or not self._buffer:
+            return False
+        with self._flush_future_lock:
+            if self._flush_future is not None and not self._flush_future.done():
+                return False
+            self._flush_future = self._flush_executor.submit(self.flush)
+            return True
+
     def pending_count(self) -> int:
-        return len(self._buffer)
+        with self._lock:
+            return len(self._buffer)
 
     def upsert_market_data_bars(self, records: list[dict], page_size: int = 500) -> int:
         """批量写入官方 OHLC Bar。``datetime`` 使用美东 naive 时间。"""
@@ -411,8 +433,18 @@ class GEXDBStorage:
 
     def shutdown(self) -> None:
         """关闭连接前 flush 缓冲"""
+        with self._flush_future_lock:
+            future = self._flush_future
+        if future is not None:
+            try:
+                future.result(timeout=max(
+                    10.0, self._config.statement_timeout_ms / 1000.0 + 5.0
+                ))
+            except Exception as exc:
+                log.warning("Pending DB flush did not finish cleanly: %s", exc)
         if self._buffer:
             self.flush()
+        self._flush_executor.shutdown(wait=True, cancel_futures=False)
         if self._conn is not None:
             try:
                 self._conn.close()

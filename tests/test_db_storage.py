@@ -57,6 +57,10 @@ class TestGEXDBStorageInit:
         mock_psycopg2.psycopg2.connect.return_value = mock_conn
         storage = mock_psycopg2.GEXDBStorage(config)
         assert storage._enabled
+        kwargs = mock_psycopg2.psycopg2.connect.call_args.kwargs
+        assert kwargs["connect_timeout"] == 5
+        assert "statement_timeout=5000" in kwargs["options"]
+        assert "lock_timeout=2000" in kwargs["options"]
 
     def test_connect_failure_degrades(self, mock_psycopg2, config):
         mock_psycopg2.psycopg2.connect.side_effect = Exception("refused")
@@ -104,6 +108,21 @@ class TestBufferAndFlush:
 
     def test_flush_empty_buffer(self, db):
         assert db.flush() == 0
+
+    def test_flush_async_schedules_background_write(self, db, mock_psycopg2):
+        db.buffer_snapshot({
+            'symbol': 'QQQ', 'ts': datetime.now(), 'spot': 480.0,
+        })
+        mock_cursor = MagicMock()
+        db._conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        db._conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert db.flush_async()
+        db._flush_future.result(timeout=2)
+
+        assert db.pending_count() == 0
+        mock_psycopg2.psycopg2.extras.execute_batch.assert_called_once()
+        db.shutdown()
 
     def test_flush_no_connection(self, db, mock_psycopg2):
         db.buffer_snapshot({'symbol': 'QQQ', 'ts': datetime.now(), 'spot': 480})
