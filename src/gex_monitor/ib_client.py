@@ -89,6 +89,8 @@ class IBWorker:
         market_data_stale_sec: int = 60,
         max_option_contracts: int = 40,
         quality_min_contracts: int = 20,
+        tail_degraded_failure_threshold: int = 3,
+        tail_degraded_probe_seconds: int = 60,
         quality_max_missing_ratio: float = 0.25,
         db_storage: GEXDBStorage | None = None,
         hedge_enabled: bool = False,
@@ -125,6 +127,12 @@ class IBWorker:
         self.max_option_contracts = max(2, int(max_option_contracts))
         self.max_option_contracts -= self.max_option_contracts % 2
         self.quality_min_contracts = max(1, int(quality_min_contracts))
+        self.tail_degraded_failure_threshold = max(
+            1, int(tail_degraded_failure_threshold)
+        )
+        self.tail_degraded_probe_seconds = max(
+            15, int(tail_degraded_probe_seconds)
+        )
         self.quality_max_missing_ratio = float(quality_max_missing_ratio)
 
         self.ib: IB | None = None
@@ -151,11 +159,14 @@ class IBWorker:
 
         # Strike 选择 hysteresis：spot 偏移超过此值才重选 strike
         self._last_strike_spot: float | None = None
-        # 尾盘行情不足时进入粘性窄窗模式。进入后本交易日不再跳回全链，
-        # 避免价格移动触发 100+ <-> 12 条行情反复退订/重订。
+        # 尾盘行情不足时进入窄窗模式，但只在完整链连续失败后启用，
+        # 并周期性探测完整链，避免一次瞬时故障把当天永久锁在 6 档。
         self._tail_degraded_active: bool = False
         self._tail_degraded_expiry: str | None = None
         self._tail_degraded_spot: float | None = None
+        self._tail_full_failure_count: int = 0
+        self._tail_degraded_last_probe_ts: float = 0.0
+        self._tail_full_probe_active: bool = False
 
         # Flip 平滑（滑动中位数，防止单 tick 跳变）
         self._flip_buffer: deque[float] = deque(maxlen=20)
@@ -274,6 +285,9 @@ class IBWorker:
         self._tail_degraded_active = False
         self._tail_degraded_expiry = None
         self._tail_degraded_spot = None
+        self._tail_full_failure_count = 0
+        self._tail_degraded_last_probe_ts = 0.0
+        self._tail_full_probe_active = False
         self.last_good_spot = None
         self._connected_at_ts = 0.0
         self._last_market_data_marker = None
@@ -375,6 +389,9 @@ class IBWorker:
         self._tail_degraded_active = False
         self._tail_degraded_expiry = None
         self._tail_degraded_spot = None
+        self._tail_full_failure_count = 0
+        self._tail_degraded_last_probe_ts = 0.0
+        self._tail_full_probe_active = False
 
         # 重新加载 ΔOI 基线：进程跨天长跑时，"前一交易日"会变，
         # 只在 __init__ 加载一次会让基线越来越陈旧
@@ -619,10 +636,9 @@ class IBWorker:
             return False
 
         # 选择 strikes：百分比范围之外再受 IB 行情额度硬上限约束。
-        # 尾盘一旦因行情不足进入窄窗，保持该模式到本交易日结束；
-        # spot 移动时只平移窄窗，不再恢复全链订阅。
         all_strikes = sorted(float(s) for s in self.chain.strikes if s and float(s) > 0)
         now_et = et_now()
+        now_ts = time.time()
         if (
             self._tail_degraded_active
             and (now_et.hour < 15 or self._tail_degraded_expiry != expiry)
@@ -630,6 +646,20 @@ class IBWorker:
             self._tail_degraded_active = False
             self._tail_degraded_expiry = None
             self._tail_degraded_spot = None
+            self._tail_full_failure_count = 0
+            self._tail_full_probe_active = False
+
+        # 窄窗不是永久状态：定时切回完整链做一次恢复探测。
+        if (
+            self._tail_degraded_active
+            and now_ts - self._tail_degraded_last_probe_ts
+            >= self.tail_degraded_probe_seconds
+        ):
+            self._tail_degraded_active = False
+            self._tail_full_probe_active = True
+            self._tail_full_failure_count = self.tail_degraded_failure_threshold
+            self.current_key = None
+            self._log('info', '尾盘窄窗：尝试恢复完整期权链订阅')
 
         if self._tail_degraded_active:
             need_reselect = (
@@ -684,14 +714,22 @@ class IBWorker:
         )
 
         if result is None:
-            # 尾盘降级：15:00 ET 之后（最后一小时），缩窄到 ATM ±3 strike 重试
-            if now_et.hour >= 15:
+            if not self._tail_degraded_active:
+                self._tail_full_failure_count += 1
+            # 尾盘降级：完整链连续失败后，缩窄到 ATM ±3 strike 重试。
+            if (
+                now_et.hour >= 15
+                and self._tail_full_failure_count
+                >= self.tail_degraded_failure_threshold
+            ):
                 narrow_below = [s for s in all_strikes if s <= spot][-3:]
                 narrow_above = [s for s in all_strikes if s > spot][:3]
                 narrow_strikes = sorted(set(narrow_below + narrow_above))
                 self._tail_degraded_active = True
                 self._tail_degraded_expiry = expiry
                 self._tail_degraded_spot = spot
+                self._tail_degraded_last_probe_ts = now_ts
+                self._tail_full_probe_active = False
                 self._subscribe_options(expiry, narrow_strikes)
                 tickers = [self.ib.ticker(c) for c in self.current_contracts]
                 result = calculate_gex(tickers, spot, oi_ready_threshold=0.0,
@@ -706,6 +744,15 @@ class IBWorker:
                           f'No valid data from {len(self.current_contracts)} contracts — '
                           'check market data subscription')
                 return False
+        elif not self._tail_degraded_active:
+            if self._tail_full_probe_active:
+                self._log(
+                    'info',
+                    f'尾盘完整期权链已恢复: '
+                    f'{len(self.current_contracts)} contracts',
+                )
+            self._tail_full_failure_count = 0
+            self._tail_full_probe_active = False
         if self._tail_degraded_active:
             result.partial = True
 

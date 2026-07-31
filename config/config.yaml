@@ -59,6 +59,8 @@ monitoring:
   # QQQ + SPY 合计最多 80 条流式期权行情，为其他请求预留 IB 行情额度。
   max_option_contracts_per_symbol: 40
   quality_min_contracts: 20    # 每个快照至少需要的有效期权合约数
+  tail_degraded_failure_threshold: 3  # 尾盘完整链连续失败后才缩窄订阅
+  tail_degraded_probe_seconds: 60     # 窄窗期间恢复完整链的探测间隔
   quality_max_missing_ratio: 0.25
   quality_min_rth_coverage: 0.95
   quality_max_gap_seconds: 60

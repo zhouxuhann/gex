@@ -96,6 +96,9 @@ class MonitoringConfig(BaseModel):
     max_option_contracts_per_symbol: int = 40
     quality_min_contracts: int = 20
     quality_max_missing_ratio: float = 0.25
+    # 尾盘完整链连续失败多次后才使用 ATM 窄窗，并周期性尝试恢复完整链。
+    tail_degraded_failure_threshold: int = 3
+    tail_degraded_probe_seconds: int = 60
     quality_min_rth_coverage: float = 0.95
     quality_max_gap_seconds: int = 60
     quality_max_derived_null_ratio: float = 0.10
