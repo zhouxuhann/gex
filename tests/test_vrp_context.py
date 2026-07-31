@@ -76,6 +76,23 @@ def test_path_features_exclude_premarket_and_use_only_past_bars():
     assert result["rv_annualized_to_now"] == result["rv_session_to_now_annualized"]
     assert result["rv_5m"] == result["rv_session_to_now"]
     assert result["rv_5m_annualized"] == result["rv_session_to_now_annualized"]
+    assert result["rv_quality"] == "good"
+    assert result["rv_bar_age_seconds"] == 60
+
+
+def test_path_features_reject_stale_rv_without_copying_old_value():
+    bars = [
+        {"ts": datetime(2026, 7, 16, 9, 30, tzinfo=ET), "close": 100},
+        {"ts": datetime(2026, 7, 16, 9, 31, tzinfo=ET), "close": 101},
+    ]
+    result = path_features(
+        bars, datetime(2026, 7, 16, 9, 40, tzinfo=ET), 101
+    )
+    assert result["rv_quality"] == "stale"
+    assert result["rv_bar_age_seconds"] == 540
+    assert result["rv_5m"] is None
+    assert result["rv_session_to_now"] is None
+    assert result["rv_annualized_to_now"] is None
 
 
 def test_vix_context_uses_prior_daily_history_and_shared_cache():

@@ -466,6 +466,8 @@ def path_features(bars, now: datetime, spot: float,
         "rv_30m_annualized": None, "rv_60m_annualized": None,
         "rv_session_to_now": None, "rv_session_to_now_annualized": None,
         "rv_annualized_to_now": None,
+        "rv_bar_asof": None, "rv_bar_age_seconds": None,
+        "rv_quality": "unavailable",
         "range_30m_pct": None, "range_60m_pct": None,
         "trend_efficiency_session": None, "trend_efficiency_30m": None,
         "entry_bar_count": 0,
@@ -491,6 +493,11 @@ def path_features(bars, now: datetime, spot: float,
     close = pd.to_numeric(df["close"], errors="coerce").dropna()
     if close.empty:
         return empty
+    bar_asof = pd.Timestamp(df.iloc[-1]["ts"])
+    bar_age_seconds = max(
+        0.0, (pd.Timestamp(now) - bar_asof).total_seconds()
+    )
+    rv_quality = "good" if bar_age_seconds <= 120 else "stale"
     session_open = _finite(df.iloc[0].get("open")) or float(close.iloc[0])
 
     def rv(values: pd.Series) -> tuple[float | None, int]:
@@ -571,6 +578,9 @@ def path_features(bars, now: datetime, spot: float,
         "entry_bar_count": len(df),
         "trend_efficiency_session": efficiency(close),
         "trend_efficiency_30m": efficiency(close.tail(31)),
+        "rv_bar_asof": bar_asof,
+        "rv_bar_age_seconds": bar_age_seconds,
+        "rv_quality": rv_quality,
     })
     session_rv, session_return_count = rv(close)
     session_rv_annualized = annualize(session_rv, session_return_count)
@@ -586,6 +596,15 @@ def path_features(bars, now: datetime, spot: float,
         result[f"rv_{minutes}m_annualized"] = annualize(
             window_rv, return_count
         )
+    if rv_quality != "good":
+        for field in (
+            "rv_5m", "rv_15m", "rv_30m", "rv_60m",
+            "rv_5m_annualized", "rv_15m_annualized",
+            "rv_30m_annualized", "rv_60m_annualized",
+            "rv_session_to_now", "rv_session_to_now_annualized",
+            "rv_annualized_to_now",
+        ):
+            result[field] = None
     for minutes in (15, 30, 60):
         result[f"range_{minutes}m_pct"] = window_range(minutes)
     return result

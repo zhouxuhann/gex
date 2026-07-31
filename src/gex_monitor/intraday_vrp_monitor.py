@@ -309,7 +309,17 @@ class IntradayVRPMonitor:
         return True
 
     def _entry_bars(self, date_str: str, fallback_bars):
-        """Prefer official TRADES bars (volume/WAP); fall back to state OHLC."""
+        """Merge official TRADES bars with fresher state bars.
+
+        Official bars win for duplicate minutes because they contain exchange
+        volume/WAP. State bars extend the frame when the official collector
+        lags, preventing intraday RV from freezing on an old official file.
+        """
+        frames = []
+        if fallback_bars is not None:
+            fallback = pd.DataFrame(fallback_bars).copy()
+            if not fallback.empty:
+                frames.append(fallback)
         official = Path(self.storage.data_dir) / (
             f"official_ohlc_{self.symbol}_{date_str}.parquet"
         )
@@ -317,10 +327,25 @@ class IntradayVRPMonitor:
             try:
                 frame = read_parquet_et(official)
                 if not frame.empty:
-                    return frame
+                    # Appended last so official values win duplicate minutes.
+                    frames.append(frame)
             except Exception as exc:
                 log.warning("[%s] official entry bars unreadable: %s", self.symbol, exc)
-        return fallback_bars
+        if not frames:
+            return fallback_bars
+        merged = pd.concat(frames, ignore_index=True)
+        if "ts" not in merged:
+            return fallback_bars
+        merged["ts"] = pd.to_datetime(merged["ts"], errors="coerce")
+        if merged["ts"].dt.tz is None:
+            merged["ts"] = merged["ts"].dt.tz_localize(ET)
+        else:
+            merged["ts"] = merged["ts"].dt.tz_convert(ET)
+        return (
+            merged.dropna(subset=["ts"])
+            .drop_duplicates("ts", keep="last")
+            .sort_values("ts")
+        )
 
     def _previous_close(self, date_str: str) -> float | None:
         if date_str in self._previous_close_cache:
@@ -980,6 +1005,13 @@ class IntradayVRPMonitor:
             log.warning("[%s] VRP settlement %s: no clean OHLC", self.symbol, date_str)
             self.audit_date(date_str)
             return 0
+        if len(bars) < 389:
+            log.warning(
+                "[%s] VRP settlement %s deferred: only %s clean RTH bars",
+                self.symbol, date_str, len(bars),
+            )
+            self.audit_date(date_str)
+            return 0
         settle = _finite(bars.iloc[-1]["close"])
         if settle is None:
             return 0
@@ -1306,17 +1338,35 @@ class IntradayVRPMonitor:
                 settled_keys = set(
                     observations.get("scheduled_time", pd.Series(dtype=str)).astype(str)
                 )
-                if not quote_keys.issubset(settled_keys):
+                complete_keys = set()
+                if "settlement_quality" in observations:
+                    complete_keys = set(
+                        observations.loc[
+                            observations["settlement_quality"].astype(str) == "complete",
+                            "scheduled_time",
+                        ].astype(str)
+                    )
+                if (not quote_keys.issubset(settled_keys)
+                        or not quote_keys.issubset(complete_keys)):
                     total += self.settle_date(date_str)
         return total
 
     def _load_clean_bars(self, date_str: str) -> tuple[pd.DataFrame, str]:
         official = Path(self.storage.data_dir) / f"official_ohlc_{self.symbol}_{date_str}.parquet"
         fallback = Path(self.storage.data_dir) / f"ohlc_{self.symbol}_{date_str}.parquet"
-        path = official if official.exists() else fallback
-        if not path.exists():
+        frames = []
+        if fallback.exists():
+            frames.append((read_parquet_et(fallback), "derived"))
+        if official.exists():
+            frames.append((read_parquet_et(official), "official"))
+        if not frames:
             return pd.DataFrame(), "missing"
-        df = read_parquet_et(path)
+        valid = [frame.assign(_bar_source=source) for frame, source in frames
+                 if not frame.empty and "ts" in frame and "close" in frame]
+        if not valid:
+            return pd.DataFrame(), "invalid"
+        # Official rows are appended last and win duplicate timestamps.
+        df = pd.concat(valid, ignore_index=True)
         if df.empty or "ts" not in df or "close" not in df:
             return pd.DataFrame(), "invalid"
         target = datetime.strptime(date_str, "%Y%m%d").date()
@@ -1325,4 +1375,10 @@ class IntradayVRPMonitor:
         df = df[(clock >= datetime.strptime("09:30", "%H:%M").time()) &
                 (clock <= datetime.strptime("16:00", "%H:%M").time())]
         df = df.drop_duplicates("ts", keep="last").sort_values("ts")
-        return df, "official_ohlc_1m" if path == official else "derived_ohlc_1m"
+        official_rows = int((df["_bar_source"] == "official").sum())
+        source = (
+            "official_ohlc_1m" if official_rows == len(df)
+            else "merged_official_derived_ohlc_1m" if official_rows
+            else "derived_ohlc_1m"
+        )
+        return df.drop(columns=["_bar_source"]), source

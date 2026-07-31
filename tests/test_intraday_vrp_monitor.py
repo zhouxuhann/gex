@@ -277,6 +277,49 @@ def test_settlement_uses_actual_strike_and_cleans_cross_day_bars(tmp_path):
     storage.shutdown()
 
 
+def test_entry_bars_merge_fresher_state_over_lagging_official_file(tmp_path):
+    storage = StorageManager(tmp_path)
+    monitor = IntradayVRPMonitor("QQQ", storage, IntradayVRPConfig(enabled=True))
+    official = pd.DataFrame({
+        "ts": pd.date_range("2026-07-16 09:30", periods=2, freq="min", tz=ET),
+        "close": [100.0, 101.0],
+        "volume": [10, 20],
+    })
+    official.to_parquet(
+        tmp_path / "official_ohlc_QQQ_20260716.parquet", index=False
+    )
+    fallback = [
+        {"ts": datetime(2026, 7, 16, 9, 31, tzinfo=ET), "close": 100.5},
+        {"ts": datetime(2026, 7, 16, 9, 32, tzinfo=ET), "close": 102.0},
+    ]
+    merged = monitor._entry_bars("20260716", fallback)
+    assert len(merged) == 3
+    assert merged.iloc[-1]["close"] == 102.0
+    assert merged.loc[
+        merged["ts"] == pd.Timestamp("2026-07-16 09:31", tz=ET), "close"
+    ].iloc[0] == 101.0
+    storage.shutdown()
+
+
+def test_settlement_defers_until_complete_rth_bars(tmp_path):
+    storage = StorageManager(tmp_path)
+    monitor = IntradayVRPMonitor("QQQ", storage, IntradayVRPConfig(enabled=True))
+    observed = datetime(2026, 7, 16, 10, 0, tzinfo=ET)
+    storage.persist_vrp_quote("QQQ", "20260716", {
+        "symbol": "QQQ", "trading_date": "20260716",
+        "scheduled_time": "10:00", "observed_at": observed,
+        "spot": 100.0, "strike": 100.0, "status": "ok",
+    })
+    bars = pd.DataFrame({
+        "ts": pd.date_range("2026-07-16 09:30", periods=200, freq="min", tz=ET),
+        "close": 100.0,
+    })
+    bars.to_parquet(tmp_path / "ohlc_QQQ_20260716.parquet", index=False)
+    assert monitor.settle_date("20260716") == 0
+    assert storage.load_vrp_observations("QQQ", "20260716").empty
+    storage.shutdown()
+
+
 def test_iron_fly_settlement_caps_payoff_at_wing(tmp_path):
     storage = StorageManager(tmp_path)
     monitor = IntradayVRPMonitor("SPY", storage, IntradayVRPConfig(enabled=True))
