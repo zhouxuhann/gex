@@ -35,6 +35,9 @@ dev = [
 [project.scripts]
 gex-monitor = "gex_monitor.main:main"
 gex-bars = "gex_monitor.qqq_bars:main"
+universal-momentum = "gex_monitor.multi_asset_momentum:main"
+momentum-0dte-paper = "gex_monitor.momentum_0dte_paper_trader:main"
+momentum-daily-optimize = "gex_monitor.momentum_daily_optimizer:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

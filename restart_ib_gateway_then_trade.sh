@@ -111,8 +111,8 @@ run_gex_start() {
   local tmux_cmd
   local start_cwd
   start_cwd="$(cd "$(dirname "$START_SCRIPT")" && pwd)"
-  printf -v tmux_cmd 'cd %q && /bin/bash %q %q > %q 2>&1; exec bash -l' \
-    "$start_cwd" "$START_SCRIPT" "$START_MODE" "$GEX_START_LOG"
+  printf -v tmux_cmd 'cd %q && IB_HOST=%q IB_PORT=%q /bin/bash %q %q > %q 2>&1; exec bash -l' \
+    "$start_cwd" "$IB_HOST" "$IB_PORT" "$START_SCRIPT" "$START_MODE" "$GEX_START_LOG"
   tmux new-session -d -s "$GEX_TMUX_SESSION" "$tmux_cmd"
 
   local deadline
