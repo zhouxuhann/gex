@@ -86,9 +86,35 @@ def test_subscribe_options_does_not_cache_when_qualification_mostly_fails():
 
 def test_1102_does_not_request_reconnect():
     worker = _worker()
+    worker._upstream_disconnected = True
 
     worker._on_ib_error(-1, 1102, "Connectivity restored - data maintained", None)
 
+    assert worker._reconnect_requested_reason is None
+    assert worker._upstream_disconnected is False
+    assert worker._market_data_reset_requested is False
+
+
+def test_1100_waits_on_existing_api_session_instead_of_reconnecting():
+    worker = _worker()
+    worker._reconnect_requested_reason = "stale data"
+
+    worker._on_ib_error(-1, 1100, "Connectivity lost", None)
+
+    assert worker._upstream_disconnected is True
+    assert worker._upstream_disconnected_at_ts > 0
+    assert worker._reconnect_requested_reason is None
+    assert worker._stale_reconnect_reason() is None
+
+
+def test_1101_requests_in_place_market_data_reset():
+    worker = _worker()
+    worker._upstream_disconnected = True
+
+    worker._on_ib_error(-1, 1101, "Connectivity restored - data lost", None)
+
+    assert worker._upstream_disconnected is False
+    assert worker._market_data_reset_requested is True
     assert worker._reconnect_requested_reason is None
 
 

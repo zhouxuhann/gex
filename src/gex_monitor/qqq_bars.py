@@ -37,6 +37,7 @@ log = logging.getLogger(__name__)
 BAR_SIZE = '1 min'
 WHAT_TO_SHOW = 'TRADES'
 SOURCE = 'ib_historical_trades'
+FINALIZE_RETRY_SEC = 60.0
 
 
 def _session_bounds(date_str: str) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -121,6 +122,15 @@ def add_gap_flags(records: list[dict], expected_minutes: int) -> list[dict]:
     for record in records:
         record['has_gaps'] = has_gaps
     return records
+
+
+def is_complete_day(records: list[dict], date_str: str) -> bool:
+    """Return whether a historical response contains the full RTH session."""
+    if not records:
+        return False
+    start, end = _session_bounds(date_str)
+    expected = int((end - start).total_seconds() // 60)
+    return len(records) == expected and not records[0].get('has_gaps', True)
 
 
 class OfficialQQQBarCollector:
@@ -258,8 +268,29 @@ class OfficialQQQBarCollector:
                 if now >= close_dt:
                     date_str = now.strftime('%Y%m%d')
                     if finalized_date != date_str:
-                        latest_records = self.fetch_day(date_str)
-                        self.persist_day(date_str, latest_records)
+                        if bars is not None:
+                            self.ib.cancelHistoricalData(bars)
+                            bars = None
+                            current_date = None
+                            last_signatures.clear()
+                        try:
+                            latest_records = self.fetch_day(date_str)
+                            self.persist_day(date_str, latest_records)
+                        except Exception:
+                            log.exception(
+                                '[%s] %s 收盘回补请求失败，%.0fs 后重试',
+                                self.symbol, date_str, FINALIZE_RETRY_SEC,
+                            )
+                            time.sleep(FINALIZE_RETRY_SEC)
+                            continue
+                        if not is_complete_day(latest_records, date_str):
+                            log.warning(
+                                '[%s] %s 收盘回补不完整 (%d bars)，%.0fs 后重试',
+                                self.symbol, date_str, len(latest_records),
+                                FINALIZE_RETRY_SEC,
+                            )
+                            time.sleep(FINALIZE_RETRY_SEC)
+                            continue
                         finalized_date = date_str
                         log.info('[%s] %s 收盘回补完成，等待下一个交易日', self.symbol, date_str)
                     if bars is not None:

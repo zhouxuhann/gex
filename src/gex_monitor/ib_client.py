@@ -44,7 +44,7 @@ log = logging.getLogger(__name__)
 
 # IB market data generic ticks
 GENERIC_TICKS = '100,101,104,106'
-RECOVERABLE_IB_ERROR_CODES = {10197, 1100, 1101}
+RECOVERABLE_IB_ERROR_CODES = {10197, 1100, 1101, 1102}
 
 
 def select_option_chain(chains, trading_class: str):
@@ -149,6 +149,13 @@ class IBWorker:
         self._loop_heartbeat_ts: float = time.time()
         self._last_market_data_marker: float | None = None
         self._reconnect_requested_reason: str | None = None
+        # 1100 means Gateway/TWS lost its upstream IBKR connection; the local
+        # API socket is normally still healthy.  Keep that socket alive so it
+        # can deliver 1101/1102 instead of creating a reconnect storm against
+        # a Gateway that cannot reach IBKR yet.
+        self._upstream_disconnected: bool = False
+        self._upstream_disconnected_at_ts: float = 0.0
+        self._market_data_reset_requested: bool = False
         self._last_quality_reasons: tuple[str, ...] = ()
         self._running: bool = True
 
@@ -252,12 +259,58 @@ class IBWorker:
             return
         if errorCode == 10197:
             reason = "IB 10197: 实时行情被另一端会话占用"
+            self._request_reconnect(reason)
         elif errorCode == 1100:
             self.state.set_status(connected=False)
-            reason = "IB 1100: Gateway/TWS 连接断开"
+            if not self._upstream_disconnected:
+                self._log(
+                    'warning',
+                    'IB 1100: Gateway 与 IBKR 上游断开; '
+                    '保持本地 API 会话并等待 1101/1102 恢复通知',
+                )
+            self._upstream_disconnected = True
+            self._upstream_disconnected_at_ts = time.time()
+            # A stale-data reconnect queued just before 1100 would defeat the
+            # wait-for-recovery behavior.
+            self._reconnect_requested_reason = None
+        elif errorCode == 1101:
+            self._upstream_disconnected = False
+            self._upstream_disconnected_at_ts = 0.0
+            self._market_data_reset_requested = True
+            self._last_success_ts = time.time()
+            self.state.set_status(connected=True)
+            self._log('warning', 'IB 1101: 上游已恢复，行情订阅已丢失; 将原地重订阅')
         else:
-            reason = f"IB {errorCode}: 连接恢复/行情 reset，需要重新订阅"
-        self._request_reconnect(reason)
+            # 1102 explicitly says existing market-data subscriptions were
+            # maintained, so no reconnect or resubscribe is needed.
+            self._upstream_disconnected = False
+            self._upstream_disconnected_at_ts = 0.0
+            self._last_success_ts = time.time()
+            self.state.set_status(connected=True)
+            self._log('info', 'IB 1102: 上游已恢复，现有行情订阅保持有效')
+
+    def _resubscribe_after_1101(self) -> None:
+        """Re-request live data in place after IB says subscriptions were lost."""
+        if self.ib is None or not self.ib.isConnected():
+            return
+        self._log('warning', 'IB 1101 恢复处理: 原地重新订阅 underlying 与期权行情')
+        if self.underlying is not None:
+            try:
+                self.ib.cancelMktData(self.underlying)
+            except Exception:
+                pass
+            self.ib.reqMktData(self.underlying, genericTickList='', snapshot=False)
+        for contract in self.current_contracts:
+            try:
+                self.ib.cancelMktData(contract)
+            except Exception:
+                pass
+            self.ib.reqMktData(
+                contract, genericTickList=GENERIC_TICKS, snapshot=False
+            )
+        self._market_data_reset_requested = False
+        self._last_market_data_marker = None
+        self._last_success_ts = time.time()
 
     def _force_reconnect(self, reason: str) -> None:
         self._log('warning', f"{reason}; 正在断开并重新订阅行情")
@@ -292,8 +345,13 @@ class IBWorker:
         self._connected_at_ts = 0.0
         self._last_market_data_marker = None
         self._reconnect_requested_reason = None
+        self._upstream_disconnected = False
+        self._upstream_disconnected_at_ts = 0.0
+        self._market_data_reset_requested = False
 
     def _stale_reconnect_reason(self) -> str | None:
+        if self._upstream_disconnected:
+            return None
         if self.ib is None or not self.ib.isConnected():
             return None
         now_ts = time.time()
@@ -386,6 +444,9 @@ class IBWorker:
         self._last_success_ts = 0.0
         self._last_market_data_marker = None
         self._reconnect_requested_reason = None
+        self._upstream_disconnected = False
+        self._upstream_disconnected_at_ts = 0.0
+        self._market_data_reset_requested = False
         self._tail_degraded_active = False
         self._tail_degraded_expiry = None
         self._tail_degraded_spot = None
@@ -449,17 +510,28 @@ class IBWorker:
             include_half_dollar=True,
             max_strikes=self.max_option_contracts // 2,
         )
-        expected_contracts = len(strikes) * 2  # C + P
+        requested_contracts = len(strikes) * 2  # C + P
 
         # 4. 订阅期权（带重试）
         for attempt in range(3):
             self._subscribe_options(expiry, strikes, validate=True)
             actual = len(self.current_contracts)
+            # qualifyContracts 会把不存在的行权价加入无效缓存。这些合约不应
+            # 继续计入预热目标，否则会出现已经订阅完 34/34、却仍按 40
+            # 重试三次的假告警。整批临时失败不会写入缓存，因此仍会正常重试。
+            expected_contracts = sum(
+                1
+                for strike in strikes
+                for right in ('C', 'P')
+                if (expiry, float(strike), right) not in self._invalid_contract_cache
+            )
 
-            if actual >= expected_contracts * 0.9:  # 允许 10% 容差
+            if expected_contracts and actual >= expected_contracts * 0.9:  # 允许 10% 容差
                 self._log('info',
                           f"预热完成: {actual}/{expected_contracts} 合约就绪, "
-                          f"strikes={len(strikes)}, expiry={expiry}")
+                          f"strikes={len(strikes)}, expiry={expiry}"
+                          + (f", requested={requested_contracts}"
+                             if expected_contracts != requested_contracts else ""))
                 return
 
             self._log('warning',
@@ -467,6 +539,12 @@ class IBWorker:
             self.current_key = None  # 强制重新订阅
             self.ib.sleep(2)
 
+        expected_contracts = sum(
+            1
+            for strike in strikes
+            for right in ('C', 'P')
+            if (expiry, float(strike), right) not in self._invalid_contract_cache
+        )
         self._log('warning',
                   f"预热: 合约订阅未达预期 ({len(self.current_contracts)}/{expected_contracts}), "
                   "继续运行")
@@ -740,6 +818,47 @@ class IBWorker:
                               f'尾盘降级模式: {len(narrow_strikes)} strikes, '
                               f'partial GEX={result.total_gex:.0f}')
             if result is None:
+                # Gateway 刚启动时 API socket 可能已经 ready，但 usopt 期权
+                # 行情农场仍在 connecting。此时首次 reqMktData 会留下一个
+                # 没有 Greeks（甚至完全无 tick）的订阅。不要立刻断开连接，
+                # 否则每次重连都会再次撞上同一个启动竞态；先在已就绪的
+                # 连接上原地取消并重订。
+                if self._tail_full_failure_count in (3, 10) and self.current_key:
+                    retry_expiry, retry_strikes = self.current_key
+                    self.current_key = None
+                    self._log(
+                        'warning',
+                        f'期权行情未就绪，原地重新订阅 '
+                        f'(attempt={self._tail_full_failure_count})',
+                    )
+                    self._subscribe_options(retry_expiry, list(retry_strikes))
+                if self._tail_full_failure_count in (1, 10) or self._tail_full_failure_count % 20 == 0:
+                    ticker_count = sum(t is not None for t in tickers)
+                    greeks_count = sum(
+                        t is not None
+                        and t.modelGreeks is not None
+                        and t.modelGreeks.gamma is not None
+                        and np.isfinite(t.modelGreeks.gamma)
+                        for t in tickers
+                    )
+                    oi_count = 0
+                    bidask_count = 0
+                    for ticker in tickers:
+                        if ticker is None:
+                            continue
+                        oi = (ticker.callOpenInterest
+                              if ticker.contract.right == 'C'
+                              else ticker.putOpenInterest)
+                        if oi is not None and np.isfinite(oi):
+                            oi_count += 1
+                        if ((ticker.bid is not None and np.isfinite(ticker.bid))
+                                or (ticker.ask is not None and np.isfinite(ticker.ask))):
+                            bidask_count += 1
+                    self._log(
+                        'warning',
+                        f'期权数据诊断: tickers={ticker_count}/{len(tickers)} '
+                        f'greeks={greeks_count} oi={oi_count} bidask={bidask_count}',
+                    )
                 self._log('warning',
                           f'No valid data from {len(self.current_contracts)} contracts — '
                           'check market data subscription')
@@ -1112,6 +1231,24 @@ class IBWorker:
                     self._log('error', f"IB connect failed: {e}")
                     time.sleep(self.timing.reconnect_delay_sec)
                     continue
+
+            # Error 1100 is an upstream outage, not a dead local API socket.
+            # Pump the existing event loop until Gateway reports 1101/1102.
+            if self._upstream_disconnected:
+                outage_age = time.time() - self._upstream_disconnected_at_ts
+                self.state.set_status(
+                    connected=False,
+                    updated=f"IBKR 上游断线，等待自动恢复 ({outage_age:.0f}s)",
+                )
+                self._sleep(min(5.0, self.timing.tick_interval_sec))
+                continue
+
+            if self._market_data_reset_requested:
+                try:
+                    self._resubscribe_after_1101()
+                except Exception as e:
+                    self._log('warning', f'IB 1101 原地重订阅失败: {e}')
+                    self._request_reconnect('IB 1101 原地重订阅失败')
 
             # 延伸时段（GTH 20:15-9:25 / Curb 16:15-17:00）：直接跑 tick
             if extended and not market_open:

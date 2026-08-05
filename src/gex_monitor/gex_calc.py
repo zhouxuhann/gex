@@ -115,11 +115,16 @@ def calculate_gex(
             oi_value = float(oi)
         except (TypeError, ValueError):
             oi_value = np.nan
-        if not np.isfinite(oi_value) or oi_value <= 0:
+        # IB reports a legitimate zero for contracts with no open positions.
+        # Zero contributes no position GEX, but it still means the OI field is
+        # ready.  Only missing/NaN (or an impossible negative value) is absent.
+        if not np.isfinite(oi_value) or oi_value < 0:
             missing_oi += 1
             oi_qty = 0
+            oi_is_ready = False
         else:
             oi_qty = oi_value
+            oi_is_ready = True
 
         # Volume 仅用于独立的活动度指标，不能代替未平仓量。
         vol = getattr(t, 'volume', None)
@@ -133,7 +138,7 @@ def calculate_gex(
         else:
             vol_qty = 0
 
-        if oi_qty > 0:
+        if oi_is_ready:
             total_with_oi += 1
 
         # dealer 约定: +1 for calls, -1 for puts

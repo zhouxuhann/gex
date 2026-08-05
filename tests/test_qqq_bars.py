@@ -2,7 +2,12 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from gex_monitor.qqq_bars import add_gap_flags, bar_to_record, normalize_bars
+from gex_monitor.qqq_bars import (
+    add_gap_flags,
+    bar_to_record,
+    is_complete_day,
+    normalize_bars,
+)
 
 
 def _bar(ts, close=500.0, volume=1000):
@@ -43,3 +48,26 @@ def test_add_gap_flags_detects_missing_minutes():
     result = add_gap_flags(bars, expected_minutes=390)
 
     assert all(row['has_gaps'] for row in result)
+
+
+def test_is_complete_day_rejects_partial_close_backfill():
+    partial = normalize_bars([
+        _bar(pd.Timestamp('2026-01-15 14:30:00', tz='UTC')),
+        _bar(pd.Timestamp('2026-01-15 14:31:00', tz='UTC')),
+    ], date_str='20260115')
+    partial = add_gap_flags(partial, expected_minutes=390)
+
+    assert is_complete_day(partial, '20260115') is False
+
+
+def test_is_complete_day_accepts_full_rth_session():
+    bars = [
+        _bar(ts)
+        for ts in pd.date_range(
+            '2026-01-15 14:30:00+00:00', periods=390, freq='min'
+        )
+    ]
+    records = normalize_bars(bars, date_str='20260115')
+    records = add_gap_flags(records, expected_minutes=390)
+
+    assert is_complete_day(records, '20260115') is True

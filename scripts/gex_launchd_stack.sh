@@ -72,7 +72,10 @@ stop_stack() {
   if [ -f "$PID_FILE" ]; then
     while read -r pid; do
       [ -z "$pid" ] && continue
-      kill "$pid" 2>/dev/null && log "Stopped PID $pid" && stopped_any=1
+      if kill "$pid" 2>/dev/null; then
+        log "Stopped PID $pid"
+        stopped_any=1
+      fi
     done < "$PID_FILE"
     rm -f "$PID_FILE"
   fi
@@ -86,7 +89,9 @@ stop_stack() {
     "python -m gex_monitor.qqq_bars")"
   if [ -n "$stale_pids" ]; then
     echo "$stale_pids" | while read -r pid; do
-      kill "$pid" 2>/dev/null && log "Stopped stale PID $pid"
+      if kill "$pid" 2>/dev/null; then
+        log "Stopped stale PID $pid"
+      fi
     done
     stopped_any=1
   fi

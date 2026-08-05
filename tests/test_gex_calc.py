@@ -282,19 +282,21 @@ class TestCalculateGex:
         assert result.invalid_contracts == 1
         assert len(result.df) == 1  # Only the valid one
 
-    def test_zero_oi_counted_as_missing(self, mock_ib_ticker):
-        """Test that zero OI is counted as missing (doesn't contribute to GEX)."""
-        ticker_good = mock_ib_ticker(500, 'C', gamma=0.10, oi=1000)
-        ticker_zero_oi = mock_ib_ticker(505, 'C', gamma=0.10, oi=0)
-        ticker_zero_oi.callOpenInterest = 0
+    def test_zero_oi_is_ready_but_contributes_no_gex(self, mock_ib_ticker):
+        """A finite zero OI is valid IB data and must pass the ready threshold."""
+        tickers = [
+            mock_ib_ticker(500, 'C', gamma=0.10, oi=0),
+            mock_ib_ticker(500, 'P', gamma=0.10, oi=0),
+            mock_ib_ticker(505, 'C', gamma=0.10, oi=0),
+            mock_ib_ticker(505, 'P', gamma=0.10, oi=0),
+        ]
 
-        tickers = [ticker_good, ticker_zero_oi]
-        # 传入低阈值以测试边缘情况
-        result = calculate_gex(tickers, spot=500.0, oi_ready_threshold=0)
+        result = calculate_gex(tickers, spot=500.0, oi_ready_threshold=0.8)
 
         assert result is not None
-        assert result.missing_oi == 1  # Zero OI is counted as missing
-        assert len(result.df) == 2  # Both rows exist but one has 0 OI
+        assert result.missing_oi == 0
+        assert result.total_gex == 0
+        assert len(result.df) == 4
 
 
 class TestPickExpiry:
